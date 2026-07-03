@@ -1,0 +1,16 @@
+{
+  "name": "erik-plugins",
+  "owner": {
+    "name": "Erik Goepfert",
+    "email": "erik.goepfert@icloud.com"
+  },
+  "description": "Erik Goepfert's personal collection of Claude Code plugins.",
+  "plugins": [
+    {
+      "name": "email-triage",
+      "source": "./plugins/email-triage",
+      "description": "Claude-driven email maintenance for iCloud + Gmail: thread-centric triage over IMAP via himalaya, with a persistent history DB so sessions compound.",
+      "version": "0.1.0"
+    }
+  ]
+}

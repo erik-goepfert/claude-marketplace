@@ -201,6 +201,44 @@ No mbsync, no Maildir, no index.
       config bootstrap must carry the entire setup. Decide the multi-machine
       history strategy (§15.7) *before* running triage from the second
       machine.
+      **In progress (2026-07-02):** the repo had no `marketplace.json` at
+      all yet — the design doc assumed one already existed. Created
+      `.claude-plugin/marketplace.json` (marketplace name `erik-plugins`,
+      one entry pointing at `./plugins/email-triage`). Verified the full
+      local mechanics work: `claude plugin marketplace add
+      /Users/erik/Source/claude-marketplace` → `claude plugin install
+      email-triage@erik-plugins` → `claude plugin list` / `plugin details`
+      all succeeded (1 skill, ~82 always-on tokens). Confirmed the
+      installed copy is a real snapshotted directory, not a symlink — it
+      will not track live edits to the repo.
+      **Deferred, deliberately:** uninstalled the plugin again and left
+      development on `--plugin-dir` instead, per §7.7's own stated workflow
+      ("development happens against the working copy... publication to the
+      marketplace when stable") — we're still actively editing SKILL.md, so
+      a snapshotted install would just drift. The `erik-plugins` marketplace
+      registration itself (directory source) is left in place; harmless,
+      and already proved the format is correct. Real GitHub push and the
+      second-machine portability proof are on hold until the plugin is more
+      stable — pushing requires the user's own git credentials (this
+      sandbox has neither SSH key access nor `gh` auth configured). The
+      multi-machine history.db strategy (§15.7) is provisionally decided as
+      **designated primary machine** (this laptop); revisit if/when a
+      second machine runs real triage, not just an install test.
+      **Dev workflow note (2026-07-02):** `claude plugin update` turned out
+      to respect the pinned `version: 0.1.0` and silently no-op when only
+      file contents change (verified empirically: edited SKILL.md, ran
+      `marketplace update` + `plugin update`, cache didn't move, CLI
+      reported "already at the latest version"). A plain **uninstall +
+      reinstall** does refresh the cache from source regardless of the
+      version string (also verified). So the working split going forward:
+      `--plugin-dir` for active back-and-forth editing sessions (this kind
+      of session — no cache, always live); a real local marketplace install
+      for standalone real-triage sessions, refreshed with
+      `claude plugin uninstall email-triage@erik-plugins &&
+      claude plugin install email-triage@erik-plugins` whenever a new batch
+      of changes is ready to try, no version bump or `--plugin-dir` flag
+      needed. Re-installed via the local `erik-plugins` marketplace so it's
+      ready to use next session.
 
 **Accepted MVP limitations** (all lifted by Phase 2):
 - Inbox-only view; no cross-folder threading, no archived-thread history.
