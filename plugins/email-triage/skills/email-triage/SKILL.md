@@ -1,6 +1,7 @@
 ---
 name: email-triage
 description: Triage email across iCloud and Gmail accounts — thread-centric review of the inbox with flag/reply/archive/trash decisions, approval gates, and a persistent history DB that makes each session smarter than the last. Use when the user asks to triage, clean up, or process their email/inbox.
+allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*)
 ---
 
 # Email Triage
@@ -27,7 +28,7 @@ plugin, under `$CLAUDE_PLUGIN_ROOT/skills/email-triage/scripts/`).
 1. Verify `himalaya` is installed (`himalaya --version`); if not, walk the
    user through installing it (`brew install himalaya`) and configuring their
    accounts before continuing.
-2. If `history.db` is missing: `python3 scripts/init_history_db.py`.
+2. If `history.db` is missing: `${CLAUDE_SKILL_DIR}/scripts/init_history_db.py`.
 3. If `config.yaml` is missing: run `himalaya folder list -a <account>` for
    each account in `himalaya account list`, propose inbox/archive/trash/sent/
    junk targets, **confirm them with the user**, then write `config.yaml`.
@@ -38,9 +39,17 @@ plugin, under `$CLAUDE_PLUGIN_ROOT/skills/email-triage/scripts/`).
    the user approving that specific action in this session:
    - *Send / reply:* always show the full draft; nothing is sent without
      explicit approval of that exact draft.
-   - *Trash / archive:* approval required, but batchable ("archive these 12?").
+   - *Trash / archive:* approval required, but batchable — and **name the
+     resolved destination folder in the ask** ("archive these 12 to
+     `Archive`?" not just "archive these 12?"). A folder mix-up between an
+     archive target and a trash target is an easy silent slip; saying the
+     folder out loud surfaces it before execution, not after.
    - *Flagging:* low-risk and reversible — you may flag autonomously during
      triage (log it as `decided_by=auto`).
+   - *Ambiguous phrasing:* "keep" or "keep it" alone means **leave it where
+     it is, no action** — not archive. Only archive/move on explicit
+     relocation language ("archive," "file it away," "move it," "get it out
+     of the inbox"). When genuinely unclear, ask rather than assume.
 2. **`\Flagged` means "needs my reply"** — reserved system-wide. The flag in
    Apple Mail and the star in Gmail are the user queueing a thread for you.
    Never use the flag for anything else.
@@ -84,16 +93,45 @@ Two axes per thread:
   | has `\Answered` (`Answered`) | `waiting` (you replied; approximate in MVP) |
   | otherwise | `holding` |
   Inactive-days ≈ days since the latest message's date.
+  **A `waiting` thread gets no proposal and no log entry, ever — not even a
+  skip.** Lifecycle state and content category are independent axes, so a
+  `waiting` thread can still land in `actionable` or any other category and
+  surface in that category's list. When it does, leave it out of the
+  proposal/approval for that batch entirely; there's nothing to decide about
+  a thread that's waiting on someone else, regardless of category (see Skip
+  rules under Logging).
 - **Content category:** `spam-noise` | `marketing` | `newsletter` |
   `passive-update` (receipts, notifications, alerts) | `ambiguous` |
   `actionable`.
 
-Then:
+**Priority scan — before the breakdown, before anything else.** Security and
+time-sensitive signals are surfaced first, regardless of what content
+category they'd otherwise land in. This is not left to in-the-moment
+judgment — always check for it, every session. Flag a thread here if it's:
 
-1. **Present the full breakdown first** — counts per category, lifecycle
-   summary, and a proposed next step. Example: "147 threads: 12 spam,
-   31 marketing, 14 newsletters, 58 passive updates, 9 ambiguous,
-   9 actionable. Clear spam first?"
+- a security notification: new sign-in / new device, new SSH or API key or
+  app password added, password or recovery-info changed, MFA/2FA settings
+  changed, suspicious or unrecognized activity;
+- financial/time-boxed: a suspicious charge, a payment method change, an
+  account or domain expiration warning;
+- anything phrased as urgent/deadline-bound ("action required," "expires in
+  N days," "confirm within...").
+
+Present these **individually, immediately**, before the category breakdown —
+"2 security alerts first: a new SSH key on your GitHub account and a GitLab
+sign-in from a new location, both from today. Recognize these?" The proposed
+action is usually "confirm it was you" (skip) or "you don't recognize this —
+here's the link to review/revoke" (surfaced, never followed, per rule 4);
+treat as `actionable` for logging purposes (`category=actionable`, and note
+in the free-text `notes` field that it was a priority-scan hit). Only once
+these are resolved does the regular classify-first flow below proceed.
+
+Then, for everything else:
+
+1. **Present the full breakdown** — counts per category, lifecycle summary,
+   and a proposed next step. Example: "147 threads: 12 spam, 31 marketing,
+   14 newsletters, 58 passive updates, 9 ambiguous, 9 actionable. Clear spam
+   first?"
 2. **Work easiest-first**, noise before attention: spam → marketing →
    newsletters → passive-updates → ambiguous → actionable. Show each category
    as a grouped list with a proposed bulk action; the user can pull
@@ -106,7 +144,12 @@ Then:
    `himalaya message read -a <acct> -f INBOX <id>`
 4. **Unsubscribe extraction:** prefer the `List-Unsubscribe` header
    (`himalaya message read --header list-unsubscribe ...`) over body-scraped
-   links. Present the link; the user acts on it themselves (rule 4).
+   links. Present the link; the user acts on it themselves (rule 4). Clicking
+   it is invisible to you by design — **ask** ("unsubscribe too, or just
+   clear this one?") and log the answer via `--unsubscribed` on that event
+   (see Logging). Don't ask on every single marketing/newsletter thread if
+   the user has clearly indicated a batch answer ("unsubscribe from all of
+   these") — apply it to each event in the batch.
 5. Apply active rules from `history.db` when they match — still within the
    approval gates; a rule justifies a proposal, not an autonomous action
    (flags excepted).
@@ -134,9 +177,14 @@ Phase 2. Group in-context from the envelope listing:
 Resolve folder names from `config.yaml`. All ids are per-folder himalaya
 envelope ids from the JSON listing.
 
+`flag add/remove`, `message move`, and `message delete` all take multiple ids
+in one call — **use this for batch actions** ("archive these 12") instead of
+looping per-message; it's one himalaya invocation, and pairs with `log-events`
+below for one bulk history write to match.
+
 - **Flag / unflag** (autonomous allowed):
-  `himalaya flag add -a <acct> -f INBOX <id> flagged`
-  `himalaya flag remove -a <acct> -f INBOX <id> flagged`
+  `himalaya flag add -a <acct> -f INBOX <id>... flagged`
+  `himalaya flag remove -a <acct> -f INBOX <id>... flagged`
 - **Archive** (approved): `himalaya message move -a <acct> -f INBOX <archive-folder> <id>...`
 - **Trash** (approved): `himalaya message move -a <acct> -f INBOX <trash-folder> <id>...`
 - **Reply** (approved, draft always shown):
@@ -154,24 +202,50 @@ envelope ids from the JSON listing.
 
 ## Logging (every decision, at act time)
 
-Use `scripts/history.py` (stdlib-only; `--data-dir` defaults to the data
-directory):
+Use `${CLAUDE_SKILL_DIR}/scripts/history.py` (stdlib-only, executable;
+`--data-dir` defaults to the data directory). `${CLAUDE_SKILL_DIR}` resolves
+correctly whether this skill is installed at the personal, project, or
+plugin level:
 
 ```sh
+HIST="${CLAUDE_SKILL_DIR}/scripts/history.py"
+
 # Session-start context (recent notes, active rules, sender stats, contacts):
-python3 scripts/history.py context [--senders addr1,addr2,...]
+$HIST context [--senders addr1,addr2,...]
 
 # One event per executed decision, at act time:
-python3 scripts/history.py log-event --session "$SESSION" \
+$HIST log-event --session "$SESSION" \
   --account gmail --sender "who@example.com" --subject "..." \
   --thread-state holding --category newsletter --inactive-days 4 \
   --proposed trash --final trash --decided-by approved \
   --from-folder INBOX --to-folder "[Gmail]/Trash" \
-  [--message-id "..."] [--thread-root-id "..."] [--rule-id N] [--notes "..."]
+  [--message-id "..."] [--thread-root-id "..."] [--rule-id N] [--notes "..."] \
+  [--unsubscribed]   # only if the user confirmed they clicked the link (see Triage step 4)
+
+# Batch of events after one bulk himalaya action (all-or-nothing insert):
+$HIST log-events <<'JSON'
+[
+  {"session_started_at": "$SESSION", "account": "gmail", "sender_addr": "a@example.com",
+   "category": "spam-noise", "proposed_action": "trash", "final_action": "trash",
+   "decided_by": "approved", "from_folder": "INBOX", "to_folder": "[Gmail]/Trash"},
+  {"session_started_at": "$SESSION", "account": "gmail", "sender_addr": "b@example.com",
+   "category": "spam-noise", "proposed_action": "trash", "final_action": "trash",
+   "decided_by": "approved", "from_folder": "INBOX", "to_folder": "[Gmail]/Trash"}
+]
+JSON
+# Same field names as log-event's flags (snake_case, matching the events
+# columns). If any item fails validation, nothing in the batch is inserted —
+# check before running the himalaya bulk call, not after.
 
 # Notes, the moment something is noteworthy:
-python3 scripts/history.py log-note --session "$SESSION" "resume state / context / watch item"
+$HIST log-note --session "$SESSION" "resume state / context / watch item"
 ```
+
+Use `log-events` for any batch you executed as one bulk himalaya call (a
+worked category's bulk archive/trash) — one event per message/thread in the
+batch, still each with its own sender/subject/category. Individual
+`log-event` calls remain right for one-at-a-time actionable/security-alert
+threads and replies.
 
 `decided_by` semantics:
 - `auto` — you acted autonomously (flags only).
@@ -187,7 +261,10 @@ Skip rules:
 - A Claude-proposed skip on a thread that presented a real decision is logged
   **once per thread per session**.
 - Threads in `waiting` state are **not skip-eligible** — nothing to decide;
-  don't log skips for them.
+  don't log skips for them, and don't propose anything for them in the first
+  place (see the lifecycle-state note in Triage). A `waiting` thread showing
+  up mixed into an `actionable` or other category's batch is not itself a
+  decision point — pass over it silently.
 - Threads never reviewed (session abandoned, "skip the rest") are **not
   logged as events** — that would be false data. Leave resume state in a
   session note instead.

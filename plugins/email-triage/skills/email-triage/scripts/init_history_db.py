@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS events (
     decided_by         TEXT NOT NULL CHECK (decided_by IN
                          ('auto','approved','override','manual')),
     rule_id            INTEGER,
-    notes              TEXT
+    notes              TEXT,
+    unsubscribed       INTEGER NOT NULL DEFAULT 0  -- user-confirmed; clicking
+                                                    -- itself is never observed (§4.4)
 );
 CREATE INDEX IF NOT EXISTS idx_events_sender  ON events(sender_addr);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_started_at);
@@ -73,6 +75,13 @@ FROM events GROUP BY sender_addr;
 """
 
 
+def migrate(conn: sqlite3.Connection) -> None:
+    """Additive migrations for DBs created before a schema change."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "unsubscribed" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN unsubscribed INTEGER NOT NULL DEFAULT 0")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -90,6 +99,7 @@ def main() -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        migrate(conn)
         conn.commit()
     finally:
         conn.close()

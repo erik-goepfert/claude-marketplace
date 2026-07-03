@@ -447,7 +447,8 @@ CREATE TABLE events (
     decided_by         TEXT NOT NULL CHECK (decided_by IN
                          ('auto','approved','override','manual')),
     rule_id            INTEGER,           -- if a rule drove the proposal
-    notes              TEXT
+    notes              TEXT,
+    unsubscribed       INTEGER NOT NULL DEFAULT 0  -- user-confirmed only; see below
 );
 CREATE INDEX idx_events_sender  ON events(sender_addr);
 CREATE INDEX idx_events_session ON events(session_started_at);
@@ -520,6 +521,19 @@ them are events:
 Threads in the `waiting` state are not skip-eligible — there is nothing to
 decide about a thread waiting on someone else, so logging "skip" for them every
 session would be pure noise.
+
+**Unsubscribe tracking is necessarily self-reported.** Rule §4.4 means the
+skill never follows a `List-Unsubscribe` link, so clicking it happens in the
+user's browser — an action the skill structurally cannot observe. `events`
+carries an `unsubscribed` boolean (default 0) set only when the user
+confirms, in-session, that they clicked it; the skill asks rather than
+inferring it from `final_action`. Without this column the only available
+proxy would be "marketing/newsletter thread ended in trash/archive," which
+conflates deleting one message with ending a subscription — exactly the kind
+of derived-looking-like-a-fact mistake §9's "facts, not aggregates" principle
+exists to avoid. Added post-MVP, during the first live triage session, when
+"how often do I actually unsubscribe from marketing mail" came up as a
+question the original schema couldn't answer.
 
 **External actions become events.** Mail is also managed outside sessions —
 from the phone, from Apple Mail. Because the skill re-indexes its own actions
@@ -705,23 +719,40 @@ Phase 4 follows a classify-first discipline:
    - **Lifecycle state** (§10): needs-reply / holding / waiting.
    - **Content category:** spam-noise, marketing, newsletter, passive-update
      (receipts, notifications), ambiguous, actionable.
-2. **Present the breakdown first.** Before any action or body read, the user
-   sees the full category summary with counts and a proposed next step —
+2. **Priority scan, before the breakdown.** Security and time-sensitive
+   signals are surfaced first, regardless of the content category they'd
+   otherwise land in, and this is an explicit, every-session rule — not left
+   to in-the-moment model judgment. (Discovered as a gap during the MVP's
+   first real session: Claude *did* prioritize a fresh sign-in alert
+   unprompted, but on its own reasoning, which isn't a reliable contract
+   across sessions or models.) In scope: new sign-in/device notifications,
+   new SSH/API key or app-password creation, password/recovery-info or
+   MFA changes, suspicious charges or payment-method changes, account/domain
+   expiration warnings, and "action required"/deadline-bound language.
+   These are presented individually and immediately — before category counts,
+   before anything else — with a proposed action of "confirm it was you" or
+   "surface the review/revoke link" (§4.4: never followed). Logged as
+   `category=actionable` with the priority-scan trigger noted in the event's
+   free-text `notes`.
+3. **Present the breakdown next.** Before any other action or body read, the
+   user sees the full category summary with counts and a proposed next step —
    "147 threads: 12 spam, 31 marketing, 14 newsletters, 58 passive updates,
    9 ambiguous, 9 actionable. Clear spam first?"
-3. **Work categories easiest-first**, noise before attention: spam → marketing
+4. **Work categories easiest-first**, noise before attention: spam → marketing
    → newsletters → passive updates → ambiguous → actionable. Each category is
    shown as a grouped list with a proposed bulk action (batchable approval per
    §4); the user can pull individual threads out before approving. Actionable
    threads are always presented individually.
-4. **Targeted body reads only.** Bodies are read for exactly two reasons —
+5. **Targeted body reads only.** Bodies are read for exactly two reasons —
    resolving an *ambiguous* classification, or extracting unsubscribe links
    from marketing/newsletters — category by category as each is worked, never
    upfront, never for confidently classified mail. Post-MVP a body read is a
    local Maildir file read.
-5. **Unsubscribe extraction** prefers the `List-Unsubscribe` header (reliable)
+6. **Unsubscribe extraction** prefers the `List-Unsubscribe` header (reliable)
    over body-scraped links (false-positive prone), and follows §4.4: surfaced,
-   never followed.
+   never followed. Since the click itself is invisible to the skill, it asks
+   whether the user unsubscribed and logs the answer on `events.unsubscribed`
+   (§9) — the only way that signal ever enters the history.
 
 The category lands on each logged event (§9), so `sender_stats` can answer
 questions like "what fraction of this domain's mail is marketing I trash?"
@@ -882,9 +913,11 @@ Rationale lives in the body; this is the index of choices.
 - Synthetic Message-IDs at index time for messages missing the header.
 - Subject fallback requires participant overlap before merging.
 - Classify-first triage: everything classified from envelopes + history before any body read; category breakdown presented before any action; categories worked easiest-first (noise before attention).
+- Priority scan ahead of the breakdown: security/time-sensitive threads (new sign-in, new SSH/API key, MFA change, suspicious charge, expiration/deadline language) always surface first, as an explicit rule rather than incidental model judgment (added after the MVP's first session).
 - Two classification axes: lifecycle state and content category; the category is snapshotted on every event.
 - Targeted body reads only: ambiguity resolution and unsubscribe extraction.
 - Unsubscribe links surfaced (`List-Unsubscribe` header preferred), never followed.
+- Unsubscribe outcome is self-reported: `events.unsubscribed` is set only when the user confirms in-session, since the click itself is structurally invisible to the skill (added after the MVP's first session, prompted by wanting an "unsubscribe rate by category" metric the original schema couldn't answer).
 - Contacts carry `relation` — human framing ('your plumber') over generic categories.
 - Packaged as a Claude Code plugin, distributed through the existing personal marketplace; developed locally via `--plugin-dir`.
 - Strict code/state separation: the plugin is read-only code; all state lives in a machine-local data dir (`~/.local/share/email-triage/` by default); nothing personal in the repo.

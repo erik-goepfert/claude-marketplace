@@ -116,6 +116,43 @@ No mbsync, no Maildir, no index.
       inserts land, `sender_stats` computes skip/override semantics
       correctly, `context` emits clean JSON. SKILL.md's logging section now
       shows the exact invocations.
+      **Amendment (2026-07-02, mid-first-session):** added
+      `events.unsubscribed` (user-confirmed, since the click is invisible to
+      the skill by design — §4.4) via an additive migration in
+      `init_history_db.py` (checks `PRAGMA table_info`, `ALTER TABLE ADD
+      COLUMN` if missing) and a `--unsubscribed` flag on `log-event`. Applied
+      to the live `history.db`, which already had 17 real events — all
+      preserved, migration verified idempotent-safe.
+      **Amendment (2026-07-02):** himalaya's `flag add`/`message move`/
+      `message delete` all take multiple ids in one call — added a matching
+      `log-events` bulk subcommand (JSON array via stdin/`--file`, shared
+      validation with `log-event`, all-or-nothing insert via one
+      transaction) so a batch himalaya action logs in one call too. Tested:
+      valid batch inserts atomically; a batch with one invalid item aborts
+      with no partial writes.
+      **Amendment (2026-07-02):** made both scripts executable (`chmod +x`;
+      both already had a `python3` shebang). Initially tried granting
+      permission by editing the user's *global* `~/.claude/settings.json`
+      — wrong instinct. The correct, self-contained mechanism is `SKILL.md`
+      frontmatter's `allowed-tools` field, which pre-approves tools while
+      the skill is active without touching any user settings file (confirmed
+      against the current skills docs; it's the documented pattern for a
+      skill that bundles and runs its own scripts, e.g. the docs' own
+      example uses `allowed-tools: Bash(python3 *)` verbatim). Reverted the
+      global settings.json edit and instead added `allowed-tools` to
+      SKILL.md's frontmatter — the plugin now travels with its own
+      permissions.
+      **Amendment (2026-07-02):** `Bash(python3 *)` was broader than needed.
+      Confirmed against the current permissions docs that Bash wildcards
+      match at any position (not just trailing), so tightened to
+      `allowed-tools: Bash(himalaya *) Bash(*history.py*)
+      Bash(*init_history_db.py*)` — scoped to exactly these two scripts
+      (now invoked directly, no `python3` prefix, since they're executable)
+      regardless of install path, rather than any python3 invocation.
+      Switched the body's invocations to `${CLAUDE_SKILL_DIR}/scripts/...`
+      too, so the actual command path resolves correctly whether the skill
+      ends up at the personal, project, or plugin level — not just the
+      permission rule.
 - [x] **1.3 In-context thread grouping.** Claude groups the inbox loosely by
       normalized subject in-context during triage — no persistent threading.
       Fine at inbox scale.
@@ -125,6 +162,39 @@ No mbsync, no Maildir, no index.
 - [ ] **1.4 First real sessions.** Both accounts. Expect skill-prompt
       iteration; capture friction as session notes — they're the requirements
       list for Phase 2.
+      **In progress (2026-07-02):** first live session underway. Finding:
+      unprompted, Claude correctly prioritized new-device security-alert
+      emails (fresh GitHub/GitLab logins on this laptop) ahead of the regular
+      flow, but on its own reasoning rather than an explicit rule — not
+      reliable across sessions/models. Added a "Priority scan" step to
+      SKILL.md's Triage section: security/time-sensitive signals (new
+      sign-in, new SSH/API key, MFA changes, suspicious charges, expiration/
+      deadline language) are now always surfaced individually, before the
+      category breakdown, regardless of content category.
+      **Session review (2026-07-02):** first full session completed and its
+      transcript reviewed against SKILL.md's contract (a subagent read the
+      ~862-line JSONL transcript so the raw log didn't have to enter this
+      session's context). This session ran concurrently with the SKILL.md/
+      history.py edits above, so its priority-scan-ordering and outdated-
+      script findings just predate those fixes landing — not new bugs. Three
+      genuine misses fixed in SKILL.md:
+      - **Waiting-state threads got a skip logged** despite the explicit
+        rule against it — added a stronger note right at the lifecycle-state
+        table (where the gap actually originates: lifecycle state and
+        content category are independent axes, so a `waiting` thread can
+        still surface in an `actionable` batch) plus reinforced the
+        cross-referenced Skip rules bullet under Logging.
+      - **A trash batch actually executed as an archive move** (folder
+        mix-up, self-caught mid-session) — approval asks must now name the
+        resolved destination folder ("archive these 12 to `Archive`?"),
+        surfacing a mismatch before execution instead of after.
+      - **"Keep the legacy account" was executed as an archive** — added
+        explicit guidance that "keep"/"keep it" alone means no action, not
+        archive; only explicit relocation language triggers a move.
+      Noted but not fixed: repeated "what's remaining" asks with no running
+      tally (friction, not a bug) — a real Phase 2 candidate once the index
+      exists, since a live remaining-count is exactly what thread-state
+      rollup queries give for free.
 - [ ] **1.5 Publish.** Add the plugin entry to the personal marketplace repo;
       install on a second machine via `/plugin marketplace add` +
       `/plugin install` as the portability proof — the dependency check and

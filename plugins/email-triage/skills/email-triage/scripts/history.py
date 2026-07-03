@@ -3,6 +3,8 @@
 
 Subcommands:
   log-event   Insert one triage decision (see design doc §9 for semantics).
+  log-events  Insert a batch of decisions from a JSON array (one himalaya
+              bulk action -> one bulk log call; all-or-nothing).
   log-note    Append a session note.
   context     Print session-start context (recent notes, active rules,
               sender stats) as JSON.
@@ -37,36 +39,111 @@ def connect(data_dir: Path) -> sqlite3.Connection:
     return conn
 
 
-def cmd_log_event(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
-    conn.execute(
-        """INSERT INTO events (session_started_at, occurred_at, account,
-               thread_root_id, message_id, sender_addr, subject,
-               thread_state, category, inactive_days,
-               proposed_action, final_action, from_folder, to_folder,
-               decided_by, rule_id, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            args.session,
-            args.occurred_at or utc_now(),
-            args.account,
-            args.thread_root_id,
-            args.message_id,
-            args.sender.lower(),
-            args.subject,
-            args.thread_state,
-            args.category,
-            args.inactive_days,
-            args.proposed,
-            args.final,
-            args.from_folder,
-            args.to_folder,
-            args.decided_by,
-            args.rule_id,
-            args.notes,
-        ),
+EVENT_INSERT_SQL = """INSERT INTO events (session_started_at, occurred_at, account,
+           thread_root_id, message_id, sender_addr, subject,
+           thread_state, category, inactive_days,
+           proposed_action, final_action, from_folder, to_folder,
+           decided_by, rule_id, notes, unsubscribed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+
+def event_row_from_dict(d: dict, *, index: int | None = None) -> tuple:
+    """Validate one event dict (same fields as log-event's flags) and return
+    the row tuple for EVENT_INSERT_SQL. Raises ValueError with the offending
+    index (if given) on the first problem, so a bulk batch fails atomically
+    and legibly rather than partially inserting."""
+    where = f"item {index}: " if index is not None else ""
+
+    def require(key: str):
+        if not d.get(key):
+            raise ValueError(f"{where}missing required field '{key}'")
+        return d[key]
+
+    def check_choice(key: str, choices: tuple[str, ...], required: bool = True):
+        val = d.get(key)
+        if val is None:
+            if required:
+                raise ValueError(f"{where}missing required field '{key}'")
+            return None
+        if val not in choices:
+            raise ValueError(f"{where}'{key}'={val!r} not one of {choices}")
+        return val
+
+    session = require("session_started_at")
+    sender = require("sender_addr").lower()
+    proposed = check_choice("proposed_action", ACTIONS)
+    final = check_choice("final_action", ACTIONS)
+    decided_by = check_choice("decided_by", DECIDED_BY)
+    check_choice("thread_state", THREAD_STATES, required=False)
+    check_choice("category", CATEGORIES, required=False)
+
+    return (
+        session,
+        d.get("occurred_at") or utc_now(),
+        d.get("account"),
+        d.get("thread_root_id"),
+        d.get("message_id"),
+        sender,
+        d.get("subject"),
+        d.get("thread_state"),
+        d.get("category"),
+        d.get("inactive_days"),
+        proposed,
+        final,
+        d.get("from_folder"),
+        d.get("to_folder"),
+        decided_by,
+        d.get("rule_id"),
+        d.get("notes"),
+        int(bool(d.get("unsubscribed", False))),
     )
+
+
+def cmd_log_event(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    row = event_row_from_dict(
+        {
+            "session_started_at": args.session,
+            "occurred_at": args.occurred_at,
+            "account": args.account,
+            "thread_root_id": args.thread_root_id,
+            "message_id": args.message_id,
+            "sender_addr": args.sender,
+            "subject": args.subject,
+            "thread_state": args.thread_state,
+            "category": args.category,
+            "inactive_days": args.inactive_days,
+            "proposed_action": args.proposed,
+            "final_action": args.final,
+            "from_folder": args.from_folder,
+            "to_folder": args.to_folder,
+            "decided_by": args.decided_by,
+            "rule_id": args.rule_id,
+            "notes": args.notes,
+            "unsubscribed": args.unsubscribed,
+        }
+    )
+    conn.execute(EVENT_INSERT_SQL, row)
     conn.commit()
     print("event logged")
+
+
+def cmd_log_events(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    raw = Path(args.file).read_text() if args.file else sys.stdin.read()
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"error: invalid JSON: {e}")
+    if not isinstance(items, list):
+        sys.exit("error: expected a JSON array of event objects")
+
+    try:
+        rows = [event_row_from_dict(item, index=i) for i, item in enumerate(items)]
+    except ValueError as e:
+        sys.exit(f"error: {e} — no events were logged (all-or-nothing)")
+
+    conn.executemany(EVENT_INSERT_SQL, rows)
+    conn.commit()
+    print(f"{len(rows)} events logged")
 
 
 def cmd_log_note(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -135,7 +212,23 @@ def main() -> None:
     ev.add_argument("--decided-by", required=True, choices=DECIDED_BY)
     ev.add_argument("--rule-id", type=int)
     ev.add_argument("--notes")
+    ev.add_argument(
+        "--unsubscribed",
+        action="store_true",
+        help="user confirmed they clicked the surfaced unsubscribe link (self-reported; see §4.4)",
+    )
     ev.set_defaults(func=cmd_log_event)
+
+    evs = sub.add_parser(
+        "log-events",
+        help="insert a batch of decisions from a JSON array (stdin or --file)",
+        description="Reads a JSON array of event objects (same field names as "
+        "log-event's flags, e.g. {\"session_started_at\": ..., \"sender_addr\": ..., "
+        "\"proposed_action\": ..., \"final_action\": ..., \"decided_by\": ..., ...}). "
+        "All events are validated before any are inserted (all-or-nothing).",
+    )
+    evs.add_argument("--file", help="read JSON array from this file instead of stdin")
+    evs.set_defaults(func=cmd_log_events)
 
     nt = sub.add_parser("log-note", help="append a session note")
     nt.add_argument("--session", required=True, help="session_started_at (UTC ISO 8601)")
