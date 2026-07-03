@@ -1,0 +1,8 @@
+{
+  "name": "email-triage",
+  "description": "Claude-driven email maintenance for iCloud + Gmail: thread-centric triage over IMAP via himalaya, with a persistent history DB so sessions compound.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Erik Goepfert"
+  }
+}
