@@ -315,7 +315,7 @@ The local mirror and index land underneath the working MVP practice.
       folder audit *before* the initial clone so the first sync doesn't
       pull folders about to be reorganized — ordering preference, not a
       requirement.
-- [ ] **2.2 Verification suite §13 in full, both accounts** — now including
+- [x] **2.2 Verification suite §13 in full, both accounts** — now including
       §13.3 round-trip (local flag/move/trash → server; phone-side changes →
       local), §13.4 envelope JSON schema, §13.5 Gmail label-removal
       round-trip (delete from a label's local folder → sync → label removed
@@ -324,6 +324,33 @@ The local mirror and index land underneath the working MVP practice.
       pin them), and §13.6 nested folder/label creation on both accounts
       (`Areas/<area>/<project>` needs two levels). **Gate everything
       downstream on this.**
+      **Outcome (2026-07-09): ALL PASS.** §13.1/§13.2 stand from Phase 0;
+      §13.4's IMAP shape stands from Phase 1 (Maildir-backend variant
+      re-verifies at 2.6 when those accounts exist). Run today:
+      - **§13.3 (iCloud + gmail): PASS**, all directions — local flag/move/
+        trash each propagated correctly (move = delete+re-append per §5,
+        flags survive), external server-side changes pulled correctly.
+      - **§13.5 (gmail): PASS — the virtual-Archive gate.** Local delete
+        from a label's folder synced as "remove label": label emptied
+        server-side, message survived in All Mail (flag intact), not
+        trashed. This account's expunge-from-last-folder behavior is
+        confirmed compatible; if Gmail settings are ever changed, re-run
+        this test.
+      - **§13.6 (both): PASS** — `himalaya folder add "A/B"` creates
+        two-level nesting on both accounts, slash-separated; parents are
+        not auto-created as separately listable folders (create them
+        explicitly when both levels must be visible).
+      **Act-layer findings for 2.6** (design §5/§12 confirmed empirically):
+      strip the `,U=<uid>` filename token when relocating a Maildir file
+      across folders; resolve-before-act is mandatory — a sync re-stamps
+      UIDs, and a pre-sync filename reference broke a move in this very
+      test run. **Latency findings for §15.5:** iCloud incrementals are
+      seconds; gmail syncs pay ~60–80 s of per-session overhead regardless
+      of scope (a single 25-message box took 81 s; full 30-box channel
+      ~5–8 min) — 2.6 must batch actions per sync and use box-scoped
+      invocations (`mbsync 'gmail:INBOX,...'`, verified working), not
+      per-action full-channel syncs. Test artifacts fully cleaned up
+      (messages trashed, `ZZZ-Skilltest*` folders deleted server+local).
 - [ ] **2.3 Folder audit & taxonomy migration.** The high-level structure is
       now fixed (`email-folder-taxonomy.md`: Inbox / Active / Areas/… /
       Archive, canonical across both accounts via per-account adapters);
