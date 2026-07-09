@@ -153,7 +153,12 @@ folders is explicitly not done.
 
 **Everything syncs.** Both accounts mirror in full — including `[Gmail]/All
 Mail`, which is the *only* place natively-archived Gmail mail exists, and
-therefore mandatory once `Archive` is virtual. The cost is that the Gmail
+therefore mandatory once `Archive` is virtual. "Everything" means every
+*message*, not every server-side view: `[Gmail]/Starred` and
+`[Gmail]/Important` are excluded (decided 2026-07-09 during the 2.1 build) —
+they're virtual overlay mailboxes with zero unique messages, Starred being a
+view of `\Flagged` (already on each message) and Important being Gmail's ML
+guess. The cost is that the Gmail
 mirror holds a duplicate copy of every labeled message (once under its label,
 once in All Mail); the indexer already dedups by Message-ID across folders for
 the Sent rollup, and the same machinery absorbs this. At current account sizes

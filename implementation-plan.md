@@ -276,9 +276,29 @@ accumulate across sessions; Claude visibly uses prior-session context.
 
 The local mirror and index land underneath the working MVP practice.
 
-- [ ] **2.1 mbsync channels, both accounts.** `Sync All` / `Expunge Both` /
-      `CopyArrivalDate yes`; `Patterns *` — everything syncs, **including
-      `[Gmail]/All Mail`** (§7.1). Initial clones (the only slow syncs).
+- [x] **2.1 mbsync channels, both accounts.** `Sync Full` / `Expunge Both` /
+      `CopyArrivalDate yes`; `Patterns INBOX *` — everything syncs,
+      **including `[Gmail]/All Mail`** (§7.1). Initial clones (the only slow
+      syncs).
+      **Outcome (2026-07-09):** done — both initial clones completed cleanly
+      (exit 0, zero log errors). iCloud: 18 folders, 2,030 messages, 396 MB.
+      Gmail: 30 mailboxes, 16,586 messages, 3.3 GB; `[Gmail]/All Mail` came
+      down complete (10,667 = the server-side count), Starred/Important
+      correctly absent. Config at `~/.config/isync/mbsyncrc` (chmod 600,
+      `PassCmd` → keychain, no plaintext secrets); draft + runbook archived
+      in the session scratchpad. Build findings, all folded into §7.1/§13
+      and the taxonomy doc: (a) no `Sync All` keyword exists — it's
+      `Sync Full`; (b) `INBOX` must be listed explicitly in `Patterns`
+      (wildcards don't match it); (c) mbsync does NOT auto-discover
+      `~/.config/isync/mbsyncrc` — every invocation needs `-c` (the 2.6
+      skill wiring must carry this); (d) `AuthMechs PLAIN` is required —
+      cyrus-SASL otherwise picks an uncompletable mechanism (XOAUTH2) and
+      fails with "unable to find a callback"; (e) `[Gmail]/Starred` +
+      `[Gmail]/Important` excluded as zero-unique-message virtual views
+      (user-approved). `config.yaml` updated: `maildir_path` set, stale
+      All-Mail exclusion replaced. Ran *before* the 2.3 folder audit —
+      acceptable per the ordering-preference note; the audit's folder moves
+      will propagate as renames/moves on later syncs.
       **Revised (2026-07-09, taxonomy):** the earlier `!Inactive/*` and
       All-Mail exclusions are both dropped. The taxonomy
       (`email-folder-taxonomy.md`) dissolves legacy folders instead of

@@ -223,18 +223,26 @@ flowchart LR
   messages, deletions, and flag changes both ways. Sync is UID-based so no
   identity conflicts.
 - **Write-back must be configured explicitly — do not rely on defaults.** The
-  channel needs `Sync All` and `Expunge Both` (verify exact syntax against the
-  isync manual for the installed version). Under-configured channels leave
+  channel needs `Sync Full` and `Expunge Both`. (Verified against isync 1.5.1
+  during the 2.1 build: there is no `Sync All` keyword in mbsync's grammar —
+  `Full` is the real one, covering New/Upgrade/Gone/Flags in both
+  directions.) Under-configured channels leave
   deletions unpropagated: mail trashed locally silently persists on iCloud, or
   lingers `\Deleted`-flagged without being expunged. This is the single most
   common mbsync foot-gun.
 - `CopyArrivalDate yes` so moved messages keep their original arrival dates
   rather than appearing as "new" at move time.
-- `Patterns *` — everything syncs. (Earlier drafts excluded an `Inactive/*`
-  parking lot; dropped 2026-07-09 — the folder audit dissolves legacy folders
-  into the taxonomy instead of parking them, and full local retrieval wants
-  the resolved tiers mirrored anyway. See `email-folder-taxonomy.md`, Sync
-  coverage.)
+- `Patterns INBOX *` — everything syncs. (Earlier drafts excluded an
+  `Inactive/*` parking lot; dropped 2026-07-09 — the folder audit dissolves
+  legacy folders into the taxonomy instead of parking them, and full local
+  retrieval wants the resolved tiers mirrored anyway. See
+  `email-folder-taxonomy.md`, Sync coverage.) Two findings from the 2.1
+  build: `INBOX` must be listed explicitly — mbsync wildcards don't match it
+  unless it lives under the store's `Path`; and the Gmail channel adds
+  `!"[Gmail]/Starred" !"[Gmail]/Important"` — virtual view-mailboxes with
+  zero unique messages (Starred is just a view of `\Flagged`; Important is
+  Gmail's ML guess), so "everything syncs" means every *message*, not every
+  server-side view.
 - **One channel per account.** iCloud syncs normally. The Gmail channel
   **includes `[Gmail]/All Mail`** (revised 2026-07-09; previously excluded) —
   every labeled message therefore lands twice, once per label and once in All
