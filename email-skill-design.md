@@ -836,6 +836,31 @@ Phase 4 follows a classify-first discipline:
    whether the user unsubscribed and logs the answer on `events.unsubscribed`
    (§9) — the only way that signal ever enters the history.
 
+**Noise-handling escalation (added 2026-07-09).** For recurring unwanted
+mail, the standing policy is a three-step ladder:
+
+1. **Unsubscribe** if possible (§4.4 mechanics: surfaced, never followed).
+2. **Server-side rule** when unsubscribe is structurally impossible — e.g.
+   Substack, where stopping the email requires unfollowing the author, so a
+   delivery-time filter becomes the unsubscribe. The skill's role is a
+   *filter proposal*: draft the exact match expression, action, and
+   carve-outs (transactional senders like login-link addresses must be
+   excluded) for the user to install in the provider's web UI. Filters are
+   not reachable over IMAP; the skill designs, the user installs.
+3. **Triage rule / continued triage** as the last resort, for mail that must
+   still be seen.
+
+One hard constraint: **server rules delete; they never file into folders.**
+A delete-filter is unsubscribe-by-other-means. A filing filter breaks the
+taxonomy at the root — Inbox stops being the only untriaged tier, mail lands
+in tier folders without a decision, and it never reaches the learning loop
+(the 2.3 audit found exactly this pathology: a stale filter had been filing
+newsletter mail into an unrelated folder for years). Installed filters are
+recorded per-account under `server_rules:` in `config.yaml` — they're
+invisible to IMAP, so the registry is the only thing future sessions and
+audits can check for drift, and it documents the accepted blind spot that
+server-deleted mail generates no history events.
+
 The category lands on each logged event (§9), so `sender_stats` can answer
 questions like "what fraction of this domain's mail is marketing I trash?"
 
@@ -1033,6 +1058,7 @@ Rationale lives in the body; this is the index of choices.
 - Two classification axes: lifecycle state and content category; the category is snapshotted on every event.
 - Targeted body reads only: ambiguity resolution and unsubscribe extraction.
 - Unsubscribe links surfaced (`List-Unsubscribe` header preferred), never followed.
+- Noise escalation ladder (2026-07-09): unsubscribe → server-side delete-filter (skill drafts, user installs, registered in config.yaml `server_rules`) → triage rule. Server rules delete, never file — filing filters bypass the Inbox tier and the learning loop.
 - Unsubscribe outcome is self-reported: `events.unsubscribed` is set only when the user confirms in-session, since the click itself is structurally invisible to the skill (added after the MVP's first session, prompted by wanting an "unsubscribe rate by category" metric the original schema couldn't answer).
 - Contacts carry `relation` — human framing ('your plumber') over generic categories.
 - Packaged as a Claude Code plugin, distributed through the existing personal marketplace; developed locally via `--plugin-dir`.

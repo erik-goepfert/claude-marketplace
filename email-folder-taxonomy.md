@@ -112,14 +112,28 @@ Canonical structure, physically realized per the adapter table above:
 ├── Inbox                     untriaged arrivals
 ├── Active                    triaged, still live
 ├── Areas/                    resolved, ongoing responsibility
-│   ├── 5621-W-141st/
+│   ├── W-141st-Ln/
 │   │   └── Fence             project subfolder (a bounded unit that can graduate)
 │   ├── Taxes/
-│   ├── Colorado-House-Search/
+│   ├── Receipts/
 │   └── …
 └── Archive                   resolved, no future relevance
-                              (real folder on iCloud; virtual on Gmail)
+    │                         (real folder on iCloud; virtual on Gmail)
+    ├── 2023-Tesla-Purchase   flat leaf: closed chapter, year-of-closure prefix
+    ├── Career/               optional family folder (container only)
+    │   ├── 2019-The-Weather-Company
+    │   └── 2023-Career-Apple
+    └── Housing/
+        └── 2026-Colorado-House-Search
 ```
+
+**Family folders under Archive (added 2026-07-09, at the 2.3 audit):**
+when two or more closed chapters share a theme (`Career`, `Housing`), they
+may live under an optional family folder — a pure container that holds no
+messages directly, only chapter subfolders. Chapters without a family stay
+flat leaves. Year-prefixed names sort each family as its own timeline.
+Three-level nesting (`Archive/Housing/2025-Colorado-Move`) is verified
+working on both accounts.
 
 Location encodes the **lifecycle tier**:
 
@@ -257,7 +271,13 @@ stateDiagram-v2
     end note
 ```
 
-1. **Arrival → Inbox.** Delivery default; no state implied.
+1. **Arrival → Inbox.** Delivery default; no state implied. The one
+   sanctioned exception is deletion at the door: server-side rules (Gmail
+   filters, iCloud rules) may **delete** unwanted mail before it ever
+   arrives — but they must never *file into folders*. A filing rule would
+   create a second untriaged entry path into tier folders, bypassing both
+   the Inbox tier and the learning loop (see the design doc's
+   noise-handling escalation, §11).
 2. **Triage.** Resolve immediately (straight to `Areas/…` or `Archive`),
    discard (move to `Trash` — always a move, never an expunge), or move to
    `Active` if still live. If live and awaiting my action, set the flag
@@ -340,6 +360,13 @@ on-demand, since Area/project state doesn't move daily.
 - **Output:** a *proposal*, approval-gated, surfaced the same way triage
   decisions are — e.g. "`Areas/…/Fence`: 0 new messages, 0 flagged threads in 45
   days — graduate to Archive?" Never auto-executed.
+- **Naming on graduation (2026-07-09):** the archived folder takes the year
+  the chapter *closed* as a prefix, and lands in its family folder when one
+  fits — `Areas/W-141st-Ln` would graduate to
+  `Archive/Housing/20XX-W-141st-Ln`. The year is judged from when the
+  folder was last genuinely active (stragglers and wrap-up messages don't
+  count), so archive children sort chronologically and read as a timeline.
+  Areas themselves are never year-prefixed — they're ongoing by definition.
 - Inactivity is a candidate signal, not a decision rule. Silence can mean
   resolved or can mean the other party hasn't replied, so graduation is always
   confirmed, never unilateral.

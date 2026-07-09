@@ -351,7 +351,37 @@ The local mirror and index land underneath the working MVP practice.
       invocations (`mbsync 'gmail:INBOX,...'`, verified working), not
       per-action full-channel syncs. Test artifacts fully cleaned up
       (messages trashed, `ZZZ-Skilltest*` folders deleted server+local).
-- [ ] **2.3 Folder audit & taxonomy migration.** The high-level structure is
+- [x] **2.3 Folder audit & taxonomy migration.**
+      **Outcome (2026-07-09): executed in full, both accounts.** Process ran
+      as five stages: Sonnet dossier agent profiled all 36 legacy folders
+      from the local mirror (headers only); mapping proposal written to the
+      data dir (`folder-audit-2026-07.md` — kept out of the repo, it's full
+      of street addresses); user review resolved every disposition;
+      execution via himalaya server-side moves with per-folder count
+      verification; final sync + ghost cleanup. Results: iCloud 12 legacy
+      folders → `Areas/{W-141st-Ln, Taxes, Receipts}` +
+      `Archive/Housing/{8 year-prefixed chapters}` (1,182 messages moved,
+      every count exact); gmail ~20 labels → `Areas/{Taxes, Receipts}` +
+      `Archive/Career/{3}` + `Archive/Housing/{2}` + 4 flat leaves; 278
+      career noise digests + 619 Substack messages trashed (537 via the
+      user's new server-side delete-filter backfill); 3 tiny labels
+      dissolved to native archive (All-Mail persistence verified by server
+      search); `Active` created on both accounts for the 2.7 cutover; both
+      bare `Archive` targets kept for the interim MVP. Design decisions
+      that came out of the audit, all now in the taxonomy doc / design doc:
+      optional **family folders** under Archive (Career, Housing;
+      container-only; 3-level nesting verified); **year-of-closure prefix**
+      on archived chapters; the **noise-handling escalation ladder**
+      (unsubscribe → server-side delete-filter → triage rule) with the
+      server-rules-delete-never-file constraint and a `server_rules:`
+      registry in config.yaml. Notable mechanics finding: Gmail dual-labeled
+      messages made the career→TWC merge self-deduplicating (37 "loose"
+      messages were Message-ID-identical to existing TWC copies — verified
+      against the pre-migration mirror; final 69 unique is complete).
+      Migration logged as a history.db session note with triage
+      implications (pre-policy sender_stats context, interim
+      archive-to-catch-all gap). Deferred by choice: message-level re-file
+      of iCloud's 69-message grab-bag Archive. The high-level structure is
       now fixed (`email-folder-taxonomy.md`: Inbox / Active / Areas/… /
       Archive, canonical across both accounts via per-account adapters);
       this step instantiates it against real mail, per account:

@@ -185,7 +185,22 @@ Then, for everything else:
    event (see Logging). Don't ask on every single marketing/newsletter
    thread if the user has clearly indicated a batch answer ("unsubscribe
    from all of these") — apply it to each event in the batch.
-5. Apply active rules from `history.db` when they match — still within the
+5. **Noise escalation — when unsubscribe isn't possible.** The standing
+   policy is a three-step ladder: (1) unsubscribe if possible; (2) when it
+   isn't (or the user declines but still wants the mail gone), **propose a
+   server-side filter**; (3) last resort, a triage rule or continued manual
+   triage. A filter proposal means drafting the exact config for the user to
+   install in the provider's web UI — filters aren't reachable over IMAP —
+   including match expression, action, and any carve-outs for transactional
+   senders (e.g. Substack newsletters are filterable but login magic links
+   come from `no-reply@substack.com`, which must be excluded). **Server
+   rules delete; they never file into folders** — a filing rule would create
+   a second untriaged path into tier folders and hide mail from the learning
+   loop. After the user installs one, record it under that account's
+   `server_rules:` in `config.yaml` and log a session note — server-deleted
+   mail generates no events, and the registry is what explains the silence
+   to future sessions.
+6. Apply active rules from `history.db` when they match — still within the
    approval gates; a rule justifies a proposal, not an autonomous action
    (flags excepted).
 
