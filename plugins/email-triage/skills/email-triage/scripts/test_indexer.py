@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Self-test for indexer.py (design refs: email-skill-design.md §7.4/§8,
+implementation-plan.md item 2.4's taxonomy scope). Builds a tiny synthetic
+Maildir under tempfile, never touches the real mirror.
+
+Covers:
+  - two accounts (icloud, gmail), a few folders including a nested one
+    (Archive/Housing/2025-Colorado-Move)
+  - an All-Mail-only gmail message (virtual Archive tier)
+  - a dual-labeled gmail message (Areas/Taxes + [Gmail]/All Mail -> tier
+    resolves to 'areas', All-Mail copy ignored)
+  - a missing-Message-ID message (synthetic id)
+  - an unrecognized folder (surfaced in the change report)
+  - idempotence: running index twice with no filesystem changes reports no
+    changes on the second run
+  - a flag rename, a cross-folder move, and a deletion, each correctly
+    classified on a third run
+  - the message_tiers view returning the right tier for every message at
+    each stage
+"""
+
+import importlib.util
+import json
+import shutil
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+_INDEXER_PATH = Path(__file__).resolve().parent / "indexer.py"
+_spec = importlib.util.spec_from_file_location("indexer", _INDEXER_PATH)
+indexer = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(indexer)
+
+
+def write_message(folder_path: Path, unique: str, flags, headers: dict, subdir: str = "cur") -> Path:
+    """Write one synthetic Maildir message file. flags=None omits the ':2,'
+    suffix entirely (as in new/ before any flag has ever been set)."""
+    for d in ("cur", "new", "tmp"):
+        (folder_path / d).mkdir(parents=True, exist_ok=True)
+    filename = unique if flags is None else f"{unique}:2,{flags}"
+    lines = [f"{k}: {v}" for k, v in headers.items() if v is not None]
+    content = "\r\n".join(lines) + "\r\n\r\n" + "body text, never read by the indexer\r\n"
+    path = folder_path / subdir / filename
+    path.write_bytes(content.encode("utf-8"))
+    return path
+
+
+class IndexerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="email-triage-indexer-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.maildir_root = self.tmp / "mail"
+        self.db_path = self.tmp / "index.db"
+
+        icloud = self.maildir_root / "icloud"
+        gmail = self.maildir_root / "gmail"
+
+        # icloud: INBOX (= account root) + a nested Archive folder.
+        self.inbox_icloud = icloud
+        self.archive_housing = icloud / "Archive" / "Housing" / "2025-Colorado-Move"
+
+        # M1: will be flag-renamed in the mutation phase.
+        self.m1_path = write_message(
+            self.inbox_icloud,
+            "m1-unique",
+            "S",
+            {
+                "Message-ID": "<m1@example.com>",
+                "Date": "Mon, 01 Jun 2026 10:00:00 -0700",
+                "From": "Alice <alice@example.com>",
+                "To": "erik@example.com",
+                "Subject": "Flag me later",
+            },
+        )
+        # M2: will be moved cross-folder in the mutation phase.
+        self.m2_path = write_message(
+            self.inbox_icloud,
+            "m2-unique",
+            "",
+            {
+                "Message-ID": "<m2@example.com>",
+                "Date": "Tue, 02 Jun 2026 11:00:00 -0700",
+                "From": "Bob <bob@example.com>",
+                "To": "erik@example.com",
+                "Subject": "Move me later",
+            },
+        )
+        # M4: stays put; exercises nested folder naming.
+        write_message(
+            self.archive_housing,
+            "m4-unique",
+            "S",
+            {
+                "Message-ID": "<m4@example.com>",
+                "Date": "Wed, 03 Jun 2026 12:00:00 -0700",
+                "From": "Carol <carol@example.com>",
+                "To": "erik@example.com",
+                "Subject": "Closing statement",
+            },
+        )
+        # M5: will be deleted in the mutation phase.
+        self.m5_path = write_message(
+            self.archive_housing,
+            "m5-unique",
+            "S",
+            {
+                "Message-ID": "<m5@example.com>",
+                "Date": "Thu, 04 Jun 2026 13:00:00 -0700",
+                "From": "Dave <dave@example.com>",
+                "To": "erik@example.com",
+                "Subject": "Old receipt",
+            },
+        )
+
+        # gmail: INBOX with a missing-Message-ID message.
+        gmail_inbox = gmail / "INBOX"
+        write_message(
+            gmail_inbox,
+            "g1-unique",
+            "",
+            {
+                "Date": "Fri, 05 Jun 2026 09:00:00 +0000",
+                "From": "noreply@service.example.com",
+                "To": "erik@gmail.example.com",
+                "Subject": "No Message-ID here",
+            },
+        )
+
+        # gmail: dual-labeled message (Areas/Taxes + [Gmail]/All Mail).
+        areas_taxes = gmail / "Areas" / "Taxes"
+        all_mail = gmail / "[Gmail]" / "All Mail"
+        g2_headers = {
+            "Message-ID": "<g2@example.com>",
+            "Date": "Sat, 06 Jun 2026 08:00:00 +0000",
+            "From": "irs@example.com",
+            "To": "erik@gmail.example.com",
+            "Subject": "Your tax document",
+        }
+        write_message(areas_taxes, "g2-taxes-copy", "S", g2_headers)
+        write_message(all_mail, "g2-allmail-copy", "S", g2_headers)
+
+        # gmail: All-Mail-only message (virtual Archive tier).
+        write_message(
+            all_mail,
+            "g3-unique",
+            "S",
+            {
+                "Message-ID": "<g3@example.com>",
+                "Date": "Sun, 07 Jun 2026 07:00:00 +0000",
+                "From": "friend@example.com",
+                "To": "erik@gmail.example.com",
+                "Subject": "Archived thread",
+            },
+        )
+
+        # gmail: unrecognized folder (folder audit leftover).
+        newsletter = gmail / "Newsletter"
+        write_message(
+            newsletter,
+            "g4-unique",
+            "S",
+            {
+                "Message-ID": "<g4@example.com>",
+                "Date": "Mon, 08 Jun 2026 06:00:00 +0000",
+                "From": "digest@newsletter.example.com",
+                "To": "erik@gmail.example.com",
+                "Subject": "Weekly digest",
+            },
+        )
+
+    def run_indexer(self):
+        conn = indexer.init_db(self.db_path)
+        try:
+            accounts = indexer.resolve_accounts(self.maildir_root, None)
+            report = indexer.run_index(conn, self.maildir_root, accounts)
+            conn.commit()
+        finally:
+            conn.close()
+        return report
+
+    def query_tiers(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute("SELECT account, message_id, tier FROM message_tiers").fetchall()
+        finally:
+            conn.close()
+        return {(a, m): t for a, m, t in rows}
+
+    def test_full_lifecycle(self):
+        # --- First run: everything is new. ---
+        report1 = self.run_indexer()
+
+        self.assertEqual(report1["parse_errors"], 0)
+        self.assertEqual(len(report1["new"]), 9, report1["new"])
+        self.assertEqual(report1["moved"], [])
+        self.assertEqual(report1["deleted"], [])
+        self.assertEqual(report1["flag_changed"], [])
+        self.assertEqual(report1["unrecognized_folders"], ["Newsletter"])
+
+        new_ids = {e["message_id"] for e in report1["new"]}
+        self.assertIn("m1@example.com", new_ids)
+        self.assertIn("g2@example.com", new_ids)  # appears twice (two folders), but message_id is shared
+        # Synthetic id present for the missing-Message-ID message.
+        synthetic_ids = [mid for mid in new_ids if mid.startswith("synthetic-")]
+        self.assertEqual(len(synthetic_ids), 1)
+
+        tiers = self.query_tiers()
+        self.assertEqual(tiers[("icloud", "m1@example.com")], "inbox")
+        self.assertEqual(tiers[("icloud", "m2@example.com")], "inbox")
+        self.assertEqual(tiers[("icloud", "m4@example.com")], "archive")
+        self.assertEqual(tiers[("icloud", "m5@example.com")], "archive")
+        self.assertEqual(tiers[("gmail", synthetic_ids[0])], "inbox")
+        self.assertEqual(tiers[("gmail", "g2@example.com")], "areas")  # non-allmail wins over allmail
+        self.assertEqual(tiers[("gmail", "g3@example.com")], "archive")  # allmail-only -> virtual Archive
+        self.assertEqual(tiers[("gmail", "g4@example.com")], "unrecognized")
+        self.assertEqual(len(tiers), 8)  # g2's two rows collapse into one message_tiers row
+
+        # --- Second run, no filesystem changes: idempotent. ---
+        report2 = self.run_indexer()
+        self.assertEqual(report2["new"], [])
+        self.assertEqual(report2["moved"], [])
+        self.assertEqual(report2["deleted"], [])
+        self.assertEqual(report2["flag_changed"], [])
+        self.assertEqual(report2["parse_errors"], 0)
+
+        # --- Mutations: flag rename, cross-folder move, deletion. ---
+        m1_new = self.m1_path.with_name("m1-unique:2,FS")
+        self.m1_path.rename(m1_new)
+
+        m2_new = self.archive_housing / "cur" / self.m2_path.name
+        self.m2_path.rename(m2_new)
+
+        self.m5_path.unlink()
+
+        report3 = self.run_indexer()
+
+        self.assertEqual(report3["new"], [])
+        self.assertEqual(report3["parse_errors"], 0)
+
+        self.assertEqual(len(report3["flag_changed"]), 1)
+        fc = report3["flag_changed"][0]
+        self.assertEqual(fc["message_id"], "m1@example.com")
+        self.assertEqual(fc["account"], "icloud")
+        self.assertEqual(fc["folder"], "INBOX")
+
+        self.assertEqual(len(report3["moved"]), 1)
+        mv = report3["moved"][0]
+        self.assertEqual(mv["message_id"], "m2@example.com")
+        self.assertEqual(mv["account"], "icloud")
+        self.assertEqual(mv["from_folder"], "INBOX")
+        self.assertEqual(mv["to_folder"], "Archive/Housing/2025-Colorado-Move")
+
+        self.assertEqual(len(report3["deleted"]), 1)
+        de = report3["deleted"][0]
+        self.assertEqual(de["message_id"], "m5@example.com")
+        self.assertEqual(de["account"], "icloud")
+        self.assertEqual(de["folder"], "Archive/Housing/2025-Colorado-Move")
+
+        # DB state reflects the mutations.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            is_flagged, flags_json = conn.execute(
+                "SELECT is_flagged, flags FROM envelopes WHERE message_id = 'm1@example.com'"
+            ).fetchone()
+            self.assertEqual(is_flagged, 1)
+            self.assertIn("Flagged", json.loads(flags_json))
+        finally:
+            conn.close()
+
+        tiers_after = self.query_tiers()
+        self.assertEqual(tiers_after[("icloud", "m2@example.com")], "archive")  # moved into Archive
+        self.assertNotIn(("icloud", "m5@example.com"), tiers_after)  # deleted
+        self.assertEqual(len(tiers_after), 7)
+
+        # --- Fourth run, no further changes: idempotent again. ---
+        report4 = self.run_indexer()
+        self.assertEqual(report4["new"], [])
+        self.assertEqual(report4["moved"], [])
+        self.assertEqual(report4["deleted"], [])
+        self.assertEqual(report4["flag_changed"], [])
+
+    def test_init_creates_schema_only(self):
+        conn = indexer.init_db(self.db_path)
+        conn.close()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
+        finally:
+            conn.close()
+        self.assertIn("envelopes", tables)
+        self.assertIn("message_tiers", tables)
+        # No rows -- init doesn't touch the (nonexistent) maildir.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM envelopes").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(count, 0)
+
+    def test_bad_maildir_root_is_fatal(self):
+        with self.assertRaises(indexer.FatalError):
+            indexer.resolve_accounts(self.tmp / "does-not-exist", None)
+
+    def test_unknown_account_is_fatal(self):
+        with self.assertRaises(indexer.FatalError):
+            indexer.resolve_accounts(self.maildir_root, ["not-a-real-account"])
+
+    def test_account_filter_scopes_to_selected_accounts(self):
+        conn = indexer.init_db(self.db_path)
+        try:
+            accounts = indexer.resolve_accounts(self.maildir_root, ["icloud"])
+            report = indexer.run_index(conn, self.maildir_root, accounts)
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertTrue(all(e["account"] == "icloud" for e in report["new"]))
+        self.assertEqual(report["unrecognized_folders"], [])  # Newsletter lives under gmail, not indexed
+
+
+if __name__ == "__main__":
+    unittest.main()
