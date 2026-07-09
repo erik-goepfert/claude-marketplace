@@ -106,6 +106,26 @@ No mbsync, no Maildir, no index.
       but *omits* `References` — the skill constructs it from the parent's
       headers (§13.2's fallback). Correct folder flag is `-f` (the plan's
       `-m` was wrong).
+      **Amendment (2026-07-04):** found (via direct testing, prompted by a
+      user question, not a session review) that `himalaya message read`
+      marks `\Seen` even when only extracting a header — the full message
+      is fetched underneath regardless of `--header` filtering. SKILL.md's
+      two documented body-read paths (ambiguous-classification, unsubscribe
+      extraction) were calling plain `message read`, so Claude's own
+      internal peeking was silently marking things read — corrupting a
+      signal that belongs to the user, not to triage. Fixed: both paths
+      (plus the parent-header lookup for `References`) now use `--preview`,
+      confirmed empirically to suppress `\Seen`; marking read is now a
+      deliberate `flag add ... seen` only when content is actually shown to
+      the user. New Operating rule 5 in SKILL.md and §4.5 in the design doc
+      codify this. `template reply`/`message reply` have no preview
+      equivalent and were left as-is — accepted, since the draft they
+      produce quotes the original back to the user before anything sends.
+      **Amendment (2026-07-04):** with `\Seen` now trustworthy (Claude's own
+      reads can no longer dirty it), the priority scan (§11) is scoped to
+      unseen messages only — an already-seen thread has had its one chance
+      to interrupt and re-surfacing it is just noise. Checked from envelope
+      flags already in hand, no extra read.
 - [x] **1.2 Event + note logging helpers.** Small Python CLI (or documented
       sqlite3 one-liners) the skill calls to insert events and session notes.
       Full `proposed/final/decided_by` semantics and skip rules from §9 apply
@@ -257,25 +277,90 @@ accumulate across sessions; Claude visibly uses prior-session context.
 The local mirror and index land underneath the working MVP practice.
 
 - [ ] **2.1 mbsync channels, both accounts.** `Sync All` / `Expunge Both` /
-      `CopyArrivalDate yes`; `Patterns * !Inactive/*`; Gmail channel excludes
-      `[Gmail]/All Mail` (§7.1). Initial clones (the only slow syncs).
+      `CopyArrivalDate yes`; `Patterns *` — everything syncs, **including
+      `[Gmail]/All Mail`** (§7.1). Initial clones (the only slow syncs).
+      **Revised (2026-07-09, taxonomy):** the earlier `!Inactive/*` and
+      All-Mail exclusions are both dropped. The taxonomy
+      (`email-folder-taxonomy.md`) dissolves legacy folders instead of
+      parking them, and All Mail is the only place natively-archived Gmail
+      mail exists — Gmail's `Archive` tier is virtual, read from the native
+      no-label state, so All Mail must mirror. Duplicate label/All-Mail
+      copies are deduped at index time (2.4).
+      **Pre-clone sizing (2026-07-04):** Google reports 3 GB total for the
+      Gmail account — disk space is a non-issue even at the full ~6 GB
+      worst case now that everything mirrors. `MaxSize` stays unused.
+      Attachments come down automatically as part of each message file
+      (Maildir = complete raw message; extract later via `himalaya
+      attachment download` — local, no network). Prefer running the 2.3
+      folder audit *before* the initial clone so the first sync doesn't
+      pull folders about to be reorganized — ordering preference, not a
+      requirement.
 - [ ] **2.2 Verification suite §13 in full, both accounts** — now including
       §13.3 round-trip (local flag/move/trash → server; phone-side changes →
-      local) and §13.4 envelope JSON schema. **Gate everything downstream on
-      this.**
-- [ ] **2.3 Folder audit.** Move inactive folders under `Inactive/` (per-account
-      pass; easiest in the native clients).
+      local), §13.4 envelope JSON schema, §13.5 Gmail label-removal
+      round-trip (delete from a label's local folder → sync → label removed
+      server-side, message stays in All Mail; the virtual-Archive model
+      rests on this, and it depends on Gmail's IMAP auto-expunge settings —
+      pin them), and §13.6 nested folder/label creation on both accounts
+      (`Areas/<area>/<project>` needs two levels). **Gate everything
+      downstream on this.**
+- [ ] **2.3 Folder audit & taxonomy migration.** The high-level structure is
+      now fixed (`email-folder-taxonomy.md`: Inbox / Active / Areas/… /
+      Archive, canonical across both accounts via per-account adapters);
+      this step instantiates it against real mail, per account:
+      (a) decide the concrete Areas and project subfolders with data in
+      hand — analyze per-folder volumes, sender domains, and content mix
+      from envelope listings or the index (the 2026-07-04 scope expansion,
+      unchanged) — and create the `Active` / `Areas/…` structure (§13.6
+      verifies nesting works first);
+      (b) dissolve every legacy folder into the taxonomy — contents to an
+      Area, a project subfolder, or Archive; delete the emptied folder.
+      This includes the MVP-era explicit `Archive` label on Gmail: its
+      contents become natively archived (label removed, mail remains in All
+      Mail), since post-taxonomy Gmail's Archive tier is virtual;
+      (c) confirm no Gmail label survives outside the taxonomy — the 2.4
+      indexer treats unrecognized labels as audit leftovers to surface, not
+      as Archive.
+      **Superseded (2026-07-09):** the original "park inactive folders under
+      `Inactive/`" approach — nothing is parked or excluded from sync
+      anymore. And since All Mail now syncs (2.1), the earlier "mirror is a
+      working set, not a backup" caveat is gone: the mirror is a complete
+      local copy, natively-archived Gmail mail included.
 - [ ] **2.4 Indexer** (`index.db`): three-pass reconciliation, change-report
       output contract, synthetic Message-IDs, UTC normalization (§7.4, §8).
+      **Added scope (2026-07-09, taxonomy):** canonical-tier derivation —
+      dedup Gmail All-Mail duplicates by Message-ID (a message's tier comes
+      from its non-All-Mail folder when one exists), classify All-Mail-only
+      messages as the virtual `Archive` tier (Sent/Trash/Spam excluded from
+      the inference), and surface unrecognized labels rather than letting
+      them fall through to Archive.
 - [ ] **2.5 Thread assembly queries:** recursive CTE / References-root
-      grouping, guarded subject fallback, both entry modes, INBOX+Sent rollup
-      + inactive-days (§9–10 of the design's threading section).
+      grouping, guarded subject fallback, both entry modes, inactive-days
+      (§9–10 of the design's threading section).
+      **Revised (2026-07-09, taxonomy):** thread state is
+      `OR(\Flagged over the thread)`, not the latest message's flag —
+      decoupled from recency by design. `waiting` vs. `holding` is derived
+      via Sent correlation on unflagged Active threads; the
+      needs-reply/holding/waiting event vocabulary is unchanged.
 - [ ] **2.6 Switch the skill's read/act layer to the Maildir backend:**
       himalaya Maildir accounts, session lockfile, resolve-before-act,
       batch-boundary syncs (§7.5, §11, §12). Measure sync latency (§15.5).
+      **Added scope (2026-07-09, taxonomy):** the two thread-wide write
+      paths — flag writes are always clear-then-set across the whole thread,
+      and tier moves always move the thread as a unit (system folders stay
+      put; threads never move *to* Inbox). On Gmail, moving to Archive =
+      removing tier labels (mechanics per the §13.5 verification).
 - [ ] **2.7 Skill upgrade:** thread-based triage from `index.db`; accurate
       inactive-days; manual events from the change report (external moves,
       flags, and Sent-detected replies, §9); rule proposals from sender_stats.
+      **Added scope (2026-07-09, taxonomy):** cut SKILL.md over to the
+      Active-tier state model (the taxonomy doc's Migration section lists
+      exactly what replaces what); reconciliation flow for arrivals on
+      filed threads (stays-resolved → join siblings / reopens → whole
+      thread to Active / refiles → whole thread to new location); and the
+      PARA review phase — weekly/on-demand graduation proposals for
+      `Areas/<area>/<project>` subfolders (approval-gated, inactivity as
+      candidate signal only, no event logged).
 - [ ] **2.8 History backup.** `history.db` is the irreplaceable file — wire it
       into whatever backup covers the home directory, explicitly.
 
@@ -291,6 +376,14 @@ The local mirror and index land underneath the working MVP practice.
 ## Phase 3 — Optional, on demand
 
 - [ ] DuckDB attached read-only over both files for trend analytics (§9).
+      **Decision (2026-07-04):** the learning loop itself (context read,
+      sender_stats, rule proposals) is core and SQLite-backed — this item is
+      only about DuckDB as a richer query engine. When analytics deepen in
+      the skill, they land as `history.py` subcommands (e.g. per-domain
+      stats, trends), not as raw SQL written in-session; and if a helper
+      does adopt DuckDB, the attach quirks documented in §9 (aggregate
+      views unreadable via the sqlite scanner; boolean predicates need
+      `::INT` casts) get encoded in that helper once, never in SKILL.md.
 - [ ] Richer rule predicates, only when sender-equality proves insufficient
       (§15.4).
 - [ ] Skip-pattern nudges ("deferred five times — archive or long-term hold?").

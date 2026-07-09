@@ -57,6 +57,25 @@ plugin, under `$CLAUDE_PLUGIN_ROOT/skills/email-triage/scripts/`).
    trash folder from `config.yaml`. Never expunge, never `flag add deleted`.
 4. **Unsubscribe links are surfaced, never followed.** Extract and present
    them; never fetch, click, or otherwise interact with them.
+5. **`\Seen` is the user's signal, not triage state — your own reads must
+   never move it.** A message counts as read only once the user has been
+   shown its content or a representative summary of it; Claude privately
+   extracting a header or a body to classify or resolve ambiguity is not
+   that. Concretely:
+   - Any read done for your own purposes (unsubscribe extraction, resolving
+     `ambiguous`, pulling a parent's headers for `References`) uses
+     `himalaya message read --preview` — confirmed this suppresses `\Seen`
+     (plain `message read`, even with `--header` to filter output, still
+     fetches and marks the full message; verified empirically).
+   - Only mark a message read by explicitly setting it —
+     `himalaya flag add -a <acct> -f INBOX <id> seen` — at the moment you
+     actually present its content or summary to the user. Don't rely on a
+     read command's side effect for this; make it a deliberate action.
+   - Exception: `himalaya template reply` / `message reply` have no preview
+     equivalent and do mark `\Seen`. That's fine here — a reply draft
+     quotes the original back to the user before anything sends, so the
+     "shown a representative summary" condition is already met by the time
+     it happens.
 
 ## Session flow
 
@@ -107,7 +126,18 @@ Two axes per thread:
 **Priority scan — before the breakdown, before anything else.** Security and
 time-sensitive signals are surfaced first, regardless of what content
 category they'd otherwise land in. This is not left to in-the-moment
-judgment — always check for it, every session. Flag a thread here if it's:
+judgment — always check for it, every session.
+
+**Scope: unseen only.** A thread enters this scan only if its latest
+message lacks `\Seen` — check `flags` in the envelope JSON already fetched
+at session start, no extra read needed. A message you've already seen (in
+this client or another) has already had its one chance to interrupt you;
+don't re-surface it here. This only works because rule 5 keeps `\Seen`
+uncorrupted — a signal Claude's own reads never touch is one this scan can
+actually trust. An already-seen security-shaped thread still gets triaged
+normally in the regular flow below, just not as a priority interrupt.
+
+Flag a thread here if it's:
 
 - a security notification: new sign-in / new device, new SSH or API key or
   app password added, password or recovery-info changed, MFA/2FA settings
@@ -140,16 +170,21 @@ Then, for everything else:
 3. **Targeted body reads only**, for exactly two reasons: resolving an
    `ambiguous` classification, or extracting unsubscribe links from
    marketing/newsletters — category by category as each is worked, never
-   upfront. Read with:
-   `himalaya message read -a <acct> -f INBOX <id>`
+   upfront. Read with `--preview` (rule 5 — this is you looking, not the
+   user):
+   `himalaya message read --preview -a <acct> -f INBOX <id>`
+   If resolving the ambiguity means actually showing the user the content
+   or a summary of it, mark it read at that point:
+   `himalaya flag add -a <acct> -f INBOX <id> seen`
 4. **Unsubscribe extraction:** prefer the `List-Unsubscribe` header
-   (`himalaya message read --header list-unsubscribe ...`) over body-scraped
-   links. Present the link; the user acts on it themselves (rule 4). Clicking
-   it is invisible to you by design — **ask** ("unsubscribe too, or just
-   clear this one?") and log the answer via `--unsubscribed` on that event
-   (see Logging). Don't ask on every single marketing/newsletter thread if
-   the user has clearly indicated a batch answer ("unsubscribe from all of
-   these") — apply it to each event in the batch.
+   (`himalaya message read --preview --header list-unsubscribe ...`) over
+   body-scraped links. Present the link; the user acts on it themselves
+   (rule 4) — extracting it is never itself a reason to mark `\Seen`.
+   Clicking it is invisible to you by design — **ask** ("unsubscribe too, or
+   just clear this one?") and log the answer via `--unsubscribed` on that
+   event (see Logging). Don't ask on every single marketing/newsletter
+   thread if the user has clearly indicated a batch answer ("unsubscribe
+   from all of these") — apply it to each event in the batch.
 5. Apply active rules from `history.db` when they match — still within the
    approval gates; a rule justifies a proposal, not an autonomous action
    (flags excepted).
@@ -191,14 +226,18 @@ below for one bulk history write to match.
   1. `himalaya template reply -a <acct> -f INBOX <id>` — generates the
      template with `From`/`To`/`Subject`/`In-Reply-To` prefilled.
   2. **Add the `References` header yourself** — the template omits it. Fetch
-     the parent's headers
-     (`himalaya message read -a <acct> -f INBOX --header references --header message-id <id>`)
+     the parent's headers with `--preview` (mechanical extraction, not
+     showing the user anything yet — rule 5):
+     (`himalaya message read --preview -a <acct> -f INBOX --header references --header message-id <id>`)
      and set `References:` = parent's References + parent's Message-ID.
   3. Write the body (quote below, reply above, matching the user's voice —
      confirm tone on first sessions). Save the full template to a temp file.
   4. Show the complete draft to the user. Only after explicit approval:
      `himalaya template send -a <acct> "$(cat <tmpfile>)"`.
-  Sending sets `\Answered` on the original automatically.
+  Sending sets `\Answered` on the original automatically. Note:
+  `template reply` itself (step 1) does mark `\Seen` on the original, with
+  no preview equivalent — accepted per rule 5's exception, since the draft
+  it produces quotes that content back to the user before anything sends.
 
 ## Logging (every decision, at act time)
 

@@ -3,7 +3,9 @@
 **Status:** Draft / pre-implementation
 **Backend target:** iCloud + Gmail (standard IMAP)
 **Primary consumer:** Claude (via a Claude skill), not a human UI
-**Companion:** `implementation-plan.md` (phased rollout: MVP → full stack)
+**Companions:** `implementation-plan.md` (phased rollout: MVP → full stack);
+`email-folder-taxonomy.md` (folder structure, flag semantics, and thread-state
+model — supersedes §10's state tables at Phase 2 cutover)
 
 ---
 
@@ -80,6 +82,22 @@ These are behavioral commitments, not implementation details.
 4. **Unsubscribe links are surfaced, never followed.** Claude extracts
    unsubscribe links and presents them for the user to act on manually; it
    never navigates to or interacts with the link itself.
+5. **`\Seen` belongs to the user, not to triage.** Claude reading a message
+   to classify it, resolve ambiguity, or extract a header is not the same
+   event as the user reading it, and must not move the flag. A message
+   counts as read only once the user has actually been shown its content or
+   a representative summary. Verified against himalaya v1.2.0: plain
+   `message read` marks `\Seen` even when only `--header` output is
+   requested — the full message is still fetched underneath — but
+   `--preview` suppresses it. `template reply`/`message reply` have no
+   preview equivalent and always mark `\Seen`; accepted, since a reply
+   draft quotes the original back to the user before anything sends, so
+   the "shown a summary" condition is already satisfied by the time it
+   happens. Every other programmatic read (unsubscribe extraction,
+   ambiguous-classification reads, parent-header lookups for `References`)
+   uses `--preview`; marking read, when warranted, is a deliberate
+   `flag add ... seen` at the moment content is actually shown — never an
+   incidental side effect of fetching it.
 
 ---
 
@@ -102,9 +120,15 @@ reasoning isn't lost.
   in this design.
 
 - **Gmail-over-IMAP has quirks the config must absorb.** Every message appears
-  in `[Gmail]/All Mail` *and* under each of its labels, so the Gmail sync
-  channel excludes All Mail and archiving uses an explicit `Archive` label,
-  keeping folder semantics identical to iCloud's. Gmail's IMAP lacks the SORT
+  in `[Gmail]/All Mail` *and* under each of its labels. The original design
+  excluded All Mail from sync and archived to an explicit `Archive` label;
+  superseded (2026-07-09) by the taxonomy's adapter model: All Mail *is*
+  synced — it's the only place natively-archived Gmail mail exists — the
+  duplicate copies are deduped at index time by Message-ID, and `Archive` on
+  Gmail is a **virtual tier** derived from the native no-label state rather
+  than a managed label (see `email-folder-taxonomy.md`, Canonical locations).
+  Net effect: any client's native archive button is taxonomy-correct with
+  zero reconciliation. Gmail's IMAP lacks the SORT
   capability, so `himalaya envelope search` fails against it — `envelope list`
   works fine, and post-MVP all queries are local anyway. `\Flagged` surfaces
   as the **star** in Gmail clients, which extends phone triage (§4.2) to both
@@ -206,12 +230,19 @@ flowchart LR
   common mbsync foot-gun.
 - `CopyArrivalDate yes` so moved messages keep their original arrival dates
   rather than appearing as "new" at move time.
-- `Patterns * !Inactive/*` directly implements the active/inactive folder split
-  (§15) — inactive folders simply aren't synced or indexed.
+- `Patterns *` — everything syncs. (Earlier drafts excluded an `Inactive/*`
+  parking lot; dropped 2026-07-09 — the folder audit dissolves legacy folders
+  into the taxonomy instead of parking them, and full local retrieval wants
+  the resolved tiers mirrored anyway. See `email-folder-taxonomy.md`, Sync
+  coverage.)
 - **One channel per account.** iCloud syncs normally. The Gmail channel
-  additionally excludes `[Gmail]/All Mail` (every message would otherwise land
-  twice — once per label, once in All Mail) and archives to an explicit
-  `Archive` label so both accounts share identical folder semantics.
+  **includes `[Gmail]/All Mail`** (revised 2026-07-09; previously excluded) —
+  every labeled message therefore lands twice, once per label and once in All
+  Mail, and the indexer dedups by Message-ID. The duplication is the price of
+  mirroring Gmail's native archive state, which the taxonomy reads as a
+  virtual `Archive` tier instead of maintaining an explicit label
+  (`email-folder-taxonomy.md`). Storage roughly doubles for Gmail; trivial at
+  current sizes (§ plan 2.1 sizing note).
   Special-folder names differ per account (`Sent` vs `[Gmail]/Sent Mail`,
   etc.); the skill carries a per-account folder map. On first run the skill
   bootstraps it: `folder list` per account, confirm archive/trash targets with
@@ -344,9 +375,13 @@ Notes:
 
 A single table. Threads are a query-time derivation from the envelope graph
 (recursive CTE), not a stored entity, so there is no threads table. Per-folder
-sync state isn't needed either: active vs. inactive is encoded by the
-`Inactive/` path convention, and per-message `indexed_at` plus the snapshot
-pass give incrementality.
+sync state isn't needed either: everything syncs (no active/inactive split —
+see `email-folder-taxonomy.md`), and per-message `indexed_at` plus the
+snapshot pass give incrementality. The Gmail All-Mail duplicates (§7.1) are
+ordinary rows here — identity is `(folder, maildir_key)`, so the same
+Message-ID legitimately appears once per containing folder; tier
+classification (taxonomy doc) prefers the non-All-Mail row and reads
+All-Mail-only membership as the virtual `Archive` tier.
 
 ```sql
 CREATE TABLE envelopes (
@@ -600,6 +635,25 @@ files read-only** and queries them in place — including joins across index and
 history. DuckDB is strictly a lens: all writes to both files remain owned by
 the Python scripts. Nothing in the system depends on DuckDB existing.
 
+The attach is `INSTALL sqlite; LOAD sqlite; ATTACH '<file>' AS h (TYPE sqlite,
+READ_ONLY);`. Two gotchas, verified against DuckDB 1.5 over the real
+`history.db`, because the attach is not fully transparent:
+
+- **Query the base tables, not the SQLite views.** DuckDB's sqlite scanner
+  cannot execute a view whose stored definition contains SQLite's internal
+  `count_star()` (what a `COUNT(*)` view compiles to) — it fails with
+  `no such function: count_star`. `sender_stats` (§9) is exactly such a view,
+  so from DuckDB it is unreadable; re-express its logic as a native DuckDB
+  query against `events` instead. This is a property of *every* aggregate view
+  in these files, not a one-off, so DuckDB analysis always works from the
+  tables.
+- **Cast booleans to INT explicitly.** SQLite treats `x = 'y'` as `0/1`, so
+  `AVG(final_action = 'reply')` "just works" there. DuckDB keeps it BOOLEAN and
+  rejects `avg(BOOLEAN)`; write `AVG((final_action = 'reply')::INT)`. Same for
+  `SUM` over a predicate. The `sender_stats` DDL in §9 is written in the
+  SQLite idiom on purpose (that view is owned by SQLite); the cast is only
+  needed when reproducing that logic on the DuckDB side.
+
 ---
 
 ## 10. Threading & state model
@@ -622,6 +676,16 @@ the Python scripts. Nothing in the system depends on DuckDB existing.
 
 ### Flag & state model
 
+> **Supersession note (2026-07-09):** the model below is the MVP-era state
+> model and remains accurate for the running MVP. The post-Phase-2 target —
+> an `Active` tier for triaged-live mail, thread state as `OR(\Flagged)` with
+> thread-wide clear-then-set writes (decoupling state from message recency),
+> and Gmail's `Archive` as a virtual tier — is defined in
+> `email-folder-taxonomy.md`, which supersedes this and the rollup tables
+> below at cutover (plan 2.5–2.7). The event vocabulary
+> (`needs-reply`/`holding`/`waiting`) survives unchanged as a read-time
+> derivation.
+
 Single meaningful state, within flags guaranteed to work everywhere:
 
 | Situation | Representation |
@@ -635,6 +699,9 @@ Single meaningful state, within flags guaranteed to work everywhere:
   automated trigger.
 - Finer state, if ever needed, goes in the history DB — never a custom IMAP
   keyword.
+- **`\Seen` is deliberately absent from this table.** It's not a triage
+  state — it's the user's own read/unread signal, and the design goes out
+  of its way (§4.5) to make sure Claude's own reads never move it.
 
 ### Thread-level rollup
 
@@ -734,6 +801,13 @@ Phase 4 follows a classify-first discipline:
    "surface the review/revoke link" (§4.4: never followed). Logged as
    `category=actionable` with the priority-scan trigger noted in the event's
    free-text `notes`.
+   **Scoped to unseen messages only** (added 2026-07-04): a thread enters
+   the scan only if its latest message lacks `\Seen`, checked from the
+   envelope flags already in hand — an already-seen message has already had
+   its one chance to interrupt, and re-surfacing it here would just be
+   noise. This scoping is only trustworthy because §4.5 keeps `\Seen`
+   uncorrupted by Claude's own reads; a signal the skill itself could dirty
+   wouldn't be safe to gate anything on.
 3. **Present the breakdown next.** Before any other action or body read, the
    user sees the full category summary with counts and a proposed next step —
    "147 threads: 12 spam, 31 marketing, 14 newsletters, 58 passive updates,
@@ -809,6 +883,17 @@ historically auto-saves sent mail to its Sent folder; iCloud may not).
 4. **Envelope JSON schema.** Confirm field names/shapes on the installed
    himalaya version before any code trusts them (wrapped vs. bare list; flags
    as strings vs. objects; `from` as object vs. list).
+5. **Gmail label-removal round-trip** (added 2026-07-09; the virtual-Archive
+   model rests on it). Remove a test message from a Gmail label's local
+   Maildir folder, sync, and verify Gmail's server-side result is "label
+   removed, message remains in All Mail" — not moved to Trash and not
+   deleted. The outcome depends on Gmail's IMAP auto-expunge / "when a
+   message is expunged from the last visible folder" settings; pin those
+   settings and re-verify before building the act layer (2.6).
+6. **Nested folder/label creation, both accounts** (added 2026-07-09). The
+   taxonomy needs two-level nesting (`Areas/<area>/<project>`): real
+   hierarchy on iCloud, `/`-named labels on Gmail. One
+   `folder create` + list + delete round-trip per account.
 
 ---
 
@@ -822,16 +907,18 @@ historically auto-saves sent mail to its Sent folder; iCloud may not).
 | Python 3 stdlib (`mailbox`, `email`, `sqlite3`) | Indexer + event logging | No third-party deps |
 | SMTP sender (`himalaya` send or `msmtp`) | Outgoing mail | Standard; behavior verified by §13.1 |
 | Password source (1Password CLI / `pass` / keyring) | Credentials for mbsync + SMTP | Keep secrets out of plaintext config |
-| DuckDB | *(optional)* read-only analytics over both SQLite files | Nothing depends on it; add only when wanted |
+| DuckDB | *(optional)* read-only analytics over both SQLite files | Nothing depends on it; add only when wanted. Attach quirks (aggregate views unreadable, boolean casts) documented in §9 Analytics access. |
 | **Neverest** | *(evaluated, not adopted)* | Beta, single-dev, "not for production." Revisit only at a stable 1.0. |
 
 ---
 
 ## 15. Open questions
 
-1. **Folder audit.** Enumerate top-level folders, decide which are active, move
-   the rest under `Inactive/` (a rename in IMAP terms — easiest in Apple Mail).
-   Leave special-use folders (Sent, Trash) at top level regardless of recency.
+1. **Folder audit.** Enumerate top-level folders and dissolve legacy folders
+   into the taxonomy (`Areas/…` / `Archive` — see `email-folder-taxonomy.md`).
+   The earlier plan to park them under an unsynced `Inactive/` is dropped
+   (2026-07-09): everything syncs. Special-use folders (Sent, Trash) stay at
+   top level regardless of recency.
 2. **Indexer performance at real mailbox size.** Expected trivial for the
    active set; only matters if a large Archive is indexed in full. Measure once
    with real data before optimizing anything.
@@ -860,13 +947,15 @@ Rollout is phased: an **MVP** (direct-IMAP triage + history logging, no local
 mirror) precedes this full build — see `implementation-plan.md`. The sequence
 below is the full stack.
 
-1. **`mbsync` → both accounts** into a local Maildir, `Patterns * !Inactive/*`,
-   explicit `Sync All` / `Expunge Both` / `CopyArrivalDate yes`. Verify Sent +
-   Archive come down.
+1. **`mbsync` → both accounts** into a local Maildir, `Patterns *`
+   (everything, including `[Gmail]/All Mail` — §7.1), explicit `Sync All` /
+   `Expunge Both` / `CopyArrivalDate yes`. Verify Sent + Archive + All Mail
+   come down.
 2. **Run the verification suite (§13).** Gate everything downstream on it —
    especially the round-trip test, which validates the riskiest assumption in
    the stack (bidirectional correctness).
-3. **Folder audit.** Move inactive folders under `Inactive/`.
+3. **Folder audit.** Dissolve legacy folders into the taxonomy (§15.1);
+   create the `Active` / `Areas/…` structure per `email-folder-taxonomy.md`.
 4. **Indexer** with the three-pass reconciliation (§7.4).
 5. **Thread assembly queries.** Recursive CTE / References-root grouping; the
    two entry modes; rollup + inactive-days.
@@ -883,15 +972,34 @@ below is the full stack.
 
 Rationale lives in the body; this is the index of choices.
 
-- Inbox Zero + GTD hybrid: active mail stays in inbox until *the user* resolves it → Archive/Trash.
+- Inbox Zero + GTD hybrid: active mail stays in inbox until *the user* resolves it → Archive/Trash. *(MVP model; post-Phase-2, triaged-live mail moves to an `Active` tier — `email-folder-taxonomy.md`.)*
 - One flag: `\Flagged` = needs-reply; everything else in inbox is holding; `\Answered` is metadata.
 - `\Flagged` reserved system-wide — flagging in any client queues for the skill.
 - Approval gate: drafts always shown; sends/moves/trash approved in-session; flags may be autonomous.
+- `\Seen` is the user's signal, not triage state: programmatic reads (classification, unsubscribe extraction, header lookups) always use `--preview`; marking read is a deliberate `flag add ... seen` only when content is actually shown to the user. Reply drafting is the one accepted exception, since it quotes the original back before sending.
 - Trash = move to Trash folder, never expunge; iCloud auto-purge finalizes.
-- Threads, not messages; thread state = latest INBOX/Sent message's state.
+- Threads, not messages; thread state = latest INBOX/Sent message's state. *(MVP model; target is `OR(\Flagged)` over the thread with thread-wide clear-then-set writes, decoupling state from recency — taxonomy doc.)*
 - Threads derived at query time, never stored; the index is a single `envelopes` table.
 - No Gmail-style labels (multi-label tagging); both accounts in scope from day
-  one — the Gmail channel excludes All Mail and archives to an explicit label.
+  one. *(Revised 2026-07-09: the Gmail channel now includes All Mail, and
+  archive on Gmail is a virtual tier read from the native no-label state
+  rather than an explicit label — taxonomy doc.)*
+- Canonical locations with per-account adapters (2026-07-09): the taxonomy is
+  defined over logical names; each account maps them to physical state.
+  Gmail's `Archive` is virtual (native archived state read as-is at index
+  time, never written back), so any client's native archive action is
+  taxonomy-correct with zero reconciliation or habit change.
+- Everything syncs (2026-07-09): no `Inactive/` parking lot, All Mail
+  included; the Gmail duplicate copies are deduped at index time; storage
+  doubling accepted (trivial at ~3 GB).
+- Threads stick together (2026-07-09): tier moves are thread-wide; threads
+  never move *to* Inbox; system folders (Sent especially) sit outside the
+  tier model and reunify at read time.
+- Project graduation is not logged as events: folder-level, no per-sender
+  learning signal; active windows reconstructable from Maildir mtimes.
+- Gmail Trash/Spam auto-purge (~30 days) recorded as an adapter property: the
+  trash rule's "reversible ~30 days" is a floor on iCloud, a hard ceiling on
+  Gmail.
 - MVP first: direct-IMAP triage with history logging from session one; the full
   stack follows (see `implementation-plan.md`).
 - Local Maildir + SQLite index, copying how real clients thread across folders.
@@ -913,7 +1021,7 @@ Rationale lives in the body; this is the index of choices.
 - Synthetic Message-IDs at index time for messages missing the header.
 - Subject fallback requires participant overlap before merging.
 - Classify-first triage: everything classified from envelopes + history before any body read; category breakdown presented before any action; categories worked easiest-first (noise before attention).
-- Priority scan ahead of the breakdown: security/time-sensitive threads (new sign-in, new SSH/API key, MFA change, suspicious charge, expiration/deadline language) always surface first, as an explicit rule rather than incidental model judgment (added after the MVP's first session).
+- Priority scan ahead of the breakdown: security/time-sensitive threads (new sign-in, new SSH/API key, MFA change, suspicious charge, expiration/deadline language) always surface first, as an explicit rule rather than incidental model judgment (added after the MVP's first session). Scoped to unseen messages only — an already-seen thread has already had its chance to interrupt.
 - Two classification axes: lifecycle state and content category; the category is snapshotted on every event.
 - Targeted body reads only: ambiguity resolution and unsubscribe extraction.
 - Unsubscribe links surfaced (`List-Unsubscribe` header preferred), never followed.
