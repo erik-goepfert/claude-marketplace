@@ -426,9 +426,23 @@ The local mirror and index land underneath the working MVP practice.
       messages as the virtual `Archive` tier (Sent/Trash/Spam excluded from
       the inference), and surface unrecognized labels rather than letting
       them fall through to Archive.
-- [ ] **2.5 Thread assembly queries:** recursive CTE / References-root
+- [x] **2.5 Thread assembly queries:** recursive CTE / References-root
       grouping, guarded subject fallback, both entry modes, inactive-days
       (§9–10 of the design's threading section).
+      **Outcome (2026-07-09):** built as `scripts/threads.py` +
+      `test_threads.py` (11 cases green). Implementation notes: connected
+      components via union-find in Python rather than a recursive CTE
+      (same result, simpler to guard); subject fallback restricted to
+      singleton (link-less) components as merge sources — prevents two
+      independently-linked threads from ever merging on subject alone;
+      state model is the revised taxonomy one (OR(\Flagged) over
+      non-trash/junk members, anti-recency property unit-tested; trash/
+      junk history-only; latest-is-sent ⇒ waiting). Live verification:
+      47 threads across both inboxes; the single `waiting` thread was
+      independently confirmed correct (user replied 2026-06-26; builder
+      thread; inactive_days=13 exact); `show` round-trips by
+      References-root. Threads remain a query-time derivation — no
+      threads table, per §8.
       **Revised (2026-07-09, taxonomy):** thread state is
       `OR(\Flagged over the thread)`, not the latest message's flag —
       decoupled from recency by design. `waiting` vs. `holding` is derived
