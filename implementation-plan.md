@@ -448,9 +448,40 @@ The local mirror and index land underneath the working MVP practice.
       decoupled from recency by design. `waiting` vs. `holding` is derived
       via Sent correlation on unflagged Active threads; the
       needs-reply/holding/waiting event vocabulary is unchanged.
-- [ ] **2.6 Switch the skill's read/act layer to the Maildir backend:**
+- [x] **2.6 Switch the skill's read/act layer to the Maildir backend:**
       himalaya Maildir accounts, session lockfile, resolve-before-act,
       batch-boundary syncs (§7.5, §11, §12). Measure sync latency (§15.5).
+      **Outcome (2026-07-09): plumbing built and verified live; skill-side
+      wiring (SKILL.md rewrite, session lockfile convention, batch-boundary
+      orchestration) deliberately folded into 2.7 — they're SKILL.md
+      concerns.** What exists and is verified:
+      - `icloud-local`/`gmail-local` himalaya Maildir accounts (user
+        config; requires `email` field; sending stays on the IMAP
+        accounts' SMTP).
+      - **Empirical verdict per operation:** himalaya-local reads are safe
+        with `--preview` (verified controlled pair: preview leaves the
+        filename alone; a plain read stamps `S`, which would sync `\Seen`
+        — rule §4.5 applies identically on the local backend). Flag ops
+        via himalaya-local are mbsync-safe (suffix-only rename). **Moves
+        via himalaya-local are UNUSABLE**: the `,U=` token travels to the
+        target folder and mbsync hard-errors ("UID N is beyond highest
+        assigned UID"), refusing the upload while having already synced
+        the source-side deletion — verified live, then repaired.
+      - `scripts/act.py` is therefore the move layer: U=-stripping rename
+        with resolve-before-act (index supplies folder+key, disk supplies
+        the CURRENT filename), collision refusal, and a `remove`
+        subcommand for the Gmail virtual-Archive write path (tier-label
+        strip; guarded — refuses to delete a message's only copy).
+        Verified live end-to-end: act.py move → box-scoped sync → server
+        correct → indexer change report classifies exactly one "moved".
+        `test_act.py` 6 cases green.
+      - Indexer hardening found during this work: mbsync re-stamps `,U=`
+        after uploading an act.py-written file — same message, same
+        folder, new maildir key — which pass 3 misread as deleted+new
+        (would have produced phantom `manual` events, §9). Fixed with
+        self-excluding, snapshot-checked same-folder matching; regression
+        test added (first fix attempt ate real moves — caught by the
+        existing suite).
       **Added scope (2026-07-09, taxonomy):** the two thread-wide write
       paths — flag writes are always clear-then-set across the whole thread,
       and tier moves always move the thread as a unit (system folders stay

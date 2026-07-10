@@ -479,6 +479,22 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list) -> d
     for k in sorted(orphan_keys):
         row = existing_map[k]
         account, folder = row["account"], row["folder"]
+        same_folder = [
+            r for r in current_by_msgid.get((account, row["message_id"]), [])
+            if r["folder"] == folder
+            and r["maildir_key"] != row["maildir_key"]
+            and (account, folder, r["maildir_key"]) in snapshot
+        ]
+        if same_folder:
+            # Same message_id reappeared in the SAME folder under a new
+            # maildir key: an in-place rename that changed the key's stem.
+            # In practice this is mbsync re-stamping ",U=<uid>" after
+            # uploading a file the act layer wrote (act.py strips the
+            # token on move). Nothing user-visible happened -- absorb
+            # silently: drop the provisional "new" entry and the stale row.
+            new_entries.pop((account, folder, row["message_id"]), None)
+            cur.execute("DELETE FROM envelopes WHERE id = ?", (row["id"],))
+            continue
         candidates = [r for r in current_by_msgid.get((account, row["message_id"]), []) if r["folder"] != folder]
         if candidates:
             target = min(candidates, key=lambda r: r["folder"])

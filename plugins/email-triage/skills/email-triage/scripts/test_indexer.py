@@ -318,5 +318,55 @@ class IndexerTest(unittest.TestCase):
         self.assertEqual(report["unrecognized_folders"], [])  # Newsletter lives under gmail, not indexed
 
 
+class RestampTest(unittest.TestCase):
+    """mbsync re-stamps ,U=<uid> after uploading a file act.py wrote (U=
+    stripped on move). Same message, same folder, new maildir key: must be
+    absorbed silently -- NOT reported as deleted+new -- while genuine
+    cross-folder moves still classify as moves (regression: the first
+    version of this fix ate real moves by matching the orphan's own row)."""
+
+    def _run(self, root, db):
+        import io, contextlib, sys as _sys
+        buf = io.StringIO()
+        argv = _sys.argv
+        try:
+            _sys.argv = ["indexer.py", "index", "--maildir", str(root), "--db", str(db)]
+            with contextlib.redirect_stdout(buf):
+                try:
+                    indexer.main()
+                except SystemExit as e:
+                    if e.code not in (0, None):
+                        raise
+        finally:
+            _sys.argv = argv
+        return json.loads(buf.getvalue())
+
+    def test_uid_restamp_is_silent_but_moves_still_classify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "mail"
+            acct = root / "icloud"
+            for f in ("INBOX", "Archive"):
+                for sub in ("cur", "new", "tmp"):
+                    (acct / f / sub).mkdir(parents=True)
+            (acct / "INBOX" / "cur" / "k1,U=5:2,").write_bytes(
+                b"Message-ID: <x@e>\nSubject: s\nFrom: a@b\n"
+                b"Date: Tue, 1 Jul 2026 10:00:00 +0000\n\nb\n")
+            db = Path(tmp) / "i.db"
+            self._run(root, db)
+            # genuine cross-folder move still reports as a move
+            (acct / "INBOX" / "cur" / "k1,U=5:2,").rename(
+                acct / "Archive" / "cur" / "k1,U=5:2,")
+            r = self._run(root, db)
+            self.assertEqual(len(r["moved"]), 1)
+            self.assertEqual(r["new"], [])
+            self.assertEqual(r["deleted"], [])
+            # in-place U= restamp is absorbed silently
+            (acct / "Archive" / "cur" / "k1,U=5:2,").rename(
+                acct / "Archive" / "cur" / "k1,U=99:2,")
+            r = self._run(root, db)
+            for key in ("new", "moved", "deleted", "flag_changed"):
+                self.assertEqual(r[key], [], key)
+
+
 if __name__ == "__main__":
     unittest.main()
