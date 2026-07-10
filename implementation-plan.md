@@ -403,8 +403,23 @@ The local mirror and index land underneath the working MVP practice.
       anymore. And since All Mail now syncs (2.1), the earlier "mirror is a
       working set, not a backup" caveat is gone: the mirror is a complete
       local copy, natively-archived Gmail mail included.
-- [ ] **2.4 Indexer** (`index.db`): three-pass reconciliation, change-report
+- [x] **2.4 Indexer** (`index.db`): three-pass reconciliation, change-report
       output contract, synthetic Message-IDs, UTC normalization (§7.4, §8).
+      **Outcome (2026-07-09):** built as `scripts/indexer.py` +
+      `test_indexer.py` (Sonnet-drafted from the design docs, reviewed and
+      verified live). §8 DDL verbatim plus additive `folder_tier` column;
+      `message_tiers` view rolls up per-message canonical tier
+      (All-Mail-only ⇒ Gmail virtual Archive; family/container dirs exempt
+      from unrecognized-surfacing). Live results: full mirror (14,658
+      messages) indexed in 24.8 s with zero parse errors — **§15.2
+      answered: indexing performance is a non-issue**; second run fully
+      idempotent; tier distribution reconciles with post-migration counts.
+      Notable resolved ambiguity: orphan reconciliation matches *any*
+      current row with the same Message-ID (not just this run's arrivals),
+      which is what makes Gmail label-removal read as a move into the
+      virtual Archive. Live external-change report validation (phone-side
+      action → sync → report) deferred to the first 2.6/2.7 session, where
+      it happens naturally; the classification logic is unit-tested.
       **Added scope (2026-07-09, taxonomy):** canonical-tier derivation —
       dedup Gmail All-Mail duplicates by Message-ID (a message's tier comes
       from its non-All-Mail folder when one exists), classify All-Mail-only
