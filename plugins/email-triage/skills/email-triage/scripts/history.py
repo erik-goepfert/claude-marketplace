@@ -8,10 +8,13 @@ Subcommands:
   log-note    Append a session note.
   context     Print session-start context (recent notes, active rules,
               sender stats) as JSON.
+  backup      Consistent dated copy of history.db (+config.yaml) into a
+              cloud-synced folder; prunes to the newest N (2.8).
 """
 
 import argparse
 import datetime
+import shutil
 import json
 import os
 import sqlite3
@@ -158,6 +161,35 @@ def cmd_log_note(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     print("note logged")
 
 
+def cmd_backup(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """history.db is the one irreplaceable file (design §9); the data dir
+    (~/.local/...) sits outside iCloud/Documents sync, so backups must land
+    somewhere the user's sync actually covers. Uses SQLite's online-backup
+    API for a consistent copy even mid-write. Dated files, pruned to the
+    newest --keep; config.yaml rides along as config-latest.yaml (folder
+    map + server_rules registry — small and worth keeping)."""
+    dest = Path(args.dest).expanduser()
+    dest.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    target = dest / f"history-{stamp}.db"
+    out = sqlite3.connect(target)
+    try:
+        conn.backup(out)
+    finally:
+        out.close()
+    cfg = args.data_dir / "config.yaml"
+    if cfg.is_file():
+        shutil.copy2(cfg, dest / "config-latest.yaml")
+    copies = sorted(dest.glob("history-*.db"))
+    pruned = []
+    for old in copies[:-args.keep] if args.keep > 0 else []:
+        old.unlink()
+        pruned.append(old.name)
+    print(json.dumps({"backed_up": str(target),
+                      "copies": len(copies) - len(pruned),
+                      "pruned": pruned}))
+
+
 def cmd_context(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     recent_sessions = [
         r["session_started_at"]
@@ -242,6 +274,21 @@ def main() -> None:
     cx.add_argument("--sessions", type=int, default=5, help="how many recent sessions of notes")
     cx.add_argument("--senders", help="comma-separated addresses to filter sender_stats")
     cx.set_defaults(func=cmd_context)
+
+    bk = sub.add_parser(
+        "backup",
+        help="consistent dated copy of history.db (+config.yaml) into a "
+             "backup dir, pruned to the newest --keep copies")
+    bk.add_argument(
+        "--dest",
+        default=os.environ.get("EMAIL_TRIAGE_BACKUP_DIR",
+                               "~/Documents/email-triage-backups"),
+        help="destination directory (default: $EMAIL_TRIAGE_BACKUP_DIR or "
+             "~/Documents/email-triage-backups — somewhere your cloud sync "
+             "actually covers; ~/.local is not synced)")
+    bk.add_argument("--keep", type=int, default=7,
+                    help="dated copies to retain (default 7)")
+    bk.set_defaults(func=cmd_backup)
 
     args = parser.parse_args()
     conn = connect(args.data_dir)

@@ -524,8 +524,20 @@ The local mirror and index land underneath the working MVP practice.
       PARA review phase — weekly/on-demand graduation proposals for
       `Areas/<area>/<project>` subfolders (approval-gated, inactivity as
       candidate signal only, no event logged).
-- [ ] **2.8 History backup.** `history.db` is the irreplaceable file — wire it
+- [x] **2.8 History backup.** `history.db` is the irreplaceable file — wire it
       into whatever backup covers the home directory, explicitly.
+      **Outcome (2026-07-10):** the user's only home-dir replication is
+      iCloud Drive, which never covers `~/.local` — so `history.py` gained
+      a `backup` subcommand (SQLite online-backup API for consistency;
+      dated copies + `config-latest.yaml` into
+      `~/Documents/email-triage-backups/`, inside iCloud-synced Documents;
+      pruned to newest 7; `--dest`/`$EMAIL_TRIAGE_BACKUP_DIR`
+      overridable). Wired into the skill's session-end step; first backup
+      taken. Honest caveat, accepted: iCloud sync is replication, not
+      versioned backup — the 7 dated rotating copies are what provide the
+      recovery window. Deliberately NOT moved the data dir into a synced
+      location: the mirror's constant Maildir renames racing iCloud sync
+      would invite conflicted copies.
 
 **Cutover notes**
 - MVP-era events remain valid unchanged — self-containment was designed for

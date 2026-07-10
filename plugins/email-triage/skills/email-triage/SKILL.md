@@ -171,8 +171,11 @@ improvising it here.
    ~60–80 s per-invocation overhead is paid regardless of scope, so batch
    actions per sync.
 9. **Session end.** Final full sync (`mbsync -c "$MBSYNCRC" icloud gmail`),
-   final `$IDX index`, `rmdir "$LOCK"`, session note if anything is
-   unfinished.
+   final `$IDX index`, then `$HIST backup` (dated copy of `history.db` +
+   `config.yaml` into `~/Documents/email-triage-backups/` — inside the
+   user's iCloud-synced Documents; `~/.local` itself is never synced, and
+   `history.db` is the one irreplaceable file), `rmdir "$LOCK"`, session
+   note if anything is unfinished.
 
 Note: mid-session syncs may pull **new arrivals**, which the indexer will
 index, but the triage set assembled in step 7 is not re-assembled mid-session
