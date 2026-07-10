@@ -80,6 +80,14 @@ index time as a computed column, never written back to the server. There is no
 `Archive` label on Gmail and no `Archive` directory in the Gmail Maildir;
 "show me Archive" is an index query, not a directory listing.
 
+**Precision from the 2.3/2.7 build:** "virtual" describes the *flat
+catch-all* tier only. Named archive chapters — `Archive/<year>-<Name>` flat
+leaves and `Archive/<Family>/<year>-<Name>` family chapters — are **real
+labels on Gmail too** (hierarchy and identity can't be expressed by
+absence), created and populated by ordinary moves. The virtual mechanism
+(label-strip; message persists only in All Mail) applies exactly to
+"resolved, no retained identity" — the catch-all disposition.
+
 What this buys: **any client's native archive action is taxonomy-correct for
 free.** Apple Mail's archive button on the Gmail account strips labels and
 leaves the message in All Mail — which the index reads as `Archive`. On the

@@ -487,9 +487,35 @@ The local mirror and index land underneath the working MVP practice.
       and tier moves always move the thread as a unit (system folders stay
       put; threads never move *to* Inbox). On Gmail, moving to Archive =
       removing tier labels (mechanics per the §13.5 verification).
-- [ ] **2.7 Skill upgrade:** thread-based triage from `index.db`; accurate
+- [x] **2.7 Skill upgrade:** thread-based triage from `index.db`; accurate
       inactive-days; manual events from the change report (external moves,
       flags, and Sent-detected replies, §9); rule proposals from sender_stats.
+      **Outcome (2026-07-09):** SKILL.md fully rewritten for the local
+      stack (Sonnet-drafted, reviewed): 9-step session flow (lockfile via
+      atomic mkdir → context → full sync → index+change-report consumption
+      as manual events → threads.py assembly → priority scan/breakdown →
+      batched acting with re-index + box-scoped syncs → close), Active-tier
+      triage with the 3-way Inbox disposition, thread-wide clear-then-set
+      flags, canonical-destinations table (incl. Gmail flat-leaf virtual
+      archive via act.py remove vs. real family-chapter labels),
+      reconciliation flow, PARA review phase, References-from-index reply
+      simplification (no more --preview parent fetch). All five operating
+      rules preserved and extended with the 2.6 verified facts.
+      **Vocabulary change:** `activate` added to history.py's ACTIONS
+      (moved-to-Active, stays open) — the draft's skip+to_folder convention
+      would have corrupted sender_stats' decisive-action rates; smoke-
+      tested. Docs aligned: taxonomy doc gains the "virtual = flat
+      catch-all only; family chapters are real Gmail labels" precision;
+      design §9 enum comment updated. Also fixed on the way through: the
+      log-events example's quoted-heredoc $SESSION bug (an old code-review
+      finding, faithfully reproduced by the drafting agent from the old
+      file).
+      **Validation: the first live triage session IS the test** — includes
+      live external-change report validation deferred from 2.4. Interim
+      notes: MVP-era `accounts.gmail.folders.archive` in config.yaml is
+      dissolved at the first session's convenience; rule proposals from
+      sender_stats remain prose-driven (skill reads context, proposes —
+      unchanged from MVP, no new code needed).
       **Added scope (2026-07-09, taxonomy):** cut SKILL.md over to the
       Active-tier state model (the taxonomy doc's Migration section lists
       exactly what replaces what); reconciliation flow for arrivals on

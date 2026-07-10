@@ -20,7 +20,10 @@ from pathlib import Path
 
 DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
 
-ACTIONS = ("flag", "reply", "archive", "trash", "skip")
+ACTIONS = ("flag", "reply", "archive", "trash", "skip", "activate")
+# "activate" (added Phase 2.7): moved to the Active tier -- triaged, stays
+# open, no flag. A real decision, so it counts as decisive in sender_stats
+# (unlike "skip"). to_folder carries "Active".
 DECIDED_BY = ("auto", "approved", "override", "manual")
 THREAD_STATES = ("needs-reply", "holding", "waiting")
 CATEGORIES = ("spam-noise", "marketing", "newsletter", "passive-update", "ambiguous", "actionable")

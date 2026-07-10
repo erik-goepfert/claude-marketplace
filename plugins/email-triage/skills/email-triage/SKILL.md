@@ -1,37 +1,69 @@
 ---
 name: email-triage
-description: Triage email across iCloud and Gmail accounts — thread-centric review of the inbox with flag/reply/archive/trash decisions, approval gates, and a persistent history DB that makes each session smarter than the last. Use when the user asks to triage, clean up, or process their email/inbox.
-allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*)
+description: Triage email across iCloud and Gmail accounts — thread-centric review of a local Maildir mirror (synced by mbsync, indexed to SQLite) with flag/reply/archive/trash decisions, approval gates, and a persistent history DB that makes each session smarter than the last. Use when the user asks to triage, clean up, or process their email/inbox.
+allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*) Bash(*indexer.py*) Bash(*threads.py*) Bash(*act.py*) Bash(mbsync *)
 ---
 
 # Email Triage
 
 You are running an email triage session. You are the interface — there is no
 other UI. Work thread-by-thread, propose actions, and let the user decide.
-Design rationale lives in the repo's `email-skill-design.md`; this file is
-operational.
+Design rationale lives in the repo's `email-skill-design.md` (state model,
+data flow) and `email-folder-taxonomy.md` (folder tiers, flag semantics,
+thread-state derivation); this file is operational.
 
-## State and first-run bootstrap
+**Phase 2.7 cutover.** Reads and thread assembly now run entirely against a
+local Maildir mirror + SQLite index, not live IMAP. Only two things still
+touch the servers directly: `mbsync` (sync) and reply/send. Everything else —
+listing, reading, flagging, moving — goes through the local backend.
+
+## State and stack layout
 
 All mutable state lives in the data directory — default
 `~/.local/share/email-triage/`, overridable via `$EMAIL_TRIAGE_DATA_DIR`.
 Never write state into the plugin directory.
 
-- `config.yaml` — accounts and per-account folder map. **Read it at session
-  start; never improvise folder names.**
+```
+DATA="${EMAIL_TRIAGE_DATA_DIR:-$HOME/.local/share/email-triage}"
+MAILDIR="$DATA/mail"                    # $MAILDIR/icloud, $MAILDIR/gmail
+IDXDB="$DATA/index.db"
+LOCK="$DATA/session.lock"
+MBSYNCRC=~/.config/isync/mbsyncrc       # NOT auto-discovered — every mbsync call needs -c
+IDX="${CLAUDE_SKILL_DIR}/scripts/indexer.py"
+THR="${CLAUDE_SKILL_DIR}/scripts/threads.py"
+ACT="${CLAUDE_SKILL_DIR}/scripts/act.py"
+HIST="${CLAUDE_SKILL_DIR}/scripts/history.py"
+```
+
+- `config.yaml` (in `$DATA`) — accounts, per-account system-folder map,
+  `maildir_path`, `server_rules` registry. **Read it at session start; never
+  improvise folder names.** `Active`, `Areas/<area>[/<project>]`, and
+  `Archive[/<family>]/<chapter>` are **not** in config — they're fixed
+  canonical names, identical on both accounts (see Canonical destinations).
+  Caveat: `accounts.gmail.folders.archive` is a leftover MVP-era explicit
+  label, kept only for the interim (implementation-plan 2.3) — it is **not**
+  the flat-leaf archive destination under this model; see Acting.
 - `history.db` — decision log, session notes, contacts, rules. Irreplaceable.
+- `index.db` — header + thread-graph cache over the Maildir. Disposable,
+  rebuildable by `$IDX index`.
+- `$DATA/mail/{icloud,gmail}` — the local Maildir mirror, synced by mbsync.
+- himalaya accounts (in `~/.config/himalaya/config.toml`, not this skill's
+  config): `icloud`/`gmail` are IMAP, `icloud-local`/`gmail-local` are
+  Maildir pointed at `$MAILDIR/<account>`. Role split (verified, 2.6):
 
-Helper scripts live in `scripts/` next to this file (when installed as a
-plugin, under `$CLAUDE_PLUGIN_ROOT/skills/email-triage/scripts/`).
+  | Account | Backend | Used for |
+  |---|---|---|
+  | `icloud`, `gmail` | IMAP | reply/send **only** — also sets `\Answered` and marks `\Seen`, accepted (rule 5) |
+  | `icloud-local`, `gmail-local` | Maildir | **all** reads and flag ops |
 
-**Bootstrap (only if something is missing):**
-1. Verify `himalaya` is installed (`himalaya --version`); if not, walk the
-   user through installing it (`brew install himalaya`) and configuring their
-   accounts before continuing.
-2. If `history.db` is missing: `${CLAUDE_SKILL_DIR}/scripts/init_history_db.py`.
-3. If `config.yaml` is missing: run `himalaya folder list -a <account>` for
-   each account in `himalaya account list`, propose inbox/archive/trash/sent/
-   junk targets, **confirm them with the user**, then write `config.yaml`.
+**Bootstrap (only if something is missing):** verify `himalaya`, `mbsync`,
+and `python3` are installed; walk the user through anything missing. If
+`history.db` is missing: `${CLAUDE_SKILL_DIR}/scripts/init_history_db.py`. If
+`index.db` is missing: `$IDX init --db "$IDXDB"` (or just run `index` — it
+auto-inits). If `config.yaml` or `~/.config/isync/mbsyncrc` is missing, this
+is a from-scratch setup outside a normal triage session — stop and walk the
+user through the full build sequence in `implementation-plan.md` rather than
+improvising it here.
 
 ## Operating rules (non-negotiable)
 
@@ -39,103 +71,153 @@ plugin, under `$CLAUDE_PLUGIN_ROOT/skills/email-triage/scripts/`).
    the user approving that specific action in this session:
    - *Send / reply:* always show the full draft; nothing is sent without
      explicit approval of that exact draft.
-   - *Trash / archive:* approval required, but batchable — and **name the
-     resolved destination folder in the ask** ("archive these 12 to
-     `Archive`?" not just "archive these 12?"). A folder mix-up between an
-     archive target and a trash target is an easy silent slip; saying the
-     folder out loud surfaces it before execution, not after.
-   - *Flagging:* low-risk and reversible — you may flag autonomously during
-     triage (log it as `decided_by=auto`).
+   - *Trash / resolve (Areas/Archive):* approval required, but batchable —
+     and **name the resolved destination in the ask** ("archive these 12 to
+     `Archive`?" / "file these 3 under `Areas/Taxes`?" not just "archive
+     these?"). A folder mix-up between an archive target and a trash target
+     is an easy silent slip; saying the destination out loud surfaces it
+     before execution, not after.
+   - *Stays open (move to `Active`, no flag):* rides along inside the same
+     category-batch approval as the archive/trash proposals for that
+     category ("9 actionable: 2 archive, 1 trash, 6 stay open in Active,
+     3 of those flagged — proceed?") — not a separately gated action.
+   - *Flagging:* low-risk and reversible — you may flag/unflag autonomously
+     during triage (log it as `decided_by=auto`).
    - *Ambiguous phrasing:* "keep" or "keep it" alone means **leave it where
      it is, no action** — not archive. Only archive/move on explicit
      relocation language ("archive," "file it away," "move it," "get it out
      of the inbox"). When genuinely unclear, ask rather than assume.
-2. **`\Flagged` means "needs my reply"** — reserved system-wide. The flag in
-   Apple Mail and the star in Gmail are the user queueing a thread for you.
-   Never use the flag for anything else.
-3. **Trash means the Trash folder.** Delete = `message move` to the account's
-   trash folder from `config.yaml`. Never expunge, never `flag add deleted`.
+2. **`\Flagged` means "needs my reply,"** derived **per thread**, not per
+   message: `blocked(thread) = OR(\Flagged over every non-trash/junk member)`.
+   Flag writes are always **thread-wide clear-then-set** — clear `\Flagged`
+   from every member, then set it on at most one — never an incremental
+   single-message flag/unflag. Why: this decouples thread state from message
+   recency (taxonomy doc) — a new arrival can no longer silently reopen or
+   close a thread as a side effect of delivery order; state changes only
+   through an explicit triage decision.
+3. **Trash means the Trash folder.** Delete = `$ACT move` to the account's
+   trash folder from `config.yaml`. Never expunge, never a raw `flag add`
+   for deletion. Cross-folder moves **never go through himalaya** — verified
+   to strand mail (mbsync hard-errors on the `,U=` token himalaya's Maildir
+   backend preserves across folders); `$ACT` strips it. This applies to
+   every move: Trash, `Active`, `Areas/…`, `Archive/…`.
 4. **Unsubscribe links are surfaced, never followed.** Extract and present
    them; never fetch, click, or otherwise interact with them.
 5. **`\Seen` is the user's signal, not triage state — your own reads must
    never move it.** A message counts as read only once the user has been
-   shown its content or a representative summary of it; Claude privately
-   extracting a header or a body to classify or resolve ambiguity is not
-   that. Concretely:
-   - Any read done for your own purposes (unsubscribe extraction, resolving
-     `ambiguous`, pulling a parent's headers for `References`) uses
-     `himalaya message read --preview` — confirmed this suppresses `\Seen`
-     (plain `message read`, even with `--header` to filter output, still
-     fetches and marks the full message; verified empirically).
+   shown its content or a representative summary of it. Concretely, on the
+   `-local` (Maildir) accounts:
+   - Any read for your own purposes (unsubscribe extraction, resolving
+     `ambiguous`, thread-state checks) uses `--preview` —
+     verified (2.6): a plain local `message read` stamps `S` on the Maildir
+     filename, which mbsync would then sync as `\Seen` to the server;
+     `--preview` leaves the filename untouched.
    - Only mark a message read by explicitly setting it —
-     `himalaya flag add -a <acct> -f INBOX <id> seen` — at the moment you
-     actually present its content or summary to the user. Don't rely on a
-     read command's side effect for this; make it a deliberate action.
-   - Exception: `himalaya template reply` / `message reply` have no preview
-     equivalent and do mark `\Seen`. That's fine here — a reply draft
-     quotes the original back to the user before anything sends, so the
-     "shown a representative summary" condition is already met by the time
-     it happens.
+     `himalaya flag add -a <acct>-local -f <folder> <id> seen` — at the
+     moment you actually present its content or summary to the user.
+   - Exception: `himalaya template reply` / `message reply` (run against the
+     **IMAP** account, since sending is IMAP-only) have no preview
+     equivalent and do mark `\Seen`. Accepted, since a reply draft quotes
+     the original back to the user before anything sends.
 
 ## Session flow
 
-1. **Stamp the session.** `session_started_at` = current UTC time, ISO 8601
-   (e.g. `2026-07-02T22:15:00Z`), taken once. Every event and note this
-   session carries it verbatim — it is the session's identity.
-2. **Read history context** from `history.db`:
-   - session notes from the last ~5 sessions (resume state, watch items);
-   - active rules (`SELECT * FROM rules WHERE active = 1`);
-   - `sender_stats` for context once you know who's in the inbox.
-3. **List both inboxes:**
-   ```sh
-   himalaya envelope list -a icloud -f INBOX -s 500 -o json
-   himalaya envelope list -a gmail  -f INBOX -s 500 -o json
-   ```
-   If a page comes back full, fetch subsequent pages (`-p 2`, …).
-4. **Group messages into threads** in-context (see Thread grouping).
-5. **Classify every thread before reading any body** (see Triage).
-6. **Present the breakdown**, then work through categories with the user.
-7. **Act and log as you go** — every executed decision becomes an event at
-   act time; notes are written the moment something is noteworthy, never
-   saved up for session close (the close may never come).
+1. **Read `config.yaml`.** Never improvise account/folder names.
+2. **Check the lockfile.** `mkdir "$LOCK"` (atomic). If it already exists,
+   tell the user a session may be live elsewhere or was abandoned, and ask
+   before removing it (`rmdir "$LOCK"`) and proceeding.
+3. **Stamp the session.** `session_started_at` = current UTC time, ISO 8601
+   (e.g. `2026-07-09T18:15:00Z`), taken once. Every event and note this
+   session carries it verbatim.
+4. **Read history context:** `$HIST context [--senders addr1,addr2,...]` —
+   recent session notes, active rules, sender stats, contacts.
+5. **Sync (session start, full).** `mbsync -c "$MBSYNCRC" icloud gmail`.
+   iCloud is seconds; Gmail's full ~30-mailbox channel is ~5–8 min regardless
+   of what changed (per-invocation overhead, not per-message) — accepted
+   once here, not something to repeat mid-session (see step 8).
+6. **Index and consume the change report.**
+   `$IDX index --maildir "$MAILDIR" --db "$IDXDB"` → JSON on stdout:
+   `new` / `moved` / `deleted` / `flag_changed` / `parse_errors` /
+   `unrecognized_folders`. This is provably-external change (the skill
+   re-indexes its own actions immediately as it acts, §Acting) — log it:
+   - `moved` entries whose destination tier is `trash` → one manual event,
+     `final_action=trash`. Destination tier `archive`/`areas` →
+     `final_action=archive`. Destination tier `active` →
+     `final_action=activate`.
+     All: `decided_by=manual`, `proposed_action=final_action`,
+     `from_folder`/`to_folder` from the report entry.
+   - `flag_changed` entries → `final_action=flag`, `decided_by=manual`
+     (covers both an external flag-set and an external flag-clear).
+   - `new` entries whose folder is the account's Sent folder → a manual
+     *reply* event (`final_action=reply`, `decided_by=manual`); resolve
+     `sender_addr` via `$THR show --account <acct> --message-id <id>` and
+     take the thread's other participant.
+   - `parse_errors` > 0 → surface to the user, don't silently drop it.
+   - `unrecognized_folders` → surface as audit debt (the 2.3 folder audit
+     hasn't finished absorbing something); log a session note, don't infer
+     Archive.
+7. **Assemble threads.** `$THR list --db "$IDXDB"` — default tiers
+   `inbox`+`active` (every thread with ≥1 member in either; the full member
+   list, including any Areas/Archive/Sent siblings, always comes back —
+   this is what makes reconciliation detectable, see below).
+8. **Priority scan**, then **breakdown**, then **classify-first, easiest-
+   first** (see Triage). **Act in approved batches** (see Acting): resolve-
+   before-act, `$ACT` for moves/removes, `-local` himalaya for flags,
+   IMAP himalaya for replies, log events at act time, re-index touched state
+   (a full `$IDX index` run is cheap, ~25 s — no need to scope it), then a
+   **box-scoped sync** at the batch boundary:
+   `mbsync -c "$MBSYNCRC" 'gmail:INBOX,Areas/Taxes'` (list exactly the
+   folders the batch touched) — never a full-channel sync per action; Gmail's
+   ~60–80 s per-invocation overhead is paid regardless of scope, so batch
+   actions per sync.
+9. **Session end.** Final full sync (`mbsync -c "$MBSYNCRC" icloud gmail`),
+   final `$IDX index`, `rmdir "$LOCK"`, session note if anything is
+   unfinished.
+
+Note: mid-session syncs may pull **new arrivals**, which the indexer will
+index, but the triage set assembled in step 7 is not re-assembled mid-session
+— new mail waits for the next session. Keeps sessions deterministic and
+terminable.
 
 ## Triage (classify-first discipline)
 
-Classify from envelope data (sender, subject, date, flags) plus history
-(sender_stats, contacts, rules) — **no body reads during classification**.
-Two axes per thread:
+Classify from thread data (`$THR list` output: sender, subject, dates,
+flags, tier) plus history (`sender_stats`, `contacts`, `rules`) — **no body
+reads during classification**. Two axes per thread:
 
-- **Lifecycle state** (MVP approximation from flags):
-  | Latest message in thread | State |
-  |---|---|
-  | has `\Flagged` (`Flagged` in JSON) | `needs-reply` |
-  | has `\Answered` (`Answered`) | `waiting` (you replied; approximate in MVP) |
-  | otherwise | `holding` |
-  Inactive-days ≈ days since the latest message's date.
+- **Lifecycle state**, from `$THR`'s `state` field (already the taxonomy's
+  `OR(\Flagged)` / Sent-correlation derivation — nothing to recompute):
+  `needs-reply` / `waiting` / `holding`. `inactive_days` is likewise already
+  computed (days since the latest non-trash/junk member).
   **A `waiting` thread gets no proposal and no log entry, ever — not even a
   skip.** Lifecycle state and content category are independent axes, so a
   `waiting` thread can still land in `actionable` or any other category and
-  surface in that category's list. When it does, leave it out of the
-  proposal/approval for that batch entirely; there's nothing to decide about
-  a thread that's waiting on someone else, regardless of category (see Skip
-  rules under Logging).
+  surface in that category's list; leave it out of the batch entirely.
 - **Content category:** `spam-noise` | `marketing` | `newsletter` |
   `passive-update` (receipts, notifications, alerts) | `ambiguous` |
   `actionable`.
+- **Current tier matters for what's being decided.** A thread whose only
+  live-tier member is in `inbox` needs the full 3-way disposition (stay open
+  in `Active` / resolve to `Areas`-or-`Archive` / discard). A thread already
+  in `active` just needs flag maintenance (flag / unflag / resolve / trash)
+  — it's already filed.
+- **Reconciliation check.** If a listed thread's members span **both**
+  `inbox` and a resolved tier (`areas`/`archive`), it's a new arrival on an
+  already-filed thread — handle per Reconciliation below, not as a fresh
+  thread.
 
 **Priority scan — before the breakdown, before anything else.** Security and
-time-sensitive signals are surfaced first, regardless of what content
-category they'd otherwise land in. This is not left to in-the-moment
-judgment — always check for it, every session.
+time-sensitive signals are surfaced first, regardless of content category.
+Not left to in-the-moment judgment — always check, every session.
 
-**Scope: unseen only.** A thread enters this scan only if its latest
-message lacks `\Seen` — check `flags` in the envelope JSON already fetched
-at session start, no extra read needed. A message you've already seen (in
-this client or another) has already had its one chance to interrupt you;
-don't re-surface it here. This only works because rule 5 keeps `\Seen`
-uncorrupted — a signal Claude's own reads never touch is one this scan can
-actually trust. An already-seen security-shaped thread still gets triaged
-normally in the regular flow below, just not as a priority interrupt.
+**Scope: unseen only.** A thread enters this scan only if its chronologically
+latest non-trash/junk member (last entry of `$THR`'s `members` array, already
+sorted oldest→newest, skipping any trash/junk members) lacks `"Seen"` in its
+`flags` array — no extra read needed, it's already in the `$THR list` output.
+A message already seen (in this client or another) has had its one chance to
+interrupt; don't re-surface it. This only works because rule 5 keeps `\Seen`
+uncorrupted. An already-seen security-shaped thread still triages normally
+below, just not as a priority interrupt.
 
 Flag a thread here if it's:
 
@@ -151,115 +233,148 @@ Present these **individually, immediately**, before the category breakdown —
 "2 security alerts first: a new SSH key on your GitHub account and a GitLab
 sign-in from a new location, both from today. Recognize these?" The proposed
 action is usually "confirm it was you" (skip) or "you don't recognize this —
-here's the link to review/revoke" (surfaced, never followed, per rule 4);
-treat as `actionable` for logging purposes (`category=actionable`, and note
-in the free-text `notes` field that it was a priority-scan hit). Only once
-these are resolved does the regular classify-first flow below proceed.
+here's the link to review/revoke" (surfaced, never followed, rule 4); log as
+`category=actionable` with a `notes` value noting the priority-scan hit. Only
+once these are resolved does the regular flow proceed.
 
 Then, for everything else:
 
 1. **Present the full breakdown** — counts per category, lifecycle summary,
-   and a proposed next step. Example: "147 threads: 12 spam, 31 marketing,
+   a proposed next step. Example: "147 threads: 12 spam, 31 marketing,
    14 newsletters, 58 passive updates, 9 ambiguous, 9 actionable. Clear spam
    first?"
 2. **Work easiest-first**, noise before attention: spam → marketing →
    newsletters → passive-updates → ambiguous → actionable. Show each category
-   as a grouped list with a proposed bulk action; the user can pull
-   individual threads out before approving. **Actionable threads are always
-   presented individually.**
+   as a grouped list with a proposed disposition per thread (stay open /
+   resolve-to / trash); the user can pull individual threads out before
+   approving. **Actionable threads are always presented individually.**
 3. **Targeted body reads only**, for exactly two reasons: resolving an
-   `ambiguous` classification, or extracting unsubscribe links from
-   marketing/newsletters — category by category as each is worked, never
-   upfront. Read with `--preview` (rule 5 — this is you looking, not the
-   user):
-   `himalaya message read --preview -a <acct> -f INBOX <id>`
-   If resolving the ambiguity means actually showing the user the content
-   or a summary of it, mark it read at that point:
-   `himalaya flag add -a <acct> -f INBOX <id> seen`
+   `ambiguous` classification, or extracting unsubscribe links — category by
+   category as worked, never upfront. Resolve the current local id
+   immediately before reading (`himalaya envelope list -a <acct>-local -f
+   <folder> -o json`, matched against the thread member by `from_addr` +
+   `date_utc` — Maildir ids are internal to himalaya, not derivable from the
+   index), then:
+   `himalaya message read --preview -a <acct>-local -f <folder> <id>`
+   If resolving the ambiguity means actually showing the user the content,
+   mark it read at that point:
+   `himalaya flag add -a <acct>-local -f <folder> <id> seen`
 4. **Unsubscribe extraction:** prefer the `List-Unsubscribe` header
-   (`himalaya message read --preview --header list-unsubscribe ...`) over
-   body-scraped links. Present the link; the user acts on it themselves
-   (rule 4) — extracting it is never itself a reason to mark `\Seen`.
-   Clicking it is invisible to you by design — **ask** ("unsubscribe too, or
-   just clear this one?") and log the answer via `--unsubscribed` on that
-   event (see Logging). Don't ask on every single marketing/newsletter
-   thread if the user has clearly indicated a batch answer ("unsubscribe
-   from all of these") — apply it to each event in the batch.
-5. **Noise escalation — when unsubscribe isn't possible.** The standing
-   policy is a three-step ladder: (1) unsubscribe if possible; (2) when it
-   isn't (or the user declines but still wants the mail gone), **propose a
-   server-side filter**; (3) last resort, a triage rule or continued manual
-   triage. A filter proposal means drafting the exact config for the user to
-   install in the provider's web UI — filters aren't reachable over IMAP —
-   including match expression, action, and any carve-outs for transactional
-   senders (e.g. Substack newsletters are filterable but login magic links
-   come from `no-reply@substack.com`, which must be excluded). **Server
-   rules delete; they never file into folders** — a filing rule would create
-   a second untriaged path into tier folders and hide mail from the learning
-   loop. After the user installs one, record it under that account's
-   `server_rules:` in `config.yaml` and log a session note — server-deleted
-   mail generates no events, and the registry is what explains the silence
-   to future sessions.
+   (`himalaya message read --preview -a <acct>-local -f <folder> --header
+   list-unsubscribe <id>`) over body-scraped links. Present the link; the
+   user acts on it themselves (rule 4). Ask ("unsubscribe too, or just clear
+   this one?") and log the answer via `--unsubscribed` on that event. Don't
+   ask per-thread if the user gave a batch answer ("unsubscribe from all of
+   these") — apply it to each event in the batch.
+5. **Noise escalation — when unsubscribe isn't possible.** Three-step
+   ladder: (1) unsubscribe if possible; (2) when it isn't (or the user
+   declines but still wants the mail gone), **propose a server-side filter**
+   — draft the exact match expression, action, and carve-outs (e.g.
+   Substack newsletters are filterable but login magic links must be
+   excluded) for the user to install in the provider's web UI; filters
+   aren't reachable over IMAP. **Server rules delete; they never file into
+   folders** — a filing rule would create a second untriaged path into tier
+   folders and bypass the learning loop. After the user installs one, record
+   it under that account's `server_rules:` in `config.yaml` and log a
+   session note — server-deleted mail generates no events, and the registry
+   is what explains the silence to future sessions. (3) Last resort, a
+   triage rule or continued manual triage.
 6. Apply active rules from `history.db` when they match — still within the
    approval gates; a rule justifies a proposal, not an autonomous action
    (flags excepted).
 
-## Thread grouping (MVP)
+## Thread assembly
 
-No persistent threading in the MVP — the References-based index arrives in
-Phase 2. Group in-context from the envelope listing:
+No in-context grouping anymore — `$THR` builds threads from the index's
+Message-ID/In-Reply-To/References graph plus a guarded subject fallback
+(participant overlap required), and derives lifecycle state directly.
 
-- **Normalize subjects:** repeatedly strip leading reply/forward prefixes
-  (`Re:`, `RE:`, `Fwd:`, `Fw:`, `AW:`, …), case-insensitively, and collapse
-  whitespace.
-- **Group by normalized subject, guarded by participants:** two messages
-  join the same thread only if they also share at least one participant
-  address (from/to). Unguarded subject matching would merge every unrelated
-  "Invoice" in the inbox.
-- When the guard splits something that might be one conversation, present
-  both fragments adjacently rather than agonizing — the user sees both
-  during triage anyway.
-- A thread's state and inactive-days come from its **latest** message
-  (see Triage).
+- `$THR list --db "$IDXDB" [--account icloud|gmail] [--tier t1 --tier t2 ...]`
+  — every thread with ≥1 member in the given tier set (default `inbox`,
+  `active`; both accounts if `--account` omitted). Each thread object:
+  `account`, `root_message_id`, `state`, `inactive_days`, `member_count`,
+  `subject`, `members[]` (every member regardless of tier — `message_id`,
+  `folder`, `folder_tier`, `date_utc`, `from_addr`, `subject`, `flags`,
+  `is_flagged`).
+- `$THR show --db "$IDXDB" --account <acct> --message-id <id>` — the full
+  thread containing a given message, any tier.
+- A thread's messages live in one tier location at a time (system folders
+  excepted — Sent copies never move). **Threads never move to Inbox** —
+  Inbox is delivery, not a destination. When a triage decision changes a
+  thread's location, **every non-system member moves as a unit**.
 
 ## Acting
 
-Resolve folder names from `config.yaml`. All ids are per-folder himalaya
-envelope ids from the JSON listing.
+**Canonical destinations** (fixed names, not in `config.yaml`, identical
+across accounts except where noted):
 
-`flag add/remove`, `message move`, and `message delete` all take multiple ids
-in one call — **use this for batch actions** ("archive these 12") instead of
-looping per-message; it's one himalaya invocation, and pairs with `log-events`
-below for one bulk history write to match.
+| Disposition | iCloud | Gmail |
+|---|---|---|
+| Stays open | `$ACT move --to Active` | `$ACT move --to Active` |
+| Resolve, ongoing area | `$ACT move --to "Areas/<area>[/<project>]"` | same |
+| Resolve, one-off closure (flat leaf) | `$ACT move --to "Archive/<year>-<Name>"` | `$ACT remove` (strip the last label — message persists in All Mail only; the indexer infers tier `archive` by absence, taxonomy's "virtual Archive") |
+| Resolve, closed chapter in a family | `$ACT move --to "Archive/<Family>/<year>-<Name>"` | `$ACT move --to "Archive/<Family>/<year>-<Name>"` — a **real** label (hierarchy can't be expressed by absence); create it first if new: `himalaya folder create -a gmail "Archive/<Family>/<year>-<Name>"` (verified two-level nesting, §13.6) |
+| Discard | `$ACT move --to "<config accounts.<acct>.folders.trash>"` | same |
 
-- **Flag / unflag** (autonomous allowed):
-  `himalaya flag add -a <acct> -f INBOX <id>... flagged`
-  `himalaya flag remove -a <acct> -f INBOX <id>... flagged`
-- **Archive** (approved): `himalaya message move -a <acct> -f INBOX <archive-folder> <id>...`
-- **Trash** (approved): `himalaya message move -a <acct> -f INBOX <trash-folder> <id>...`
-- **Reply** (approved, draft always shown):
-  1. `himalaya template reply -a <acct> -f INBOX <id>` — generates the
-     template with `From`/`To`/`Subject`/`In-Reply-To` prefilled.
-  2. **Add the `References` header yourself** — the template omits it. Fetch
-     the parent's headers with `--preview` (mechanical extraction, not
-     showing the user anything yet — rule 5):
-     (`himalaya message read --preview -a <acct> -f INBOX --header references --header message-id <id>`)
-     and set `References:` = parent's References + parent's Message-ID.
-  3. Write the body (quote below, reply above, matching the user's voice —
-     confirm tone on first sessions). Save the full template to a temp file.
-  4. Show the complete draft to the user. Only after explicit approval:
+`$ACT move --db "$IDXDB" --maildir "$MAILDIR/<acct>" --account <acct> --from
+<folder> --to <folder> <message-id>...` and `$ACT remove ... --from <folder>
+<message-id>...` both take multiple message-ids in one call — use this for
+batch actions. `$ACT remove` refuses to strip a message's only copy (guards
+against deleting mail instead of archiving it). **Resolve-before-act is
+built into `$ACT`** — it reads the current filename off disk at call time,
+never from a cached listing; if it reports "message file not found on disk,"
+the index is stale — rerun `$IDX index` and retry.
+
+- **Flag / unflag** (autonomous allowed; thread-wide clear-then-set, rule 2):
+  resolve current local ids for every currently-flagged member of the thread
+  (`himalaya envelope list -a <acct>-local -f <folder> -o json`, matched as
+  above), `himalaya flag remove -a <acct>-local -f <folder> <id>... flagged`
+  on all of them, then, if the thread should be blocked-on-me,
+  `himalaya flag add -a <acct>-local -f <folder> <id> flagged` on exactly
+  one member (the latest is the natural choice).
+- **Move / resolve / trash** (approved): `$ACT move` or `$ACT remove` per
+  the table above, applied to every non-system member of the thread.
+- **Reply** (approved, draft always shown; runs on the IMAP account —
+  reply/send is the one thing that isn't local):
+  1. Compute `References` **from the local index**, not a live read: `$THR
+     show --account <acct> --message-id <parent-id>` → take every member's
+     `message_id` in date order up to and including the parent, that
+     ordered list is the References header. This is a Phase 2.7
+     simplification — the MVP had to fetch the parent's headers with a
+     `--preview` read; the index already has the full thread graph.
+  2. Resolve the parent's **IMAP-side** id (separate id-space from
+     `-local`): `himalaya envelope list -a <acct> -f <folder> -o json`,
+     matched by `from_addr`/`date_utc`/`subject`.
+  3. `himalaya template reply -a <acct> -f <folder> <id>` — prefills
+     `From`/`To`/`Subject`/`In-Reply-To`. Add `References:` yourself from
+     step 1 (the template omits it).
+  4. Write the body (quote below, reply above, matching the user's voice).
+     Save the full template to a temp file.
+  5. Show the complete draft to the user. Only after explicit approval:
      `himalaya template send -a <acct> "$(cat <tmpfile>)"`.
-  Sending sets `\Answered` on the original automatically. Note:
-  `template reply` itself (step 1) does mark `\Seen` on the original, with
-  no preview equivalent — accepted per rule 5's exception, since the draft
-  it produces quotes that content back to the user before anything sends.
+  Sending sets `\Answered` automatically (and marks `\Seen` on the original
+  — accepted per rule 5's exception). The next sync/index picks this up
+  locally.
+
+## Reconciliation (new arrival on a filed thread)
+
+New mail continuing an existing thread arrives in Inbox regardless of the
+thread's filed location — delivery has no knowledge of it. Detected per
+Triage's reconciliation check (a listed thread spanning `inbox` + a resolved
+tier). Three outcomes, always a fresh, explicit decision — arrival triggers
+attention, it doesn't itself change state:
+
+- **Stays resolved** (default expectation): move the new Inbox message to
+  join its siblings at their existing location (`$ACT move` for just that
+  message).
+- **Reopens:** move the **whole thread** to `Active`.
+- **Refiles:** move the **whole thread** to the new resolved location.
+
+Log per the normal action vocabulary (archive / activate / trash as it
+resolves); note `"reconciliation: stays-resolved"` / `"reopens"` /
+`"refiles"` in the event's free-text `notes`.
 
 ## Logging (every decision, at act time)
-
-Use `${CLAUDE_SKILL_DIR}/scripts/history.py` (stdlib-only, executable;
-`--data-dir` defaults to the data directory). `${CLAUDE_SKILL_DIR}` resolves
-correctly whether this skill is installed at the personal, project, or
-plugin level:
 
 ```sh
 HIST="${CLAUDE_SKILL_DIR}/scripts/history.py"
@@ -274,72 +389,98 @@ $HIST log-event --session "$SESSION" \
   --proposed trash --final trash --decided-by approved \
   --from-folder INBOX --to-folder "[Gmail]/Trash" \
   [--message-id "..."] [--thread-root-id "..."] [--rule-id N] [--notes "..."] \
-  [--unsubscribed]   # only if the user confirmed they clicked the link (see Triage step 4)
+  [--unsubscribed]
 
-# Batch of events after one bulk himalaya action (all-or-nothing insert):
+# Batch of events after one bulk act.py/himalaya call (all-or-nothing insert).
+# Write the REAL session timestamp into the JSON — a quoted heredoc (<<'JSON')
+# does NOT expand $SESSION, and an unexpanded literal would corrupt the log:
 $HIST log-events <<'JSON'
 [
-  {"session_started_at": "$SESSION", "account": "gmail", "sender_addr": "a@example.com",
-   "category": "spam-noise", "proposed_action": "trash", "final_action": "trash",
-   "decided_by": "approved", "from_folder": "INBOX", "to_folder": "[Gmail]/Trash"},
-  {"session_started_at": "$SESSION", "account": "gmail", "sender_addr": "b@example.com",
+  {"session_started_at": "2026-07-09T18:15:00Z", "account": "gmail", "sender_addr": "a@example.com",
    "category": "spam-noise", "proposed_action": "trash", "final_action": "trash",
    "decided_by": "approved", "from_folder": "INBOX", "to_folder": "[Gmail]/Trash"}
 ]
 JSON
-# Same field names as log-event's flags (snake_case, matching the events
-# columns). If any item fails validation, nothing in the batch is inserted —
-# check before running the himalaya bulk call, not after.
 
 # Notes, the moment something is noteworthy:
 $HIST log-note --session "$SESSION" "resume state / context / watch item"
 ```
 
-Use `log-events` for any batch you executed as one bulk himalaya call (a
-worked category's bulk archive/trash) — one event per message/thread in the
-batch, still each with its own sender/subject/category. Individual
-`log-event` calls remain right for one-at-a-time actionable/security-alert
-threads and replies.
+`decided_by`: `auto` (you acted autonomously — flags only), `approved` (user
+approved as-is), `override` (user changed the outcome — always log the
+original `proposed_action` alongside; **the richest learning signal** —
+"leave it" after a proposal is `final_action=skip, decided_by=override`),
+`manual` (detected via the indexer's change report, §Session flow step 6).
 
-`decided_by` semantics:
-- `auto` — you acted autonomously (flags only).
-- `approved` — user approved your proposal as-is.
-- `override` — user changed the outcome. **Overrides are the richest
-  learning signal** — always log the original `proposed_action` alongside
-  the `final_action`. "Leave it" after a proposal is
-  `final_action=skip, decided_by=override`.
-- `manual` — an action the user took outside the session (only if they tell
-  you about it in the MVP; automated detection arrives in Phase 2).
+**Action vocabulary (Phase 2.7).** The `final_action` enum is
+`flag | reply | archive | trash | skip | activate`. `activate` is the 2.7
+addition: moved to the Active tier — triaged, stays open, no flag — with
+`to_folder=Active`. It's a real decision (counts as decisive in
+`sender_stats`), which is exactly why it is NOT logged as `skip`: skips are
+excluded from decisive-action rates, and conflating "I decided this stays
+open" with "no decision was made" would corrupt the learning signal. Because
+every Inbox thread now gets a real disposition decision (stay open / resolve
+/ discard), this is an improvement on the MVP, where "holding" threads
+sometimes went unlogged entirely.
 
 Skip rules:
-- A Claude-proposed skip on a thread that presented a real decision is logged
-  **once per thread per session**.
-- Threads in `waiting` state are **not skip-eligible** — nothing to decide;
-  don't log skips for them, and don't propose anything for them in the first
-  place (see the lifecycle-state note in Triage). A `waiting` thread showing
-  up mixed into an `actionable` or other category's batch is not itself a
-  decision point — pass over it silently.
+- A Claude-proposed skip on a thread that presented a real decision is
+  logged **once per thread per session**. (Staying open is NOT a skip —
+  it's `activate`. A genuine skip is "reviewed, deferred, still in Inbox"
+  or a no-op pass on an already-`Active` thread.)
+- Threads in `waiting` state are **not skip-eligible** — don't log skips for
+  them, don't propose anything for them. A `waiting` thread mixed into a
+  batch is not a decision point — pass over it silently.
 - Threads never reviewed (session abandoned, "skip the rest") are **not
-  logged as events** — that would be false data. Leave resume state in a
-  session note instead.
+  logged as events**. Leave resume state in a session note instead.
 
-Session notes (`session_notes` table) carry what events can't: resume state
-("got through needs-reply, never touched holding"), stats context ("mass
-cleanup — don't read these 300 trash events as normal rates"), watch items
-("contractor reply expected this week"). Write them **the moment** the
-noteworthy thing happens. At session start, read the recent ones back.
+Session notes (`session_notes` table) carry resume state, stats context,
+watch items, and `unrecognized_folders`/`parse_errors` audit debt from the
+change report. Write them **the moment** the noteworthy thing happens.
+
+## PARA review phase (on-demand / weekly, not every session)
+
+Project graduation runs on a slower loop than per-session triage.
+
+1. **Signal:** per `Areas/<area>/<project>` subfolder — `$THR list --tier
+   areas`, grouped by `folder`, look at days since the latest member's
+   `date_utc` and whether any member is flagged. Falling volume + no open
+   flags is a candidate.
+2. **Propose, never auto-execute:** "`Areas/…/Fence`: 0 new messages, 0
+   flagged threads in 45 days — graduate to Archive?"
+3. **Naming on graduation:** year-of-closure prefix (judged from when the
+   folder was last genuinely active, not stragglers), lands in its family
+   folder when one fits — `Areas/W-141st-Ln` → `Archive/Housing/20XX-
+   W-141st-Ln`. Create the destination first if new (`himalaya folder
+   create`), then `$ACT move` every message in the source folder to it in
+   one batch call.
+4. **No event is logged** — folder-level, no per-sender learning signal;
+   the active window is reconstructable from Maildir mtimes
+   (`CopyArrivalDate yes`) if ever needed.
 
 ## Account quirks
 
-- **Gmail:** `envelope search` fails (no IMAP SORT) — **only ever
-  `envelope list`**. The star is `\Flagged`. Archive target is the explicit
-  `Archive` label from `config.yaml` — never emulate Gmail's native archive
-  (remove-from-inbox), which would strand mail in All Mail only.
-  `message.send.save-copy = false` is set in the himalaya config because
-  Gmail's SMTP auto-saves to Sent — don't "fix" a missing local save.
+- **`mbsync` requires `-c "$MBSYNCRC"` on every invocation** — not
+  auto-discovered (verified, 2.1). Box-scoped syntax:
+  `mbsync -c "$MBSYNCRC" 'gmail:INBOX,Areas/Taxes'`.
+- **Gmail:** `envelope search` fails (no IMAP SORT) — only `envelope list`,
+  on both the IMAP and `-local` accounts. The star is `\Flagged`. Gmail's
+  `[Gmail]/Trash` and `[Gmail]/Spam` auto-purge in ~30 days — a hard
+  ceiling, vs. a comfortable floor on iCloud.
+- **Moves via `-local` himalaya are unusable** — verified live (2.6): the
+  `,U=<uid>` filename token travels to the target folder and mbsync
+  hard-errors, having already synced the source-side deletion (a real
+  stranding risk). `$ACT` is the only move path. Flag ops via `-local`
+  himalaya, by contrast, are mbsync-safe (suffix-only rename, `,U=`
+  preserved in place).
 - **iCloud:** himalaya's save-copy is the only Sent copy (iCloud SMTP does
-  not auto-save) — leave `save-copy` at its default there.
-- Envelope JSON shape (verified against himalaya v1.2.0): bare array;
-  `id` is a **string**; `flags` is an array of strings (e.g. `["Flagged"]`);
-  `from`/`to` are `{name, addr}` objects; `date` is local-tz RFC-ish
-  (`2026-07-02 14:12-07:00`).
+  not auto-save) — leave `save-copy` at its default on the `icloud` account.
+- **Gmail SMTP auto-saves to Sent** — `message.send.save-copy = false` is
+  set on the `gmail` account in himalaya's config; don't "fix" a missing
+  local save there.
+- Envelope JSON shape (verified against himalaya v1.2.0, both IMAP and
+  Maildir backends): bare array; `id` is a **string**; `flags` is an array
+  of strings (e.g. `["Flagged"]`); `from`/`to` are `{name, addr}` objects;
+  `date` is local-tz RFC-ish. Maildir-backend ids are internal to himalaya
+  (an id-mapper over the folder), unrelated to the index's `maildir_key` —
+  always resolve them fresh, immediately before use.

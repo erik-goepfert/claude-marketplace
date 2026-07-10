@@ -483,7 +483,7 @@ CREATE TABLE events (
                                           -- passive-update | ambiguous | actionable
     inactive_days      INTEGER,
     -- the decision (the learning signal)
-    proposed_action    TEXT NOT NULL,     -- flag | reply | archive | trash | skip
+    proposed_action    TEXT NOT NULL,     -- flag | reply | archive | trash | skip | activate (2.7: moved to Active — decisive, unlike skip)
     final_action       TEXT NOT NULL,
     from_folder        TEXT,
     to_folder          TEXT,              -- populated for archive/trash/move
