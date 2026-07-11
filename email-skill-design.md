@@ -835,6 +835,12 @@ Phase 4 follows a classify-first discipline:
    never followed. Since the click itself is invisible to the skill, it asks
    whether the user unsubscribed and logs the answer on `events.unsubscribed`
    (§9) — the only way that signal ever enters the history.
+   **A confirmed unsubscribe doubles as trash approval** (added 2026-07-10,
+   user rule): "I've unsubscribed" authorizes trashing the associated
+   message or batch without a separate approval round-trip — scoped strictly
+   to the messages the unsubscribe was about. Rationale: the user has
+   already decided this mail stream is unwanted; asking again to discard
+   the very message that prompted the unsubscribe is pure friction.
 
 **Noise-handling escalation (added 2026-07-09).** For recurring unwanted
 mail, the standing policy is a three-step ladder:

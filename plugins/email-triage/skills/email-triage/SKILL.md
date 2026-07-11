@@ -269,6 +269,12 @@ Then, for everything else:
    this one?") and log the answer via `--unsubscribed` on that event. Don't
    ask per-thread if the user gave a batch answer ("unsubscribe from all of
    these") — apply it to each event in the batch.
+   **A confirmed unsubscribe is also trash approval** (user rule,
+   2026-07-10): "I've unsubscribed" means you may trash the associated
+   message or batch without a separate ask — the confirmation IS the
+   approval for those specific messages. Log normally
+   (`final_action=trash, decided_by=approved, --unsubscribed`). It approves
+   only the messages the unsubscribe was about, nothing wider.
 5. **Noise escalation — when unsubscribe isn't possible.** Three-step
    ladder: (1) unsubscribe if possible; (2) when it isn't (or the user
    declines but still wants the mail gone), **propose a server-side filter**
