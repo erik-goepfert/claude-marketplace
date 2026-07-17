@@ -35,14 +35,19 @@ ACT="${CLAUDE_SKILL_DIR}/scripts/act.py"
 HIST="${CLAUDE_SKILL_DIR}/scripts/history.py"
 ```
 
-- `config.yaml` (in `$DATA`) — accounts, per-account system-folder map,
-  `maildir_path`, `server_rules` registry. **Read it at session start; never
-  improvise folder names.** `Active`, `Areas/<area>[/<project>]`, and
-  `Archive[/<family>]/<chapter>` are **not** in config — they're fixed
-  canonical names, identical on both accounts (see Canonical destinations).
-  Caveat: `accounts.gmail.folders.archive` is a leftover MVP-era explicit
-  label, kept only for the interim (implementation-plan 2.3) — it is **not**
-  the flat-leaf archive destination under this model; see Acting.
+- `config.yaml` (in `$DATA`) — schema v2 (Phase 4): per-account `tiers:`
+  map realizing each canonical tier CONCEPT as this account's folder name,
+  plus `maildir_path` and the `server_rules` registry. **Read it at session
+  start; never improvise folder names — every folder name in every command
+  comes from this map.** Tier concepts (code) vs realizations (config):
+  `untriaged` (delivery lands, nothing decided), `active` (decided, live),
+  `ongoing` (resolved, group stays warm — a subtree root), `cold` (resolved,
+  done), plus system roles `sent`/`drafts`/`trash`/`junk`/`all_mail`.
+  Nullable: `active: null` = no distinct live location (3-way disposition
+  collapses to 2-way); `cold: null` = cold is a *condition, not a place*
+  (derived as present-only-in-all_mail; write path `$ACT remove`;
+  `cold_root` optionally names a real subtree for named chapters —
+  gmail's `Archive/...` labels).
 - `history.db` — decision log, session notes, contacts, rules. Irreplaceable.
 - `index.db` — header + thread-graph cache over the Maildir. Disposable,
   rebuildable by `$IDX index`.
@@ -138,10 +143,14 @@ improvising it here.
    session live there, and `waiting`-state derivation lies without it):
    ```sh
    rm -f "$DATA/.fullsync-done"
-   mbsync -c "$MBSYNCRC" 'gmail:INBOX,Active,[Gmail]/Sent Mail'
-   mbsync -c "$MBSYNCRC" 'icloud:INBOX,Active,Sent Messages'
+   $IDX priority-folders     # config-driven fast set per account:
+                             # tiers untriaged + active + sent + drafts
    ```
-   (~60–90 s total; gmail's per-invocation overhead dominates.)
+   Build one box-scoped mbsync invocation per account from its `fast`
+   list, e.g. `mbsync -c "$MBSYNCRC" 'gmail:INBOX,Active,[Gmail]/Sent
+   Mail,[Gmail]/Drafts'` (~60–90 s total; gmail's per-invocation overhead
+   dominates). Never hardcode the folder names — accounts differ and the
+   config is the single source of truth.
    **Stage 2 — full sync, background**, one account per invocation
    (combined multi-channel invocations flake ~25% with
    `read: unexpected EOF`; per-account + one routine retry always
@@ -167,7 +176,7 @@ improvising it here.
    `unrecognized_folders`. This is provably-external change (the skill
    re-indexes its own actions immediately as it acts, §Acting) — log it:
    - `moved` entries whose destination tier is `trash` → one manual event,
-     `final_action=trash`. Destination tier `archive`/`areas` →
+     `final_action=trash`. Destination tier `cold`/`ongoing` →
      `final_action=archive`. Destination tier `active` →
      `final_action=activate`.
      All: `decided_by=manual`, `proposed_action=final_action`,
@@ -183,9 +192,11 @@ improvising it here.
      hasn't finished absorbing something); log a session note, don't infer
      Archive.
 7. **Assemble threads.** `$THR list --db "$IDXDB"` — default tiers
-   `inbox`+`active` (every thread with ≥1 member in either; the full member
-   list, including any Areas/Archive/Sent siblings, always comes back —
-   this is what makes reconciliation detectable, see below).
+   `untriaged`+`active` (every thread with ≥1 member in either; the full
+   member list, including ongoing/cold/sent siblings, always comes back —
+   this is what makes reconciliation detectable, see below). Every thread
+   object carries `drafted: true|false` — the second derived status,
+   orthogonal to `state` (see Triage).
 8. **Priority scan**, then **breakdown**, then **classify-first, easiest-
    first** (see Triage). **Before the FIRST act batch: verify Stage 2 is
    done** — `[ -f "$DATA/.fullsync-done" ]`. If not yet, tell the user
@@ -247,22 +258,32 @@ reads during classification**. Two axes per thread:
 - **Lifecycle state**, from `$THR`'s `state` field (already the taxonomy's
   `OR(\Flagged)` / Sent-correlation derivation — nothing to recompute):
   `needs-reply` / `waiting` / `holding`. `inactive_days` is likewise already
-  computed (days since the latest non-trash/junk member).
+  computed (days since the latest state-eligible member).
   **A `waiting` thread gets no proposal and no log entry, ever — not even a
   skip.** Lifecycle state and content category are independent axes, so a
   `waiting` thread can still land in `actionable` or any other category and
   surface in that category's list; leave it out of the batch entirely.
+- **Drafted status** (`drafted: true` on the thread object — third axis,
+  orthogonal to both others; derived from a `drafts`-tier member): a
+  response is in progress. Changes the triage verb: `needs-reply + drafted`
+  proposes "finish/send this draft?", never "compose a reply?".
+  **Drafted threads are never silently passed over** — the inverse of the
+  waiting rule: surface every session until the draft is sent or
+  discarded, with staleness ("this draft is 3 sessions old") as nudge
+  material. A draft never drives `state` (it isn't communication; it's its
+  own axis).
 - **Content category:** `spam-noise` | `marketing` | `newsletter` |
   `passive-update` (receipts, notifications, alerts) | `ambiguous` |
   `actionable`.
 - **Current tier matters for what's being decided.** A thread whose only
-  live-tier member is in `inbox` needs the full 3-way disposition (stay open
-  in `Active` / resolve to `Areas`-or-`Archive` / discard). A thread already
-  in `active` just needs flag maintenance (flag / unflag / resolve / trash)
+  live-tier member is `untriaged` needs the full 3-way disposition (stay
+  open in the active tier / resolve to ongoing-or-cold / discard — with
+  `active: null` in config this collapses to 2-way). A thread already in
+  `active` just needs flag maintenance (flag / unflag / resolve / trash)
   — it's already filed.
 - **Reconciliation check.** If a listed thread's members span **both**
-  `inbox` and a resolved tier (`areas`/`archive`), it's a new arrival on an
-  already-filed thread — handle per Reconciliation below, not as a fresh
+  `untriaged` and a resolved tier (`ongoing`/`cold`), it's a new arrival on
+  an already-filed thread — handle per Reconciliation below, not as a fresh
   thread.
 
 **Priority scan — before the breakdown, before anything else.** Security and
@@ -372,7 +393,7 @@ Message-ID/In-Reply-To/References graph plus a guarded subject fallback
 
 - `$THR list --db "$IDXDB" [--account icloud|gmail] [--tier t1 --tier t2 ...]
   [--sender substr] [--subject-contains substr]`
-  — every thread with ≥1 member in the given tier set (default `inbox`,
+  — every thread with ≥1 member in the given tier set (default `untriaged`,
   `active`; both accounts if `--account` omitted). Use the two filters to
   answer "which thread is X" directly — don't dump the full JSON and
   re-filter it with ad-hoc python (the first live session did that 27
@@ -390,16 +411,18 @@ Message-ID/In-Reply-To/References graph plus a guarded subject fallback
 
 ## Acting
 
-**Canonical destinations** (fixed names, not in `config.yaml`, identical
-across accounts except where noted):
+**Destinations — resolved from `config.yaml`'s `tiers:` map, never
+hardcoded.** The dispatch per disposition (Phase 4.4 — a third account
+slots in by config alone):
 
-| Disposition | iCloud | Gmail |
-|---|---|---|
-| Stays open | `$ACT move --to Active` | `$ACT move --to Active` |
-| Resolve, ongoing area | `$ACT move --to "Areas/<area>[/<project>]"` | same |
-| Resolve, one-off closure (flat leaf) | `$ACT move --to "Archive/<year>-<Name>"` | `$ACT remove` (strip the last label — message persists in All Mail only; the indexer infers tier `archive` by absence, taxonomy's "virtual Archive") |
-| Resolve, closed chapter in a family | `$ACT move --to "Archive/<Family>/<year>-<Name>"` | `$ACT move --to "Archive/<Family>/<year>-<Name>"` — a **real** label (hierarchy can't be expressed by absence); create it first if new: `himalaya folder create -a gmail "Archive/<Family>/<year>-<Name>"` (verified two-level nesting, §13.6) |
-| Discard | `$ACT move --to "<config accounts.<acct>.folders.trash>"` | same |
+| Disposition | Rule (per account's tier config) |
+|---|---|
+| Stays open | `$ACT move --to <tiers.active>` (if `active: null`, the disposition doesn't exist — mail stays put in untriaged) |
+| Resolve, ongoing group | `$ACT move --to "<tiers.ongoing>/<group>[/<project>]"` |
+| Resolve, closed one-off (flat leaf) | `cold` is a **name** → `$ACT move --to "<tiers.cold>/<year>-<Name>"`. `cold` is **null** → `$ACT remove` (strip the last label; message persists only in all_mail; the indexer derives tier `cold` by absence) |
+| Resolve, closed chapter in a family | `$ACT move --to "<cold name or cold_root>/<Family>/<year>-<Name>"` — always a **real** folder/label even when cold is null (hierarchy can't be expressed by absence); create first if new (`himalaya folder create`) |
+| Discard | `$ACT move --to <tiers.trash>` |
+| Save reply for later | see Reply step 5b — `himalaya message save` into `<tiers.drafts>` |
 
 `$ACT move --db "$IDXDB" --maildir "$MAILDIR/<acct>" --account <acct> --from
 <folder> --to <folder> <message-id>...` and `$ACT remove ... --from <folder>
@@ -435,18 +458,39 @@ the index is stale — rerun `$IDX index` and retry.
      step 1 (the template omits it).
   4. Write the body (quote below, reply above, matching the user's voice).
      Save the full template to a temp file.
-  5. Show the complete draft to the user. Only after explicit approval:
-     `himalaya template send -a <acct> "$(cat <tmpfile>)"`.
-  Sending sets `\Answered` automatically (and marks `\Seen` on the original
-  — accepted per rule 5's exception). The next sync/index picks this up
-  locally.
+  5. Show the complete draft to the user. Three exits:
+     - **Send** (explicit approval of that exact draft):
+       `himalaya template send -a <acct> "$(cat <tmpfile>)"`. Sending sets
+       `\Answered` automatically (and marks `\Seen` on the original —
+       accepted per rule 5's exception). The next sync/index picks it up.
+     - **Save for later** ("save it, I'll finish on my phone"): write the
+       full RFC822 (headers incl. In-Reply-To/References + body, LF line
+       endings) to the account's drafts folder LOCALLY — **on stdin, never
+       as an argument** (verified 4.5: the argument form silently saves an
+       EMPTY message, and without stdin redirection the command hangs
+       waiting for it):
+       `himalaya message save -a <acct>-local -f "<tiers.drafts>" < <tmpfile>`
+       Then resolve the draft's local id FRESH (`envelope list` — himalaya
+       Maildir ids are unstable across operations; verified the id changed
+       0→4 over one sync) and flag it:
+       `himalaya flag add -a <acct>-local -f "<tiers.drafts>" <id> draft seen`.
+       New files carry no `,U=` token — mbsync-safe upload; the batch-
+       boundary sync (which must include the drafts folder) pushes it as a
+       standard IMAP draft the phone can open, edit, and send. Log
+       `final_action=draft` (decisive). Thread keeps its flag — the reply
+       is still owed; `drafted: true` surfaces it next session. Sent from
+       the phone later → the change report's Sent detection logs the
+       manual reply; the draft's disappearance (clients delete on send) is
+       expected report noise — don't log an event for it.
+     - **Discard**: delete the temp file; log per the user's actual
+       disposition of the thread.
 
 ## Reconciliation (new arrival on a filed thread)
 
 New mail continuing an existing thread arrives in Inbox regardless of the
 thread's filed location — delivery has no knowledge of it. Detected per
-Triage's reconciliation check (a listed thread spanning `inbox` + a resolved
-tier). Three outcomes, always a fresh, explicit decision — arrival triggers
+Triage's reconciliation check (a listed thread spanning `untriaged` + a
+resolved tier). Three outcomes, always a fresh, explicit decision — arrival triggers
 attention, it doesn't itself change state:
 
 - **Stays resolved** (default expectation): move the new Inbox message to
@@ -497,8 +541,10 @@ original `proposed_action` alongside; **the richest learning signal** —
 "leave it" after a proposal is `final_action=skip, decided_by=override`),
 `manual` (detected via the indexer's change report, §Session flow step 6).
 
-**Action vocabulary (Phase 2.7).** The `final_action` enum is
-`flag | reply | archive | trash | skip | activate`. `activate` is the 2.7
+**Action vocabulary.** The `final_action` enum is
+`flag | reply | archive | trash | skip | activate | draft`. `draft` (4.5)
+= composed a reply but saved it to Drafts instead of sending — decisive,
+like activate. `activate` is the 2.7
 addition: moved to the Active tier — triaged, stays open, no flag — with
 `to_folder=Active`. It's a real decision (counts as decisive in
 `sender_stats`), which is exactly why it is NOT logged as `skip`: skips are
@@ -546,8 +592,8 @@ sender_stats.
 
 Project graduation runs on a slower loop than per-session triage.
 
-1. **Signal:** per `Areas/<area>/<project>` subfolder — `$THR list --tier
-   areas`, grouped by `folder`, look at days since the latest member's
+1. **Signal:** per `<tiers.ongoing>/<group>/<project>` subfolder —
+   `$THR list --tier ongoing`, grouped by `folder`, look at days since the latest member's
    `date_utc` and whether any member is flagged. Falling volume + no open
    flags is a candidate.
 2. **Propose, never auto-execute:** "`Areas/…/Fence`: 0 new messages, 0

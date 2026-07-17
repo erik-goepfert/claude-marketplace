@@ -52,6 +52,18 @@ required to preserve the taxonomy.
 messages. Where a flag is per-message but the state is per-thread, the tool
 derives the thread value from the message graph (below).
 
+**Concepts in code, names in config (Phase 4, 2026-07-17).** The tier
+vocabulary is the canon: `untriaged` (delivery lands, nothing decided),
+`active` (decided, still live), `ongoing` (resolved, group stays warm),
+`cold` (resolved, done), plus the system roles (sent/drafts/trash/junk/
+all-mail). Every folder NAME in this document — INBOX, `Active`, `Areas/`,
+`Archive/` — is one user's *realization* of those concepts, recorded in
+`config.yaml`'s per-account `tiers:` map, not fixed by the system. Tiers
+are nullable per account: `active: null` collapses the live tier into
+untriaged (the MVP model); `cold: null` makes cold a derived condition
+(present-only-in-all-mail) rather than a place. Nobody adopting this
+system needs these folder names; they need these concepts.
+
 **Mirrored, not merged.** Both accounts carry the same canonical structure. A
 message is never moved between accounts — it is filed within whichever account
 delivered it. A single logical Area may therefore hold threads in both
@@ -200,6 +212,7 @@ category.
 |------|---------|--------|----------------------|
 | `\Flagged` | Needs my reply / blocked on my action | Explicit triage decision only (any client's flag/star works — it's a queue-for-the-skill action) | Yes — derives thread needs-reply state |
 | `\Answered` | I have sent a reply to this message | MUA, automatically on reply | No — bookkeeping input to the `waiting` derivation; queried, never acted on |
+| `\Draft` | An unsent response exists (drafts-tier member) | Draft-save (skill's save-for-later flow, or any client) | No — derives the thread's independent `drafted` status (added Phase 4.5) |
 | `\Seen` | Read by **the user** | The user's own clients; Claude only ever by deliberate `flag add … seen` when content was actually shown | No — not repurposed |
 
 `\Answered` and `\Flagged` are fully decoupled: `\Answered` records what was
@@ -239,6 +252,15 @@ delivery order. Now, state changes *only* through the explicit clear-then-set
 write path. Mail arrival never touches it — the existing flag persists, and
 the thread stays blocked (or not) until a triage decision says otherwise. This
 supersedes the latest-message rollup in design §10 (see Migration).
+
+**Second derived status: `drafted` (Phase 4.5).** Orthogonal to state:
+`drafted(thread) = any member sits in the drafts tier`. Drafts are excluded
+from the *state* derivation — a draft isn't communication and can't move
+the conversation axis; it IS its own axis. Every state x drafted
+combination is meaningful (`needs-reply + drafted` = owed, and started —
+the triage verb becomes "finish/send this draft?"). Drafted threads are
+never silently passed over: surfaced every session until sent or
+discarded — the inverse of the waiting rule.
 
 **Mapping to the richer event vocabulary.** The server carries exactly two
 live states — flagged or unflagged within `Active`. The three-state vocabulary

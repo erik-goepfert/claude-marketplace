@@ -643,7 +643,7 @@ Erik's folder names. Canonical *structure* stays mirrored across accounts;
 folder names masquerading as concepts. index.db is disposable — rename is
 a rebuild, cheapest it will ever be.
 
-- [ ] **4.1 Config schema v2.** Per-account `tiers:` map replaces/extends
+- [x] **4.1 Config schema v2.** Per-account `tiers:` map replaces/extends
       `folders:`: `untriaged`, `active`, `ongoing` (subtree root), `cold`
       (folder AND root), `sent`, `drafts` (NEW), `trash`, `junk`,
       `all_mail` (NEW, gmail). **Nullable tiers:** `active: null` = no
@@ -654,7 +654,7 @@ a rebuild, cheapest it will ever be.
       `all_mail`). Fix the stale gmail `archive: Archive` MVP leftover
       (label also gets deleted server-side — it's empty). Matching rule:
       folder == name OR folder startswith name + "/".
-- [ ] **4.2 Indexer reads the tier map.** Replace `SYSTEM_FOLDER_TIERS` +
+- [x] **4.2 Indexer reads the tier map.** Replace `SYSTEM_FOLDER_TIERS` +
       canonical-name checks in `classify_folder_tier` with the per-account
       config map (tiny restricted line-based parser for our known
       config.yaml shape — stdlib-only constraint holds). Built-in defaults
@@ -667,7 +667,7 @@ a rebuild, cheapest it will ever be.
       (`'inbox','allmail'` in candidates), SKILL prose. Rebuild index;
       **regression gate: tier counts must match the pre-rename index
       modulo the renames.**
-- [ ] **4.3 `priority-folders` subcommand** (indexer): emits per-account
+- [x] **4.3 `priority-folders` subcommand** (indexer): emits per-account
       mbsync box lists. Fast set = tiers `untriaged` + `active` + `sent` +
       `drafts`; slow = everything else (`cold`, `ongoing`, `trash`,
       `junk`, `allmail`) — archiving activity must never promote cold
@@ -676,12 +676,12 @@ a rebuild, cheapest it will ever be.
       liveness. Empty index degrades to untriaged+sent. SKILL step 5
       builds Stage-1 sync commands from this output instead of hardcoded
       names.
-- [ ] **4.4 Config-driven archive dispatch** (SKILL Acting section): cold
+- [x] **4.4 Config-driven archive dispatch** (SKILL Acting section): cold
       tier maps to a name → `act.py move` to it; `cold: null` →
       `act.py remove`. Replaces the hardcoded per-account row in the
       canonical-destinations table. A third account slots in by config
       alone.
-- [ ] **4.5 Drafts: independent thread status + server round-trip.**
+- [x] **4.5 Drafts: independent thread status + server round-trip.**
       - `drafted` is a SECOND derived thread status, orthogonal to state
         (`\Flagged` → needs-reply/waiting/holding; `\Draft`-tier member →
         `drafted: true/false`). Drafts excluded from the STATE computation
@@ -712,7 +712,7 @@ a rebuild, cheapest it will ever be.
       - Smoke test at execution: save dummy draft, sync, verify
         server-side, clean up; USER validates phone-side editability
         (the one hop not verifiable from here).
-- [ ] **4.6 Doc alignment.** Taxonomy doc: canonical-structure-vs-
+- [x] **4.6 Doc alignment.** Taxonomy doc: canonical-structure-vs-
       config-realized-names (supersedes "fixed canonical names identical
       on both accounts"); flag table gains `\Draft` row (set by
       draft-save; derives the independent `drafted` status);
@@ -720,6 +720,28 @@ a rebuild, cheapest it will ever be.
       per flag; tier-ID renames throughout. Design doc: §7.7/§9 config
       schema v2 note; §7.1 two-stage sync already documented. SKILL:
       all of the above operationally. Plugin reinstall at the end.
+
+**Phase 4 outcome (2026-07-17): executed in full, committed across two
+commits.** Code (4.2/4.3/4.5) Sonnet-drafted from this plan and verified:
+50 tests green across four suites; real-index rebuild matched the baseline
+tier counts EXACTLY modulo the renames; `priority-folders` emits the
+expected fast sets for both accounts. Config v2 live (machine-local, with
+pre-Phase-4 backup); stale empty gmail `Archive` label deleted server-side
+(all 11 Archive/* children verified intact — Gmail slash-labels are
+independent). One schema addition beyond the plan: `cold_root` (gmail),
+naming the real chapter subtree that coexists with `cold: null`. Agent
+improvement beyond spec: containers are now DERIVED
+(proper-ancestor-of-a-configured-folder) — zero hardcoded container names
+remain. Draft round-trip smoke-tested live against iCloud: save → flag →
+box-scoped sync → server shows subject + [Seen, Draft]; three operational
+findings encoded in SKILL.md: `message save` takes the message on STDIN
+(the argument form silently saves an EMPTY message; without redirection it
+hangs), LF line endings, and himalaya-local ids are unstable (0→4 across
+one sync) so resolve fresh before flagging. Test draft left in iCloud
+Drafts for the user's phone-side validation (`ZZZ-Skilltest draft
+roundtrip v2` — delete from the phone; that deletion propagating back is
+itself a bonus test). USER FOLLOW-UPS: phone check; 2.9 launchd backup
+still pending.
 
 **Explicitly rejected during design (recorded so they stay rejected):**
 - *Recency as the priority-sync signal.* "Sync recently-active folders

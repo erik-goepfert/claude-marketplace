@@ -23,7 +23,11 @@ from pathlib import Path
 
 DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
 
-ACTIONS = ("flag", "reply", "archive", "trash", "skip", "activate")
+ACTIONS = ("flag", "reply", "archive", "trash", "skip", "activate", "draft")
+# "draft" (added Phase 4.5): composed a reply but saved it to the account's
+# Drafts folder instead of sending (finish-on-phone flow). Decisive, like
+# activate. Lingering-draft analytics derive from draft events without a
+# subsequent reply -- facts, not aggregates; no extra column.
 # "activate" (added Phase 2.7): moved to the Active tier -- triaged, stays
 # open, no flag. A real decision, so it counts as decisive in sender_stats
 # (unlike "skip"). to_folder carries "Active".

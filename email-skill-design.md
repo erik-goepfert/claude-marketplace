@@ -254,7 +254,14 @@ flowchart LR
   Special-folder names differ per account (`Sent` vs `[Gmail]/Sent Mail`,
   etc.); the skill carries a per-account folder map. On first run the skill
   bootstraps it: `folder list` per account, confirm archive/trash targets with
-  the user, write the config.
+  the user, write the config. **Schema v2 (Phase 4, 2026-07-17):** the map
+  became a full per-account `tiers:` block realizing every tier concept
+  (untriaged/active/ongoing/cold + system roles) as this account's folder
+  name, nullable where a tier has no place on an account (`active: null`
+  collapses live into untriaged; `cold: null` = derived condition, with
+  `cold_root` optionally naming the real chapter subtree). The indexer's
+  classifier and the skill's action dispatch both read this map — no folder
+  name below the config boundary.
 - **Scheduling discipline:** all syncs are **skill-invoked at safe points** —
   session start, after each approved action batch, and session end.
   **Two-stage refinement (2026-07-16, latency):** session start splits into
@@ -1091,6 +1098,8 @@ Rationale lives in the body; this is the index of choices.
 - Noise escalation ladder (2026-07-09): unsubscribe → server-side delete-filter (skill drafts, user installs, registered in config.yaml `server_rules`) → triage rule. Server rules delete, never file — filing filters bypass the Inbox tier and the learning loop.
 - Unsubscribe outcome is self-reported: `events.unsubscribed` is set only when the user confirms in-session, since the click itself is structurally invisible to the skill (added after the MVP's first session, prompted by wanting an "unsubscribe rate by category" metric the original schema couldn't answer).
 - Contacts carry `relation` — human framing ('your plumber') over generic categories.
+- Concepts in code, names in config (Phase 4): tier IDs renamed to concept names (untriaged/ongoing/cold); config.yaml schema v2 realizes tiers per account, nullable; containers derived as ancestors of configured folders; priority sync set = tier-derived (untriaged+active+sent+drafts), never activity-derived.
+- Drafts are a third orthogonal axis (Phase 4.5): `\Draft`-tier member ⇒ thread `drafted` status; excluded from state derivation (a draft isn't communication); never silently passed over; save-for-later flow writes real IMAP drafts finishable from any client; `draft` action in the events vocabulary.
 - Packaged as a Claude Code plugin, distributed through the existing personal marketplace; developed locally via `--plugin-dir`.
 - Strict code/state separation: the plugin is read-only code; all state lives in a machine-local data dir (`~/.local/share/email-triage/` by default); nothing personal in the repo.
 - Dependencies checked and bootstrapped on first run, never bundled.
