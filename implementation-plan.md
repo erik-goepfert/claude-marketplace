@@ -619,3 +619,111 @@ quoting bit once); category closure now requires a re-list, not memory.
 - [ ] Richer rule predicates, only when sender-equality proves insufficient
       (§15.4).
 - [ ] Skip-pattern nudges ("deferred five times — archive or long-term hold?").
+
+---
+
+## Phase 4 — Tier vocabulary & config generalization (designed 2026-07-16, not yet executed)
+
+Design converged over one long session (two-stage sync → taxonomy-agnostic
+priority → the five standard spaces → drafts). Decisions are FINAL below;
+only execution remains. Execute in order; each task is independently
+committable.
+
+**Governing decision — concepts in code, names in config.** The tier
+vocabulary (IDs + semantics + derivation logic) is system code; every
+folder-name realization of a tier is per-account config, uniform with how
+`trash`/`sent` already work. Nobody adopting this system should need
+Erik's folder names. Canonical *structure* stays mirrored across accounts;
+*names* are per-user.
+
+**Tier ID renames (decided):** `inbox`→`untriaged`, `areas`→`ongoing`,
+`archive`→`cold`; `active` and the system roles (`sent`, `drafts`,
+`trash`, `junk`, `allmail`, `container`, `unrecognized`) unchanged.
+`untriaged`/`ongoing`/`cold` are concept names; the old IDs were Erik's
+folder names masquerading as concepts. index.db is disposable — rename is
+a rebuild, cheapest it will ever be.
+
+- [ ] **4.1 Config schema v2.** Per-account `tiers:` map replaces/extends
+      `folders:`: `untriaged`, `active`, `ongoing` (subtree root), `cold`
+      (folder AND root), `sent`, `drafts` (NEW), `trash`, `junk`,
+      `all_mail` (NEW, gmail). **Nullable tiers:** `active: null` = no
+      distinct live location (live mail stays in untriaged; 3-way
+      disposition collapses to 2-way — degrades to the MVP model);
+      `cold: null` = cold is a *condition, not a place* (derived as
+      present-only-in-all_mail; write path is act.py remove; requires
+      `all_mail`). Fix the stale gmail `archive: Archive` MVP leftover
+      (label also gets deleted server-side — it's empty). Matching rule:
+      folder == name OR folder startswith name + "/".
+- [ ] **4.2 Indexer reads the tier map.** Replace `SYSTEM_FOLDER_TIERS` +
+      canonical-name checks in `classify_folder_tier` with the per-account
+      config map (tiny restricted line-based parser for our known
+      config.yaml shape — stdlib-only constraint holds). Built-in defaults
+      = current hardcoded names, so absent config degrades gracefully
+      (tests, bare bootstrap). Delete the dead container entries
+      `Archive/Career`/`Archive/Housing` (unreachable — shadowed by the
+      cold-root prefix rule; user-taxonomy leaked into code). Rename tier
+      IDs everywhere: classifier, `message_tiers` view CASE/ranks,
+      threads.py `DEFAULT_LIST_TIERS`/`HISTORY_TIERS`, analytics queries
+      (`'inbox','allmail'` in candidates), SKILL prose. Rebuild index;
+      **regression gate: tier counts must match the pre-rename index
+      modulo the renames.**
+- [ ] **4.3 `priority-folders` subcommand** (indexer): emits per-account
+      mbsync box lists. Fast set = tiers `untriaged` + `active` + `sent` +
+      `drafts`; slow = everything else (`cold`, `ongoing`, `trash`,
+      `junk`, `allmail`) — archiving activity must never promote cold
+      storage into the fast lane, and under inbox-only delivery
+      (server-rules-delete-never-file) no other folder can originate
+      liveness. Empty index degrades to untriaged+sent. SKILL step 5
+      builds Stage-1 sync commands from this output instead of hardcoded
+      names.
+- [ ] **4.4 Config-driven archive dispatch** (SKILL Acting section): cold
+      tier maps to a name → `act.py move` to it; `cold: null` →
+      `act.py remove`. Replaces the hardcoded per-account row in the
+      canonical-destinations table. A third account slots in by config
+      alone.
+- [ ] **4.5 Drafts: independent thread status + server round-trip.**
+      - `drafted` is a SECOND derived thread status, orthogonal to state
+        (`\Flagged` → needs-reply/waiting/holding; `\Draft`-tier member →
+        `drafted: true/false`). Drafts excluded from the STATE computation
+        (a draft isn't communication; it can't move the conversation axis
+        — it IS its own axis). All state×drafted combinations meaningful;
+        `needs-reply + drafted` changes the triage verb to "finish/send
+        this draft?".
+      - threads.py: exclude tier `drafts` from state derivation, expose
+        `drafted` on the thread object; tests for the axis independence.
+      - **Drafted threads are never silently passed over** — surfaced
+        every session until sent or discarded (staleness nudge:
+        "this draft is 3 sessions old"). Inverse of waiting's
+        never-propose rule; encode both in SKILL Triage + Skip rules.
+      - **Save-for-later reply flow** (SKILL Reply section): third exit
+        besides send/discard — `himalaya message save -a <acct>-local
+        -f <drafts-folder>` (new files carry no ,U= token: mbsync-safe
+        upload), `flag add ... draft`, then box-scoped Drafts sync at the
+        batch boundary (existing invariant). Standard IMAP-append
+        drafting; phone continues the thread via the In-Reply-To/
+        References we already construct. Round-trip is existing
+        machinery: sent-from-phone → manual reply event; unsent →
+        drafted status next session. Drafts deletions in the change
+        report (client deletes on send) are expected noise — surface,
+        don't log events.
+      - `draft` added to history.py ACTIONS (decisive, like activate);
+        no new events column — lingering-draft analytics derivable from
+        draft events without subsequent reply (facts, not aggregates).
+      - Smoke test at execution: save dummy draft, sync, verify
+        server-side, clean up; USER validates phone-side editability
+        (the one hop not verifiable from here).
+- [ ] **4.6 Doc alignment.** Taxonomy doc: canonical-structure-vs-
+      config-realized-names (supersedes "fixed canonical names identical
+      on both accounts"); flag table gains `\Draft` row (set by
+      draft-save; derives the independent `drafted` status);
+      thread-state derivation section becomes two derived statuses, one
+      per flag; tier-ID renames throughout. Design doc: §7.7/§9 config
+      schema v2 note; §7.1 two-stage sync already documented. SKILL:
+      all of the above operationally. Plugin reinstall at the end.
+
+**Explicitly rejected during design (recorded so they stay rejected):**
+date_utc- or indexed_at-recency as the priority-sync signal (both
+polluted by the skill's own filing: archiving yesterday's newsletter
+would make cold storage look "active" — the user's catch);
+skip+to_folder as a stand-in for real action verbs; folder-name-based
+logic anywhere below the config boundary.
