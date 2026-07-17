@@ -435,12 +435,27 @@ def cmd_list(args: argparse.Namespace) -> None:
         accounts = args.account or all_accounts(conn)
         tiers = set(args.tier) if args.tier else set(DEFAULT_LIST_TIERS)
 
+        sender_q = (args.sender or "").lower()
+        subject_q = (args.subject_contains or "").lower()
+
         result = []
         for account in accounts:
             members = load_account_members(conn, account)
             for group in assemble_account_threads(members):
                 mlist = [members[mid] for mid in group]
                 if not any(m["tier"] in tiers for m in mlist):
+                    continue
+                # Cheap in-process filters (added after the first live
+                # session spent 27 ad-hoc python -c calls re-filtering
+                # dumped JSON): substring match, case-insensitive, against
+                # ANY member's from_addr / subject.
+                if sender_q and not any(
+                    sender_q in (m["from_addr"] or "").lower() for m in mlist
+                ):
+                    continue
+                if subject_q and not any(
+                    subject_q in (m["subject"] or "").lower() for m in mlist
+                ):
                     continue
                 thread_obj, sort_date = build_thread_object(account, mlist)
                 result.append((thread_obj, sort_date))
@@ -493,6 +508,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--tier",
         action="append",
         help=f"include threads with >=1 member in this tier (repeatable); default: {DEFAULT_LIST_TIERS}",
+    )
+    list_p.add_argument(
+        "--sender",
+        help="only threads where some member's from_addr contains this "
+             "(case-insensitive substring)",
+    )
+    list_p.add_argument(
+        "--subject-contains",
+        dest="subject_contains",
+        help="only threads where some member's subject contains this "
+             "(case-insensitive substring)",
     )
     list_p.set_defaults(func=cmd_list)
 

@@ -538,6 +538,32 @@ The local mirror and index land underneath the working MVP practice.
       recovery window. Deliberately NOT moved the data dir into a synced
       location: the mirror's constant Maildir renames racing iCloud sync
       would invite conflicted copies.
+      **Amendment (2026-07-16):** the skill-invoked session-end backup is
+      retired — the first live session hit macOS TCC denials writing
+      `~/Documents` from the shell (grants don't attach to already-running
+      processes), and per the user, making Claude do it is unnecessary.
+      Replaced by 2.9.
+- [ ] **2.9 Scheduled history backup (follow-up).** A launchd user agent
+      (daily) invoking `history.py backup` — the subcommand already exists
+      and does the right thing (SQLite online-backup API, dated copies,
+      pruning); only the scheduling moves out of Claude's hands. Setup
+      notes: launchd jobs get their own TCC identity, so either grant the
+      invoking binary access to Documents (or Full Disk Access), or point
+      `--dest` somewhere un-TCC'd that iCloud still syncs; verify the
+      first scheduled run actually produced a file before trusting it.
+
+**First live full-stack session (2026-07-10, reviewed 2026-07-16):**
+59 threads → 0 in 81 min; `activate` vocabulary and change-report manual
+events (2 external flags, 1 Sent-detected reply) worked in production —
+this also closes 2.4's deferred live external-change validation. Review
+found the iteration-cycle costs and all fixes are applied: batch-boundary
+sync made a hard invariant (six batches sat local-only for 35 min until
+the user asked); unsubscribe flow reworked (body links primary, full-URL
+markdown formatting rules, `--header`-doesn't-suppress-body pattern);
+`-s 500` pagination and per-account mbsync (+1 retry) documented;
+`threads.py` gained `--sender`/`--subject-contains` (the session
+hand-rolled 27 JSON filters); `act.py` gained stdin ids (backslash
+quoting bit once); category closure now requires a re-list, not memory.
 
 **Cutover notes**
 - MVP-era events remain valid unchanged — self-containment was designed for

@@ -126,9 +126,19 @@ def main(argv=None) -> int:
                        help="account Maildir root (e.g. .../mail/icloud)")
         p.add_argument("--account", required=True, help="account name in the index")
         p.add_argument("--from", dest="src", required=True, help="source folder")
-        p.add_argument("message_ids", nargs="+", metavar="MESSAGE-ID")
+        p.add_argument(
+            "message_ids", nargs="+", metavar="MESSAGE-ID",
+            help="message-ids; pass a single '-' to read newline-separated "
+                 "ids from stdin instead (avoids shell quoting mangling ids "
+                 "containing backslashes etc. — bit a live session once)")
     mv.add_argument("--to", dest="dst", required=True, help="destination folder")
     args = ap.parse_args(argv)
+
+    if args.message_ids == ["-"]:
+        args.message_ids = [ln.strip() for ln in sys.stdin if ln.strip()]
+        if not args.message_ids:
+            print("fatal: no message-ids on stdin", file=sys.stderr)
+            return 1
 
     if not os.path.isfile(args.db):
         print(f"fatal: no such db: {args.db}", file=sys.stderr)

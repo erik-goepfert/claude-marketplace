@@ -131,10 +131,15 @@ improvising it here.
    session carries it verbatim.
 4. **Read history context:** `$HIST context [--senders addr1,addr2,...]` —
    recent session notes, active rules, sender stats, contacts.
-5. **Sync (session start, full).** `mbsync -c "$MBSYNCRC" icloud gmail`.
-   iCloud is seconds; Gmail's full ~30-mailbox channel is ~5–8 min regardless
-   of what changed (per-invocation overhead, not per-message) — accepted
-   once here, not something to repeat mid-session (see step 8).
+5. **Sync (session start, full).** One invocation **per account** —
+   `mbsync -c "$MBSYNCRC" gmail` then `mbsync -c "$MBSYNCRC" icloud` —
+   never combined: combined multi-channel invocations fail ~25% of the
+   time with `read: unexpected EOF` when the second channel opens
+   (observed live, 5/20 invocations; per-account calls or one retry always
+   recover — treat one retry as routine, not an incident). iCloud is
+   seconds; Gmail's full ~30-mailbox channel is ~5–8 min regardless of what
+   changed (per-invocation overhead, not per-message) — accepted once
+   here, not something to repeat mid-session (see step 8).
 6. **Index and consume the change report.**
    `$IDX index --maildir "$MAILDIR" --db "$IDXDB"` → JSON on stdout:
    `new` / `moved` / `deleted` / `flag_changed` / `parse_errors` /
@@ -170,12 +175,19 @@ improvising it here.
    folders the batch touched) — never a full-channel sync per action; Gmail's
    ~60–80 s per-invocation overhead is paid regardless of scope, so batch
    actions per sync.
-9. **Session end.** Final full sync (`mbsync -c "$MBSYNCRC" icloud gmail`),
-   final `$IDX index`, then `$HIST backup` (dated copy of `history.db` +
-   `config.yaml` into `~/Documents/email-triage-backups/` — inside the
-   user's iCloud-synced Documents; `~/.local` itself is never synced, and
-   `history.db` is the one irreplaceable file), `rmdir "$LOCK"`, session
-   note if anything is unfinished.
+   **HARD INVARIANT: a batch is not complete until its sync has run.**
+   Never begin the next batch — and never report a batch as done — while
+   the previous batch's changes exist only in the local mirror. Why: in the
+   first live session, six batches of trashes sat local-only for 35 minutes
+   until the user asked "have you pushed our changes to the server?" — a
+   crash in that window would have left all of it live in the mailbox.
+   Act → log → re-index → **push** is one unit.
+9. **Session end.** Final full sync (per account, as in step 5), final
+   `$IDX index`, `rmdir "$LOCK"`, session note if anything is unfinished.
+   History backup is NOT a session step — it runs as a scheduled system
+   task outside Claude (launchd invoking `$HIST backup`; plan 2.9). The
+   first live session hit macOS TCC denials trying to write
+   `~/Documents` from this shell; don't retry that fight in-session.
 
 Note: mid-session syncs may pull **new arrivals**, which the indexer will
 index, but the triage set assembled in step 7 is not re-assembled mid-session
@@ -251,6 +263,11 @@ Then, for everything else:
    as a grouped list with a proposed disposition per thread (stay open /
    resolve-to / trash); the user can pull individual threads out before
    approving. **Actionable threads are always presented individually.**
+   **Never declare a category closed from memory** — re-run `$THR list`
+   (scoped with `--sender`/`--subject-contains` when useful) and verify
+   nothing from the category remains in a live tier first. The first live
+   session reported "all 18 handled" twice while a thread still sat in
+   Inbox.
 3. **Targeted body reads only**, for exactly two reasons: resolving an
    `ambiguous` classification, or extracting unsubscribe links — category by
    category as worked, never upfront. Resolve the current local id
@@ -262,13 +279,24 @@ Then, for everything else:
    If resolving the ambiguity means actually showing the user the content,
    mark it read at that point:
    `himalaya flag add -a <acct>-local -f <folder> <id> seen`
-4. **Unsubscribe extraction:** prefer the `List-Unsubscribe` header
-   (`himalaya message read --preview -a <acct>-local -f <folder> --header
-   list-unsubscribe <id>`) over body-scraped links. Present the link; the
-   user acts on it themselves (rule 4). Ask ("unsubscribe too, or just clear
-   this one?") and log the answer via `--unsubscribed` on that event. Don't
-   ask per-thread if the user gave a batch answer ("unsubscribe from all of
-   these") — apply it to each event in the batch.
+4. **Unsubscribe extraction:** extract BOTH the `List-Unsubscribe` header
+   AND the body's footer unsubscribe link, and **surface the body link as
+   primary** (revised 2026-07-16 after live sessions: header links are
+   built for RFC 8058 automated one-click POSTs and frequently fail when a
+   human clicks them; body links on ESP click-tracking domains worked
+   reliably). Note: `--header list-unsubscribe` does NOT suppress the
+   body — looping it over many ids produces a giant blob. Read each
+   message once to a temp file and grep both the header and the footer out
+   of it:
+   `himalaya message read --preview -a <acct>-local -f <folder> <id> > "$tmp"`
+   **Link formatting is load-bearing:** present the FULL URL as a markdown
+   link — never truncate/elide it (`...` breaks the token) and never wrap
+   it in backticks (unclickable in the terminal). Both failure modes cost
+   real user round-trips in the first live session.
+   The user acts on the link themselves (rule 4). Ask ("unsubscribe too,
+   or just clear this one?") and log the answer via `--unsubscribed` on
+   that event. Don't ask per-thread if the user gave a batch answer
+   ("unsubscribe from all of these") — apply it to each event in the batch.
    **A confirmed unsubscribe is also trash approval** (user rule,
    2026-07-10): "I've unsubscribed" means you may trash the associated
    message or batch without a separate ask — the confirmation IS the
@@ -298,9 +326,13 @@ No in-context grouping anymore — `$THR` builds threads from the index's
 Message-ID/In-Reply-To/References graph plus a guarded subject fallback
 (participant overlap required), and derives lifecycle state directly.
 
-- `$THR list --db "$IDXDB" [--account icloud|gmail] [--tier t1 --tier t2 ...]`
+- `$THR list --db "$IDXDB" [--account icloud|gmail] [--tier t1 --tier t2 ...]
+  [--sender substr] [--subject-contains substr]`
   — every thread with ≥1 member in the given tier set (default `inbox`,
-  `active`; both accounts if `--account` omitted). Each thread object:
+  `active`; both accounts if `--account` omitted). Use the two filters to
+  answer "which thread is X" directly — don't dump the full JSON and
+  re-filter it with ad-hoc python (the first live session did that 27
+  times). Each thread object:
   `account`, `root_message_id`, `state`, `inactive_days`, `member_count`,
   `subject`, `members[]` (every member regardless of tier — `message_id`,
   `folder`, `folder_tier`, `date_utc`, `from_addr`, `subject`, `flags`,
@@ -471,7 +503,17 @@ Project graduation runs on a slower loop than per-session triage.
 
 - **`mbsync` requires `-c "$MBSYNCRC"` on every invocation** — not
   auto-discovered (verified, 2.1). Box-scoped syntax:
-  `mbsync -c "$MBSYNCRC" 'gmail:INBOX,Areas/Taxes'`.
+  `mbsync -c "$MBSYNCRC" 'gmail:INBOX,Areas/Taxes'`. **One account per
+  invocation** — combined `icloud gmail` calls flake with
+  `read: unexpected EOF` ~25% of the time (opening the second channel);
+  a single retry always recovered.
+- **`himalaya envelope list` defaults to a 10-envelope page** on every
+  backend — a listing that "looks complete" at 10 is silently truncated.
+  Always pass `-s 500` (or page with `-p`). Cost a live session ~9 tool
+  calls to rediscover.
+- **`$ACT` accepts message-ids on stdin** (`... move ... -` with one id
+  per line) — use it whenever an id contains shell-hostile characters
+  (backslashes bit a live session) or for long batches.
 - **Gmail:** `envelope search` fails (no IMAP SORT) — only `envelope list`,
   on both the IMAP and `-local` accounts. The star is `\Flagged`. Gmail's
   `[Gmail]/Trash` and `[Gmail]/Spam` auto-purge in ~30 days — a hard

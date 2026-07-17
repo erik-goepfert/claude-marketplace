@@ -830,9 +830,13 @@ Phase 4 follows a classify-first discipline:
    from marketing/newsletters — category by category as each is worked, never
    upfront, never for confidently classified mail. Post-MVP a body read is a
    local Maildir file read.
-6. **Unsubscribe extraction** prefers the `List-Unsubscribe` header (reliable)
-   over body-scraped links (false-positive prone), and follows §4.4: surfaced,
-   never followed. Since the click itself is invisible to the skill, it asks
+6. **Unsubscribe extraction** captures both the `List-Unsubscribe` header
+   and the body's footer link, and surfaces the **body link as primary**
+   (reversed 2026-07-16 from the original header-first preference, on live
+   evidence: header links target RFC 8058 automated one-click POST
+   endpoints and frequently fail for a human browser GET, while
+   body/footer links on ESP click-tracking domains worked reliably).
+   Follows §4.4: surfaced, never followed. Since the click itself is invisible to the skill, it asks
    whether the user unsubscribed and logs the answer on `events.unsubscribed`
    (§9) — the only way that signal ever enters the history.
    **A confirmed unsubscribe doubles as trash approval** (added 2026-07-10,
