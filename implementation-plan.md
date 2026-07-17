@@ -576,7 +576,25 @@ quoting bit once); category closure now requires a re-list, not memory.
 
 ## Phase 3 — Optional, on demand
 
-- [ ] DuckDB attached read-only over both files for trend analytics (§9).
+- [x] DuckDB attached read-only over both files for trend analytics (§9).
+      **Outcome (2026-07-16):** built as `scripts/analytics.py` +
+      `test_analytics.py` (8 tests green): categories / domains / trends /
+      rules / sessions / candidates, JSON out, both DBs attached read-only,
+      §9 gotchas encoded once at the attach site. One deviation from the
+      2026-07-04 phrasing, deliberate: a separate script rather than
+      history.py subcommands — the core logger stays stdlib-only, so
+      nothing in the system depends on duckdb existing. Deployment: the
+      system python3 has no duckdb module (the July 4 install was the CLI);
+      solved with a PEP 723 inline-dependency block + `uv run` (uv present
+      via brew) — self-provisioning, no venv, no install step. SKILL.md
+      gains an Analytics section (canned-queries-only rule, graceful skip
+      without uv) and allowed-tools coverage. Real-data first light:
+      26.8% confirmed-unsubscribe rate on decisive marketing events (the
+      metric that motivated the column); `candidates` surfaces
+      e-tradealerts@etrade.com (9 decisive, 88.9% trash) as the first
+      genuine rule proposal — pending only arrival recency within the
+      default 30-day window. DuckDB ATTACH quirk found: the path can't be
+      a bound parameter; interpolated with manual quote-escaping.
       **Decision (2026-07-04):** the learning loop itself (context read,
       sender_stats, rule proposals) is core and SQLite-backed — this item is
       only about DuckDB as a richer query engine. When analytics deepen in

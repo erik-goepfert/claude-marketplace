@@ -643,6 +643,14 @@ files read-only** and queries them in place — including joins across index and
 history. DuckDB is strictly a lens: all writes to both files remain owned by
 the Python scripts. Nothing in the system depends on DuckDB existing.
 
+**Built (2026-07-16, Phase 3): `scripts/analytics.py`** — canned queries
+only (categories, domains, trends, rules, sessions, candidates), invoked
+via `uv run` with a PEP 723 block self-provisioning duckdb; the gotchas
+below are encoded once in its `connect()`, never rewritten in-session.
+`candidates` is the cross-DB payoff: chronic-trash senders still arriving
+(events × envelopes join) — rule-proposal evidence. history.py stays
+stdlib-only; nothing depends on duckdb existing.
+
 The attach is `INSTALL sqlite; LOAD sqlite; ATTACH '<file>' AS h (TYPE sqlite,
 READ_ONLY);`. Two gotchas, verified against DuckDB 1.5 over the real
 `history.db`, because the attach is not fully transparent:

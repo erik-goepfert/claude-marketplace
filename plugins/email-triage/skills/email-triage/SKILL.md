@@ -1,7 +1,7 @@
 ---
 name: email-triage
 description: Triage email across iCloud and Gmail accounts — thread-centric review of a local Maildir mirror (synced by mbsync, indexed to SQLite) with flag/reply/archive/trash decisions, approval gates, and a persistent history DB that makes each session smarter than the last. Use when the user asks to triage, clean up, or process their email/inbox.
-allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*) Bash(*indexer.py*) Bash(*threads.py*) Bash(*act.py*) Bash(mbsync *)
+allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*) Bash(*indexer.py*) Bash(*threads.py*) Bash(*act.py*) Bash(*analytics.py*) Bash(mbsync *)
 ---
 
 # Email Triage
@@ -478,6 +478,25 @@ Skip rules:
 Session notes (`session_notes` table) carry resume state, stats context,
 watch items, and `unrecognized_folders`/`parse_errors` audit debt from the
 change report. Write them **the moment** the noteworthy thing happens.
+
+## Analytics (on demand — user asks for stats/trends/patterns, or you need rule-proposal evidence)
+
+`ANA="${CLAUDE_SKILL_DIR}/scripts/analytics.py"` — DuckDB over both DBs,
+read-only, canned queries only (never write raw SQL in-session; the §9
+attach gotchas are encoded in the script once). **Invoke via
+`uv run "$ANA" <subcommand>`** — a PEP 723 block self-provisions the
+optional duckdb dependency; core triage never needs it. If `uv` is
+unavailable, skip analytics gracefully — `$HIST context` still carries
+sender_stats.
+
+| Subcommand | Answers |
+|---|---|
+| `categories` | action mix + unsubscribe rate per category ("how often do I unsubscribe from marketing?") |
+| `domains [--min-events N] [--category X]` | per-domain trash/reply/archive/override rates |
+| `trends [--weeks N]` | weekly volume + action mix + distinct senders/sessions |
+| `rules` | per-rule usage + override rate (incl. unused rules) |
+| `sessions [--limit N]` | per-session event counts, mix, duration spread |
+| `candidates [--min-events N] [--days N]` | **rule-proposal fuel**: senders you nearly always trash that keep arriving, not yet covered by a rule — cite these numbers when proposing a rule |
 
 ## PARA review phase (on-demand / weekly, not every session)
 
