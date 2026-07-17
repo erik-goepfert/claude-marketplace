@@ -380,7 +380,7 @@ recent_arrivals AS (
     SELECT lower(from_addr)   AS sender,
            MAX(date_utc)      AS last_arrival
     FROM i.envelopes
-    WHERE folder_tier IN ('inbox', 'allmail')
+    WHERE folder_tier IN ('untriaged', 'allmail')
       AND date_utc >= ?
     GROUP BY 1
 )

@@ -46,7 +46,7 @@ class ActTests(unittest.TestCase):
         self.conn.execute(
             """INSERT INTO envelopes (message_id, folder, maildir_key,
                maildir_file, account, folder_tier)
-               VALUES (?, ?, ?, ?, 'acct', 'inbox')""",
+               VALUES (?, ?, ?, ?, 'acct', 'untriaged')""",
             (mid, folder, key, filename))
         self.conn.commit()
 

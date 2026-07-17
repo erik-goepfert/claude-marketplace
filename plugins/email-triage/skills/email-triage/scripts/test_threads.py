@@ -102,18 +102,18 @@ class ThreadsTestCase(unittest.TestCase):
 
     # (a) 3-message In-Reply-To chain assembles as one thread.
     def test_in_reply_to_chain_assembles_one_thread(self):
-        self.insert(message_id="A", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Fence quote", from_addr="me@x.com", to_addr="them@y.com",
                     date_utc=days_ago(3))
         self.insert(message_id="B", folder="Sent Messages",
                     folder_tier="sent", account="ic", in_reply_to="A", references_chain=["A"],
                     subject="Re: Fence quote", from_addr="me@x.com", to_addr="them@y.com",
                     date_utc=days_ago(2), is_answered=1)
-        self.insert(message_id="C", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="C", folder="INBOX", folder_tier="untriaged", account="ic",
                     in_reply_to="B", references_chain=["A", "B"], subject="Re: Fence quote",
                     from_addr="them@y.com", to_addr="me@x.com", date_utc=days_ago(1))
 
-        result = self.run_list(tier=["inbox", "active", "sent"])
+        result = self.run_list(tier=["untriaged", "active", "sent"])
         self.assertEqual(len(result), 1)
         thread = result[0]
         self.assertEqual(thread["member_count"], 3)
@@ -122,15 +122,15 @@ class ThreadsTestCase(unittest.TestCase):
 
     # (b) A References-only link (gap in the parent walk) still joins.
     def test_references_only_link_joins_despite_missing_parent(self):
-        self.insert(message_id="A", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Taxes 2025", from_addr="cpa@firm.com", to_addr="me@x.com",
                     date_utc=days_ago(10))
         # B is deliberately never indexed (dropped/never synced).
-        self.insert(message_id="C", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="C", folder="INBOX", folder_tier="untriaged", account="ic",
                     in_reply_to="B", references_chain=["A", "B"], subject="Re: Taxes 2025",
                     from_addr="me@x.com", to_addr="cpa@firm.com", date_utc=days_ago(1))
 
-        result = self.run_list(tier=["inbox"])
+        result = self.run_list(tier=["untriaged"])
         self.assertEqual(len(result), 1)
         thread = result[0]
         self.assertEqual(thread["member_count"], 2)
@@ -138,48 +138,48 @@ class ThreadsTestCase(unittest.TestCase):
 
     # (c) subject fallback joins ONLY with participant overlap.
     def test_subject_fallback_positive_with_participant_overlap(self):
-        self.insert(message_id="X1", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="X1", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Invoice #42", from_addr="billing@vendor.com", to_addr="me@x.com",
                     date_utc=days_ago(5))
         self.insert(message_id="X2", folder="Active", folder_tier="active", account="ic",
                     subject="Re: Invoice #42", from_addr="me@x.com", to_addr="billing@vendor.com",
                     date_utc=days_ago(1))
-        result = self.run_list(tier=["inbox", "active"])
+        result = self.run_list(tier=["untriaged", "active"])
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["member_count"], 2)
 
     def test_subject_fallback_negative_without_participant_overlap(self):
-        self.insert(message_id="Y1", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="Y1", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Invoice #99", from_addr="billing@vendorA.com", to_addr="me@x.com",
                     date_utc=days_ago(5))
-        self.insert(message_id="Y2", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="Y2", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Re: Invoice #99", from_addr="billing@vendorB.com", to_addr="someone-else@z.com",
                     date_utc=days_ago(1))
-        result = self.run_list(tier=["inbox"])
+        result = self.run_list(tier=["untriaged"])
         self.assertEqual(len(result), 2)
         self.assertEqual({t["member_count"] for t in result}, {1})
 
     # (d) flagged mid-thread message => needs-reply even when latest is unflagged.
     def test_flagged_mid_thread_message_forces_needs_reply(self):
-        self.insert(message_id="A", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Contractor question", from_addr="them@y.com", to_addr="me@x.com",
                     date_utc=days_ago(5), is_flagged=1)
-        self.insert(message_id="B", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="B", folder="INBOX", folder_tier="untriaged", account="ic",
                     in_reply_to="A", references_chain=["A"], subject="Re: Contractor question",
                     from_addr="them@y.com", to_addr="me@x.com", date_utc=days_ago(1), is_flagged=0)
-        result = self.run_list(tier=["inbox"])
+        result = self.run_list(tier=["untriaged"])
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["state"], "needs-reply")
 
     # (e) latest-is-sent unflagged => waiting, inactive_days from the sent member.
     def test_latest_is_sent_unflagged_gives_waiting(self):
-        self.insert(message_id="A", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Question", from_addr="them@y.com", to_addr="me@x.com",
                     date_utc=days_ago(9))
         self.insert(message_id="B", folder="Sent Messages", folder_tier="sent", account="ic",
                     in_reply_to="A", references_chain=["A"], subject="Re: Question",
                     from_addr="me@x.com", to_addr="them@y.com", date_utc=days_ago(4), is_answered=1)
-        result = self.run_list(tier=["inbox", "sent"])
+        result = self.run_list(tier=["untriaged", "sent"])
         self.assertEqual(len(result), 1)
         thread = result[0]
         self.assertEqual(thread["state"], "waiting")
@@ -187,13 +187,13 @@ class ThreadsTestCase(unittest.TestCase):
 
     # (f) flagged message in Trash does NOT make the thread needs-reply.
     def test_flagged_trash_message_does_not_block(self):
-        self.insert(message_id="A", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Old thread", from_addr="them@y.com", to_addr="me@x.com",
                     date_utc=days_ago(20), is_flagged=0)
         self.insert(message_id="B", folder="Deleted Messages", folder_tier="trash", account="ic",
                     in_reply_to="A", references_chain=["A"], subject="Re: Old thread",
                     from_addr="spammer@y.com", to_addr="me@x.com", date_utc=days_ago(1), is_flagged=1)
-        result = self.run_list(tier=["inbox"])
+        result = self.run_list(tier=["untriaged"])
         self.assertEqual(len(result), 1)
         thread = result[0]
         self.assertEqual(thread["member_count"], 2)
@@ -218,14 +218,14 @@ class ThreadsTestCase(unittest.TestCase):
 
     # (h) list --tier inbox excludes a fully-archived thread; show still assembles it.
     def test_list_tier_filter_excludes_archived_thread_but_show_finds_it(self):
-        self.insert(message_id="A", folder="Archive", folder_tier="archive", account="ic",
+        self.insert(message_id="A", folder="Archive", folder_tier="cold", account="ic",
                     subject="Closed chapter", from_addr="them@y.com", to_addr="me@x.com",
                     date_utc=days_ago(400))
-        self.insert(message_id="B", folder="Archive", folder_tier="archive", account="ic",
+        self.insert(message_id="B", folder="Archive", folder_tier="cold", account="ic",
                     in_reply_to="A", references_chain=["A"], subject="Re: Closed chapter",
                     from_addr="me@x.com", to_addr="them@y.com", date_utc=days_ago(399))
 
-        result = self.run_list(tier=["inbox"])
+        result = self.run_list(tier=["untriaged"])
         self.assertEqual(result, [])
 
         # Default tiers (inbox+active) should also exclude it.
@@ -237,7 +237,7 @@ class ThreadsTestCase(unittest.TestCase):
         self.assertEqual(thread["root_message_id"], "A")
 
     def test_show_unknown_message_id_exits_1_with_clear_error(self):
-        self.insert(message_id="A", folder="INBOX", folder_tier="inbox", account="ic",
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Hi", from_addr="them@y.com", to_addr="me@x.com", date_utc=days_ago(1))
         stderr_text = self.run_show_expect_exit1("ic", "does-not-exist")
         self.assertIn("does-not-exist", stderr_text)
@@ -252,10 +252,10 @@ class ThreadsTestCase(unittest.TestCase):
             # holds regardless of account, matching indexer.py's real schema
             # (real Maildir keys are unique hashes and never collide across
             # accounts in practice).
-            self.insert(message_id="DUP", folder="INBOX", folder_tier="inbox", account=account,
+            self.insert(message_id="DUP", folder="INBOX", folder_tier="untriaged", account=account,
                         subject="Renewal notice", from_addr="billing@service.com", to_addr="me@x.com",
                         date_utc=days_ago(2), maildir_key=f"DUP-{account}")
-        result = self.run_list(tier=["inbox"])
+        result = self.run_list(tier=["untriaged"])
         self.assertEqual(len(result), 2)
         accounts_seen = {t["account"] for t in result}
         self.assertEqual(accounts_seen, {"ic", "gmail"})
@@ -271,6 +271,52 @@ class ThreadsTestCase(unittest.TestCase):
         self.assertEqual(thread_gmail["account"], "gmail")
         self.assertEqual(thread_ic["member_count"], 1)
         self.assertEqual(thread_gmail["member_count"], 1)
+
+    # -- Drafts axis (4.5): `drafted` is a second, orthogonal derived status.
+
+    # (a) flagged thread + draft member => needs-reply AND drafted true.
+    def test_drafted_true_alongside_needs_reply_from_flagged_member(self):
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
+                    subject="Quote request", from_addr="them@y.com", to_addr="me@x.com",
+                    date_utc=days_ago(5), is_flagged=1)
+        self.insert(message_id="B", folder="Drafts", folder_tier="drafts", account="ic",
+                    in_reply_to="A", references_chain=["A"], subject="Re: Quote request",
+                    from_addr="me@x.com", to_addr="them@y.com", date_utc=days_ago(1))
+        result = self.run_list(tier=["untriaged"])
+        self.assertEqual(len(result), 1)
+        thread = result[0]
+        self.assertEqual(thread["state"], "needs-reply")
+        self.assertTrue(thread["drafted"])
+
+    # (b)+(d) latest member is a draft => state (and inactive_days) come from
+    # the latest non-draft/non-history member, not the draft.
+    def test_latest_draft_member_excluded_from_state_and_inactive_days(self):
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
+                    subject="Project status", from_addr="them@y.com", to_addr="me@x.com",
+                    date_utc=days_ago(9))
+        self.insert(message_id="B", folder="Sent Messages", folder_tier="sent", account="ic",
+                    in_reply_to="A", references_chain=["A"], subject="Re: Project status",
+                    from_addr="me@x.com", to_addr="them@y.com", date_utc=days_ago(3), is_answered=1)
+        self.insert(message_id="C", folder="Drafts", folder_tier="drafts", account="ic",
+                    in_reply_to="B", references_chain=["A", "B"], subject="Re: Project status",
+                    from_addr="me@x.com", to_addr="them@y.com", date_utc=days_ago(1))
+        result = self.run_list(tier=["untriaged", "sent"])
+        self.assertEqual(len(result), 1)
+        thread = result[0]
+        # 'waiting' from B (latest sent-tier member), NOT 'holding' because
+        # C (a draft) happens to be chronologically newest.
+        self.assertEqual(thread["state"], "waiting")
+        self.assertEqual(thread["inactive_days"], 3)
+        self.assertTrue(thread["drafted"])
+
+    # (c) drafted false when no draft member.
+    def test_drafted_false_when_no_draft_member(self):
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
+                    subject="Simple note", from_addr="them@y.com", to_addr="me@x.com",
+                    date_utc=days_ago(2))
+        result = self.run_list(tier=["untriaged"])
+        self.assertEqual(len(result), 1)
+        self.assertFalse(result[0]["drafted"])
 
 
 if __name__ == "__main__":

@@ -169,11 +169,14 @@ class IndexerTest(unittest.TestCase):
             },
         )
 
-    def run_indexer(self):
+    def run_indexer(self, accounts=None):
+        # No --config passed (mirrors a bare bootstrap, no config.yaml on
+        # disk) -- exercises the DEFAULT_TIER_MAPS fallback (4.2).
         conn = indexer.init_db(self.db_path)
         try:
-            accounts = indexer.resolve_accounts(self.maildir_root, None)
-            report = indexer.run_index(conn, self.maildir_root, accounts)
+            resolved = accounts or indexer.resolve_accounts(self.maildir_root, None)
+            tier_maps = indexer.load_tier_maps(self.tmp / "no-such-config.yaml", resolved)
+            report = indexer.run_index(conn, self.maildir_root, resolved, tier_maps)
             conn.commit()
         finally:
             conn.close()
@@ -206,13 +209,13 @@ class IndexerTest(unittest.TestCase):
         self.assertEqual(len(synthetic_ids), 1)
 
         tiers = self.query_tiers()
-        self.assertEqual(tiers[("icloud", "m1@example.com")], "inbox")
-        self.assertEqual(tiers[("icloud", "m2@example.com")], "inbox")
-        self.assertEqual(tiers[("icloud", "m4@example.com")], "archive")
-        self.assertEqual(tiers[("icloud", "m5@example.com")], "archive")
-        self.assertEqual(tiers[("gmail", synthetic_ids[0])], "inbox")
-        self.assertEqual(tiers[("gmail", "g2@example.com")], "areas")  # non-allmail wins over allmail
-        self.assertEqual(tiers[("gmail", "g3@example.com")], "archive")  # allmail-only -> virtual Archive
+        self.assertEqual(tiers[("icloud", "m1@example.com")], "untriaged")
+        self.assertEqual(tiers[("icloud", "m2@example.com")], "untriaged")
+        self.assertEqual(tiers[("icloud", "m4@example.com")], "cold")
+        self.assertEqual(tiers[("icloud", "m5@example.com")], "cold")
+        self.assertEqual(tiers[("gmail", synthetic_ids[0])], "untriaged")
+        self.assertEqual(tiers[("gmail", "g2@example.com")], "ongoing")  # non-allmail wins over allmail
+        self.assertEqual(tiers[("gmail", "g3@example.com")], "cold")  # allmail-only -> virtual Cold
         self.assertEqual(tiers[("gmail", "g4@example.com")], "unrecognized")
         self.assertEqual(len(tiers), 8)  # g2's two rows collapse into one message_tiers row
 
@@ -269,7 +272,7 @@ class IndexerTest(unittest.TestCase):
             conn.close()
 
         tiers_after = self.query_tiers()
-        self.assertEqual(tiers_after[("icloud", "m2@example.com")], "archive")  # moved into Archive
+        self.assertEqual(tiers_after[("icloud", "m2@example.com")], "cold")  # moved into Archive
         self.assertNotIn(("icloud", "m5@example.com"), tiers_after)  # deleted
         self.assertEqual(len(tiers_after), 7)
 
@@ -310,7 +313,8 @@ class IndexerTest(unittest.TestCase):
         conn = indexer.init_db(self.db_path)
         try:
             accounts = indexer.resolve_accounts(self.maildir_root, ["icloud"])
-            report = indexer.run_index(conn, self.maildir_root, accounts)
+            tier_maps = indexer.load_tier_maps(self.tmp / "no-such-config.yaml", accounts)
+            report = indexer.run_index(conn, self.maildir_root, accounts, tier_maps)
             conn.commit()
         finally:
             conn.close()
@@ -330,7 +334,13 @@ class RestampTest(unittest.TestCase):
         buf = io.StringIO()
         argv = _sys.argv
         try:
-            _sys.argv = ["indexer.py", "index", "--maildir", str(root), "--db", str(db)]
+            # Explicit --config pointing at a nonexistent file: deterministic
+            # DEFAULT_TIER_MAPS fallback, never the real ~/.local/share
+            # config.yaml (which --config's own default would otherwise read).
+            _sys.argv = [
+                "indexer.py", "index", "--maildir", str(root), "--db", str(db),
+                "--config", str(Path(root).parent / "no-such-config.yaml"),
+            ]
             with contextlib.redirect_stdout(buf):
                 try:
                     indexer.main()
@@ -366,6 +376,217 @@ class RestampTest(unittest.TestCase):
             r = self._run(root, db)
             for key in ("new", "moved", "deleted", "flag_changed"):
                 self.assertEqual(r[key], [], key)
+
+
+# --------------------------------------------------------------------------
+# Config parser (4.2): a fixture string mirroring the real config.yaml's
+# tricky parts -- comments (inline and full-line), quoted values with
+# brackets/slashes, bare values with spaces, null, the server_rules `>-`
+# folded multiline block, excluded_from_sync -- none of which should ever
+# leak into the parsed tiers map.
+# --------------------------------------------------------------------------
+
+FIXTURE_CONFIG = """\
+# Machine-local config for the email-triage skill (not checked into the plugin repo).
+#
+# Schema v2 comment block, several lines, purely descriptive.
+
+accounts:
+  icloud:
+    email: erik.goepfert@icloud.com
+    himalaya_account: icloud
+    server_rules: []           # none; same delete-only policy applies if added
+    tiers:
+      untriaged: INBOX
+      active: Active
+      ongoing: Areas
+      cold: Archive            # a real folder AND a root (chapters beneath)
+      sent: Sent Messages
+      drafts: Drafts
+      trash: Deleted Messages
+      junk: Junk
+
+  gmail:
+    email: egep84@gmail.com
+    himalaya_account: gmail
+    server_rules:              # server-side filters (web-UI managed; invisible over
+                               # IMAP, so this registry is the only drift check).
+                               # Policy: server rules DELETE only -- never file into
+                               # folders (design section 11, noise-handling escalation).
+      - created: 2026-07-09
+        matches: "from:(substack.com -no-reply@substack.com)"
+        action: delete
+        why: >-
+          Substack newsletters can't be unsubscribed without unfollowing the
+          author on Substack itself; content is read in the app, so the email
+          is pure clutter. no-reply@substack.com is carved out because login
+          magic links and payment receipts come from it. Verified 2026-07-09:
+          backfill trashed 537 old issues; a login link arrived post-filter.
+    tiers:
+      untriaged: INBOX
+      active: Active
+      ongoing: Areas
+      cold: null               # virtual -- no such place (the stale MVP-era
+                               # `Archive` label was deleted 2026-07-17);
+                               # named Archive/* chapter labels are still
+                               # real and classify cold via the root below
+      cold_root: Archive       # named-chapter subtree (Archive/Career/...);
+                               # only meaningful alongside cold: null
+      all_mail: "[Gmail]/All Mail"
+      sent: "[Gmail]/Sent Mail"
+      drafts: "[Gmail]/Drafts"
+      trash: "[Gmail]/Trash"
+      junk: "[Gmail]/Spam"
+    excluded_from_sync:        # mbsync channel exclusions.
+      - "[Gmail]/Starred"
+      - "[Gmail]/Important"
+
+# Local Maildir mirror root (Phase 2.1, initial clones 2026-07-09).
+maildir_path: ~/.local/share/email-triage/mail
+"""
+
+
+class ConfigParserTest(unittest.TestCase):
+    def test_parses_icloud_tiers(self):
+        accounts = indexer.parse_config_tiers_text(FIXTURE_CONFIG)
+        self.assertEqual(accounts["icloud"], {
+            "untriaged": "INBOX",
+            "active": "Active",
+            "ongoing": "Areas",
+            "cold": "Archive",
+            "sent": "Sent Messages",  # bare value with a space
+            "drafts": "Drafts",
+            "trash": "Deleted Messages",
+            "junk": "Junk",
+        })
+
+    def test_gmail_null_cold_cold_root_and_quoted_values(self):
+        accounts = indexer.parse_config_tiers_text(FIXTURE_CONFIG)
+        gmail = accounts["gmail"]
+        self.assertIsNone(gmail["cold"])
+        self.assertEqual(gmail["cold_root"], "Archive")
+        self.assertEqual(gmail["all_mail"], "[Gmail]/All Mail")
+        self.assertEqual(gmail["sent"], "[Gmail]/Sent Mail")
+        self.assertEqual(gmail["trash"], "[Gmail]/Trash")
+        self.assertEqual(gmail["junk"], "[Gmail]/Spam")
+
+    def test_server_rules_and_excluded_from_sync_never_leak_into_tiers(self):
+        # The >- folded multiline block (and its created/matches/action/why
+        # keys), the inline "[]" list, and excluded_from_sync's own list
+        # must all be walked over, not misparsed as tier entries.
+        accounts = indexer.parse_config_tiers_text(FIXTURE_CONFIG)
+        for leaked_key in ("created", "matches", "action", "why", "email",
+                           "himalaya_account", "server_rules", "excluded_from_sync"):
+            self.assertNotIn(leaked_key, accounts["icloud"])
+            self.assertNotIn(leaked_key, accounts["gmail"])
+        self.assertEqual(set(accounts.keys()), {"icloud", "gmail"})
+
+    def test_missing_file_returns_empty_dict(self):
+        self.assertEqual(indexer.parse_config_tiers(Path("/nonexistent/config.yaml")), {})
+
+    def test_load_tier_maps_falls_back_when_config_missing(self):
+        tier_maps = indexer.load_tier_maps(Path("/nonexistent/config.yaml"), ["icloud", "gmail"])
+        self.assertEqual(tier_maps["icloud"], indexer.DEFAULT_TIER_MAPS["icloud"])
+        self.assertEqual(tier_maps["gmail"], indexer.DEFAULT_TIER_MAPS["gmail"])
+
+    def test_load_tier_maps_uses_config_when_present(self):
+        tmp = Path(tempfile.mkdtemp(prefix="email-triage-config-test-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        cfg = tmp / "config.yaml"
+        cfg.write_text(FIXTURE_CONFIG)
+        tier_maps = indexer.load_tier_maps(cfg, ["icloud", "gmail"])
+        self.assertEqual(tier_maps["icloud"]["cold"], "Archive")
+        self.assertIsNone(tier_maps["gmail"]["cold"])
+        self.assertEqual(tier_maps["gmail"]["cold_root"], "Archive")
+
+
+# --------------------------------------------------------------------------
+# classify_folder_tier (4.2): direct match, cold_root fallback, derived
+# container, unrecognized -- unit-level, independent of any Maildir/db.
+# --------------------------------------------------------------------------
+
+
+class ClassifyFolderTierTest(unittest.TestCase):
+    def test_direct_match_and_subtree(self):
+        tier_map = {"untriaged": "INBOX", "cold": "Archive"}
+        self.assertEqual(indexer.classify_folder_tier("INBOX", tier_map), "untriaged")
+        self.assertEqual(indexer.classify_folder_tier("Archive", tier_map), "cold")
+        self.assertEqual(indexer.classify_folder_tier("Archive/Housing/2020", tier_map), "cold")
+
+    def test_all_mail_config_key_maps_to_allmail_tier_id(self):
+        # 4.1's config key (all_mail) and the system-role tier id (allmail)
+        # are spelled differently, deliberately.
+        tier_map = {"all_mail": "[Gmail]/All Mail"}
+        self.assertEqual(indexer.classify_folder_tier("[Gmail]/All Mail", tier_map), "allmail")
+
+    def test_cold_root_used_only_when_cold_is_null(self):
+        tier_map = {"cold": None, "cold_root": "Archive"}
+        self.assertEqual(indexer.classify_folder_tier("Archive", tier_map), "cold")
+        self.assertEqual(indexer.classify_folder_tier("Archive/Career/TWC", tier_map), "cold")
+
+    def test_container_is_derived_from_ancestry_not_hardcoded(self):
+        tier_map = {"sent": "[Gmail]/Sent Mail", "trash": "[Gmail]/Trash"}
+        self.assertEqual(indexer.classify_folder_tier("[Gmail]", tier_map), "container")
+
+    def test_bare_tier_root_classifies_as_tier_not_container(self):
+        # 4.2 deliberately drops the old hardcoded ("[Gmail]", "Areas", ...)
+        # container tuple: the matching rule (folder == name) now classifies
+        # a bare "Areas" folder directly as the ongoing tier, not container
+        # -- a documented behavior change from the pre-Phase-4 code.
+        tier_map = {"ongoing": "Areas"}
+        self.assertEqual(indexer.classify_folder_tier("Areas", tier_map), "ongoing")
+
+    def test_unrecognized_when_nothing_matches(self):
+        tier_map = {"untriaged": "INBOX"}
+        self.assertEqual(indexer.classify_folder_tier("Newsletter", tier_map), "unrecognized")
+
+    def test_null_tier_never_matches(self):
+        tier_map = {"active": None}
+        self.assertEqual(indexer.classify_folder_tier("Active", tier_map), "unrecognized")
+
+
+# --------------------------------------------------------------------------
+# priority-folders (4.3): config-driven, database-free.
+# --------------------------------------------------------------------------
+
+
+class PriorityFoldersTest(unittest.TestCase):
+    def test_fast_set_order_and_null_skipped(self):
+        tier_map = {"untriaged": "INBOX", "active": None, "sent": "Sent Messages", "drafts": "Drafts"}
+        fast = [tier_map[k] for k in indexer.PRIORITY_FAST_TIER_KEYS if tier_map.get(k)]
+        self.assertEqual(fast, ["INBOX", "Sent Messages", "Drafts"])
+
+    def test_cmd_priority_folders_real_config_shape(self):
+        import argparse
+        import contextlib
+        import io
+
+        tmp = Path(tempfile.mkdtemp(prefix="email-triage-pf-test-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        cfg = tmp / "config.yaml"
+        cfg.write_text(FIXTURE_CONFIG)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            indexer.cmd_priority_folders(argparse.Namespace(config=cfg))
+        result = json.loads(buf.getvalue())
+        self.assertEqual(result["icloud"], {
+            "fast": ["INBOX", "Active", "Sent Messages", "Drafts"],
+            "slow_hint": "full channel",
+        })
+        self.assertEqual(result["gmail"]["fast"], ["INBOX", "Active", "[Gmail]/Sent Mail", "[Gmail]/Drafts"])
+
+    def test_cmd_priority_folders_no_config_degrades_to_defaults(self):
+        import argparse
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            indexer.cmd_priority_folders(argparse.Namespace(config=Path("/nonexistent/config.yaml")))
+        result = json.loads(buf.getvalue())
+        self.assertEqual(set(result.keys()), {"icloud", "gmail"})
+        self.assertEqual(result["icloud"]["fast"], ["INBOX", "Active", "Sent Messages", "Drafts"])
+        self.assertEqual(result["gmail"]["fast"], ["INBOX", "Active", "[Gmail]/Sent Mail", "[Gmail]/Drafts"])
 
 
 if __name__ == "__main__":

@@ -26,22 +26,34 @@ does not express cleanly as SQL.
 
 Revised state model actually implemented here (per the taxonomy carve-out and
 implementation-plan 2.5's revision note, both more specific than design §10's
-now-superseded "only INBOX and Sent drive state" table):
+now-superseded "only INBOX and Sent drive state" table), extended by Phase 4
+item 4.5 for the drafts axis:
   - Members whose per-message tier is trash or junk are history only: they
     never drive state, and flags on them are never counted in the OR.
-  - blocked(thread) = OR(is_flagged) over non-trash/junk members => needs-reply.
-  - else if the latest non-trash/junk member (by date_utc) is in the sent
+  - Members whose per-message tier is drafts are excluded from state
+    derivation too, but for a different reason (4.5): a draft isn't
+    communication -- it can't move the conversation axis, it IS its own
+    axis. `drafted` (see below) carries that information instead.
+  - blocked(thread) = OR(is_flagged) over state-eligible members (excludes
+    trash/junk/drafts) => needs-reply.
+  - else if the latest state-eligible member (by date_utc) is in the sent
     tier => waiting.
   - else => holding.
-  - inactive_days is always "days since that same latest non-trash/junk
+  - inactive_days is always "days since that same latest state-eligible
     member's date_utc" -- in the waiting branch that member is, by
     construction, also the latest sent-tier member, so the two phrasings in
-    the spec ("latest sent-tier member" for waiting, "latest non-trash/junk
-    member" otherwise) resolve to one formula.
+    the spec ("latest sent-tier member" for waiting, "latest state-eligible
+    member" otherwise) resolve to one formula. A draft member, even if it is
+    chronologically the thread's newest message, is never that "latest"
+    member (4.5 point (b)/(d)).
+  - `drafted`: a second, orthogonal derived status -- true iff ANY member
+    (including trash/junk/drafts-tier ones; the full member list) has tier
+    drafts. Independent of `state`: a thread can be needs-reply AND drafted,
+    holding AND drafted, etc.
 
 Subcommands:
   list    All threads (per account) having >=1 member whose per-message tier
-          is in the given set (default: inbox + active, the live tiers).
+          is in the given set (default: untriaged + active, the live tiers).
   show    The full thread containing a given message-id.
 
 Both print JSON to stdout (indent=2, sort_keys=True, matching indexer.py's
@@ -63,13 +75,13 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 # Mirrors indexer.py's message_tiers CASE precedence (lower = wins). 'allmail'
-# is deliberately absent -- a pure-allmail message resolves to 'archive'
-# (Gmail's virtual Archive tier), never appears as 'allmail' in output.
+# is deliberately absent -- a pure-allmail message resolves to 'cold'
+# (Gmail's virtual Cold tier), never appears as 'allmail' in output.
 TIER_RANK = {
-    "inbox": 1,
+    "untriaged": 1,
     "active": 2,
-    "areas": 3,
-    "archive": 4,
+    "ongoing": 3,
+    "cold": 4,
     "sent": 5,
     "drafts": 6,
     "trash": 7,
@@ -82,8 +94,14 @@ TIER_RANK = {
 # thread state, flags on them never count toward the OR.
 HISTORY_TIERS = {"trash", "junk"}
 
-# "the live tiers" (implementation-plan 2.5 / taxonomy Active-tier model).
-DEFAULT_LIST_TIERS = ["inbox", "active"]
+# Drafts axis (4.5): excluded from STATE derivation for a different reason
+# than trash/junk (a draft isn't communication, not that it's history), but
+# mechanically it's excluded the same way -- never in the state-eligible set.
+STATE_EXCLUDED_TIERS = HISTORY_TIERS | {"drafts"}
+
+# "the live tiers" (implementation-plan 2.5 / taxonomy Active-tier model;
+# tier IDs renamed per Phase 4 4.2: inbox->untriaged).
+DEFAULT_LIST_TIERS = ["untriaged", "active"]
 
 SUBJECT_PREFIX_RE = re.compile(r"^\s*(re|fwd?|aw)\s*:\s*", re.IGNORECASE)
 
@@ -215,9 +233,9 @@ def load_account_members(conn: sqlite3.Connection, account: str) -> dict:
             tier = winner["folder_tier"]
         else:
             # Every row for this message is All-Mail-only -> Gmail's virtual
-            # Archive tier (message_tiers view semantics), not literal 'allmail'.
+            # Cold tier (message_tiers view semantics), not literal 'allmail'.
             winner = parsed[0]
-            tier = "archive"
+            tier = "cold"
 
         members[message_id] = {
             "message_id": message_id,
@@ -353,24 +371,31 @@ def days_since(date_str, now: datetime.datetime = None):
 
 def compute_state(members: list):
     """Returns (state, inactive_days). See module docstring for the exact
-    (revised) derivation."""
-    non_history = [m for m in members if m["tier"] not in HISTORY_TIERS]
-    latest = latest_dated(non_history)
+    (revised) derivation. Excludes trash/junk (history) AND drafts (4.5's
+    independent axis) from every part of this computation."""
+    state_eligible = [m for m in members if m["tier"] not in STATE_EXCLUDED_TIERS]
+    latest = latest_dated(state_eligible)
 
-    blocked = any(m["is_flagged"] for m in non_history)
+    blocked = any(m["is_flagged"] for m in state_eligible)
     if blocked:
         state = "needs-reply"
     elif latest is not None and latest["tier"] == "sent":
         state = "waiting"
     else:
         # Covers both genuine 'holding' and the degenerate case where every
-        # member is trash/junk (non_history empty, latest is None) -- there
-        # is no server-side state left to read in that case, so it falls
-        # through to 'holding' with a null inactive_days below.
+        # member is trash/junk/drafts (state_eligible empty, latest is None)
+        # -- there is no server-side state left to read in that case, so it
+        # falls through to 'holding' with a null inactive_days below.
         state = "holding"
 
     inactive_days = days_since(latest["date_utc"]) if latest is not None else None
     return state, inactive_days
+
+
+def compute_drafted(members: list) -> bool:
+    """4.5: true iff ANY member (the full list -- trash/junk/drafts-tier
+    included) has tier drafts. Orthogonal to `state`."""
+    return any(m["tier"] == "drafts" for m in members)
 
 
 def thread_root_id(members: list) -> str:
@@ -407,6 +432,7 @@ def build_thread_object(account: str, mlist: list):
     date_utc (or '' if none), used only by `list`'s ordering and dropped
     otherwise."""
     state, inactive_days = compute_state(mlist)
+    drafted = compute_drafted(mlist)
     newest = latest_dated(mlist)
     if newest is None:
         newest = sorted(mlist, key=lambda m: m["message_id"])[0]
@@ -416,6 +442,7 @@ def build_thread_object(account: str, mlist: list):
         "account": account,
         "root_message_id": thread_root_id(mlist),
         "state": state,
+        "drafted": drafted,
         "inactive_days": inactive_days,
         "member_count": len(mlist),
         "subject": normalize_subject(newest["subject"]),

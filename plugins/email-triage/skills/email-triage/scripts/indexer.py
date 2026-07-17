@@ -12,12 +12,21 @@ Design refs:
     implementation-plan.md item 2.4's "Added scope (2026-07-09, taxonomy)"
     for the folder->tier derivation, All-Mail dedup, and unrecognized-folder
     surfacing.
+  - implementation-plan.md Phase 4 ("concepts in code, names in config"):
+    tier IDs (untriaged/active/ongoing/cold + system roles) are fixed
+    vocabulary; every folder-name realization is per-account config
+    (config.yaml's accounts.<name>.tiers map). Tier ID renames (4.2):
+    inbox->untriaged, areas->ongoing, archive->cold.
 
 Subcommands:
-  init    Create index.db schema only (idempotent).
-  index   Walk a Maildir root (one subdirectory per account), upsert +
-          reconcile into index.db (auto-inits schema), print a JSON change
-          report to stdout.
+  init             Create index.db schema only (idempotent).
+  index            Walk a Maildir root (one subdirectory per account), upsert
+                    + reconcile into index.db (auto-inits schema), print a
+                    JSON change report to stdout.
+  priority-folders  Config-driven mbsync Stage-1 box lists per account (4.3):
+                    {"<account>": {"fast": [...], "slow_hint": "full channel"}}.
+                    Database-free -- reads config.yaml (or built-in defaults)
+                    only.
 
 Three passes, in this exact order (§7.4):
   1. Snapshot -- walk every folder's cur/ + new/, recording
@@ -82,18 +91,19 @@ CREATE INDEX IF NOT EXISTS idx_message_id  ON envelopes(message_id);
 CREATE INDEX IF NOT EXISTS idx_in_reply_to ON envelopes(in_reply_to);
 CREATE INDEX IF NOT EXISTS idx_folder_date ON envelopes(folder, date_utc);
 
--- Per-message tier rollup (added scope, 2026-07-09 taxonomy). One row per
--- (account, message_id): the highest-precedence non-allmail folder_tier
--- among its rows, or 'archive' when the message's only rows are allmail
--- (Gmail's virtual Archive -- taxonomy doc, Canonical locations).
+-- Per-message tier rollup (added scope, 2026-07-09 taxonomy; tier IDs
+-- renamed per Phase 4 4.2: inbox->untriaged, areas->ongoing, archive->cold).
+-- One row per (account, message_id): the highest-precedence non-allmail
+-- folder_tier among its rows, or 'cold' when the message's only rows are
+-- allmail (Gmail's virtual Cold tier -- taxonomy doc, Canonical locations).
 CREATE VIEW IF NOT EXISTS message_tiers AS
 WITH ranked AS (
     SELECT account, message_id,
         CASE folder_tier
-            WHEN 'inbox'        THEN 1
+            WHEN 'untriaged'    THEN 1
             WHEN 'active'       THEN 2
-            WHEN 'areas'        THEN 3
-            WHEN 'archive'      THEN 4
+            WHEN 'ongoing'      THEN 3
+            WHEN 'cold'         THEN 4
             WHEN 'sent'         THEN 5
             WHEN 'drafts'       THEN 6
             WHEN 'trash'        THEN 7
@@ -111,14 +121,14 @@ best AS (
 )
 SELECT b.account, b.message_id,
     CASE b.best_rank
-        WHEN 1 THEN 'inbox' WHEN 2 THEN 'active' WHEN 3 THEN 'areas'
-        WHEN 4 THEN 'archive' WHEN 5 THEN 'sent' WHEN 6 THEN 'drafts'
+        WHEN 1 THEN 'untriaged' WHEN 2 THEN 'active' WHEN 3 THEN 'ongoing'
+        WHEN 4 THEN 'cold' WHEN 5 THEN 'sent' WHEN 6 THEN 'drafts'
         WHEN 7 THEN 'trash' WHEN 8 THEN 'junk' WHEN 9 THEN 'unrecognized'
         WHEN 10 THEN 'container'
     END AS tier
 FROM best b
 UNION
-SELECT DISTINCT e.account, e.message_id, 'archive' AS tier
+SELECT DISTINCT e.account, e.message_id, 'cold' AS tier
 FROM envelopes e
 WHERE e.folder_tier = 'allmail'
   AND NOT EXISTS (
@@ -147,43 +157,219 @@ def utc_now() -> str:
 
 
 # --------------------------------------------------------------------------
-# Folder -> tier classification (taxonomy doc, "Canonical locations").
-# Convention-based, no config file: folder is the slash-joined path relative
-# to the account root (e.g. "INBOX", "Archive/Housing/2025-Colorado-Move",
-# "[Gmail]/Sent Mail", "Areas/Taxes").
+# Folder -> tier classification (taxonomy doc, "Canonical locations";
+# implementation-plan.md Phase 4 -- "concepts in code, names in config").
+# folder is the slash-joined path relative to the account root (e.g.
+# "INBOX", "Archive/Housing/2025-Colorado-Move", "[Gmail]/Sent Mail",
+# "Areas/Taxes"). Folder NAMES come from the per-account tier_map (parsed
+# from config.yaml's accounts.<name>.tiers block, or DEFAULT_TIER_MAPS when
+# no config/account entry exists); tier IDs and the matching/derivation
+# logic are fixed system vocabulary, not config.
 # --------------------------------------------------------------------------
 
-SYSTEM_FOLDER_TIERS = {
-    "[Gmail]/Sent Mail": "sent",
-    "Sent Messages": "sent",
-    "[Gmail]/Trash": "trash",
-    "Deleted Messages": "trash",
-    "[Gmail]/Spam": "junk",
-    "Junk": "junk",
-    "[Gmail]/Drafts": "drafts",
-    "Drafts": "drafts",
-    "[Gmail]/All Mail": "allmail",
+# config.yaml tier-map key -> tier id. Identical for every key except
+# all_mail (config key, schema v2 4.1) -> allmail (the system-role tier id,
+# unchanged since MVP) -- config and code deliberately spell it differently.
+CONFIG_KEY_TO_TIER = {
+    "untriaged": "untriaged",
+    "active": "active",
+    "ongoing": "ongoing",
+    "cold": "cold",
+    "sent": "sent",
+    "drafts": "drafts",
+    "trash": "trash",
+    "junk": "junk",
+    "all_mail": "allmail",
+}
+
+# Fallback per-account tier maps: current hardcoded folder names (pre-Phase-4
+# behavior), used when config.yaml is absent or has no tiers map for an
+# account -- keeps tests and a bare bootstrap working without config.
+DEFAULT_TIER_MAPS = {
+    "icloud": {
+        "untriaged": "INBOX",
+        "active": "Active",
+        "ongoing": "Areas",
+        "cold": "Archive",
+        "sent": "Sent Messages",
+        "drafts": "Drafts",
+        "trash": "Deleted Messages",
+        "junk": "Junk",
+    },
+    "gmail": {
+        "untriaged": "INBOX",
+        "active": "Active",
+        "ongoing": "Areas",
+        "cold": "Archive",
+        "all_mail": "[Gmail]/All Mail",
+        "sent": "[Gmail]/Sent Mail",
+        "drafts": "[Gmail]/Drafts",
+        "trash": "[Gmail]/Trash",
+        "junk": "[Gmail]/Spam",
+    },
 }
 
 
-def classify_folder_tier(folder: str) -> str:
-    if folder == "INBOX":
-        return "inbox"
-    if folder == "Active":
-        return "active"
-    if folder in SYSTEM_FOLDER_TIERS:
-        return SYSTEM_FOLDER_TIERS[folder]
-    if folder == "Archive" or folder.startswith("Archive/"):
-        return "archive"
-    if folder.startswith("Areas/"):
-        return "areas"
-    if folder in ("[Gmail]", "Areas", "Archive/Career", "Archive/Housing"):
-        # Pure container directories (Gmail's bracket namespace, family
-        # folders, the Areas parent): they hold no messages by convention
-        # and aren't audit debt. Messages found in one anyway still get
-        # surfaced, via the container tier's lowest precedence.
-        return "container"
+def _matches(folder: str, name: str) -> bool:
+    """4.1's matching rule: a folder belongs to a tier if it equals the
+    configured name or is a descendant (name + "/...")."""
+    return folder == name or folder.startswith(name + "/")
+
+
+def classify_folder_tier(folder: str, tier_map: dict) -> str:
+    """Folder -> tier, driven entirely by one account's tier_map (config.yaml
+    accounts.<name>.tiers, or a DEFAULT_TIER_MAPS fallback -- 4.2).
+
+    1. Direct match against every configured tier folder (untriaged, active,
+       ongoing, cold, sent, drafts, trash, junk, all_mail); a null/missing
+       tier never matches anything.
+    2. `cold_root` (gmail-only second cold-tier root): meaningful only when
+       `cold` itself is null (a virtual-only account) -- named Archive/<
+       chapter> labels still exist on disk and must classify `cold`.
+    3. `container`: a folder that matched no tier above but is a PROPER
+       ancestor of some configured tier folder (e.g. "[Gmail]" is an
+       ancestor of "[Gmail]/Sent Mail") holds no messages by convention and
+       isn't audit debt.
+    4. Anything else: `unrecognized`.
+    """
+    for config_key, tier_id in CONFIG_KEY_TO_TIER.items():
+        name = tier_map.get(config_key)
+        if name and _matches(folder, name):
+            return tier_id
+
+    cold_root = tier_map.get("cold_root")
+    if cold_root and _matches(folder, cold_root):
+        return "cold"
+
+    configured_names = [tier_map.get(k) for k in CONFIG_KEY_TO_TIER]
+    configured_names.append(cold_root)
+    for name in configured_names:
+        if name and name.startswith(folder + "/"):
+            return "container"
+
     return "unrecognized"
+
+
+# --------------------------------------------------------------------------
+# config.yaml parsing (4.2): a restricted, stdlib-only, line-based parser for
+# exactly one shape -- accounts.<name>.tiers.<key>: <value> -- tracking
+# indentation to know when it has entered/left that block. Everything else
+# in the file (server_rules' multiline `>-` folded block, excluded_from_sync,
+# top-level maildir_path, comments anywhere) is walked over via indentation
+# alone and never interpreted -- this is deliberately not a YAML parser.
+# --------------------------------------------------------------------------
+
+
+def _strip_comment(line: str) -> str:
+    """Strip a trailing '# comment', but not a '#' that appears inside a
+    double-quoted value (e.g. tier names like "[Gmail]/Trash" never contain
+    one, but this stays robust regardless)."""
+    in_quotes = False
+    for i, ch in enumerate(line):
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif ch == "#" and not in_quotes:
+            return line[:i]
+    return line
+
+
+def _parse_scalar(raw: str):
+    """A YAML scalar restricted to what config.yaml's tiers block actually
+    uses: null/~ -> None, a double- or single-quoted string -> unquoted, or
+    a bare value (which may contain spaces, e.g. "Sent Messages")."""
+    raw = raw.strip()
+    if raw in ("", "null", "~"):
+        return None
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        return raw[1:-1]
+    return raw
+
+
+def parse_config_tiers_text(text: str) -> dict:
+    """Parse config.yaml's accounts.<name>.tiers maps out of raw text.
+    Returns {account: {tier_key: value_or_None}} for every account that has
+    a tiers: block; accounts without one are simply absent (caller falls
+    back to DEFAULT_TIER_MAPS)."""
+    accounts: dict = {}
+    in_accounts = False
+    accounts_indent = None
+    account_indent = None
+    current_account = None
+    in_tiers = False
+    tiers_indent = None
+
+    for raw_line in text.splitlines():
+        line = _strip_comment(raw_line)
+        if not line.strip():
+            continue  # blank or comment-only: structurally insignificant
+        indent = len(line) - len(line.lstrip(" "))
+        content = line.strip()
+
+        if indent == 0 and content == "accounts:":
+            in_accounts = True
+            accounts_indent = indent
+            account_indent = None
+            current_account = None
+            in_tiers = False
+            continue
+
+        if not in_accounts:
+            continue
+
+        if indent <= accounts_indent:
+            # Back to top level (e.g. "maildir_path:") -- accounts: is done.
+            in_accounts = False
+            current_account = None
+            in_tiers = False
+            continue
+
+        if account_indent is None:
+            account_indent = indent  # first line inside accounts: sets the unit
+
+        if indent == account_indent:
+            # A new account name (bare "key:" at the account level).
+            if content.endswith(":") and ":" not in content[:-1]:
+                current_account = content[:-1].strip()
+                accounts.setdefault(current_account, {})
+                in_tiers = False
+            continue
+
+        if current_account is None:
+            continue
+
+        if in_tiers and indent <= tiers_indent:
+            in_tiers = False  # left the tiers: block (sibling key or dedent)
+
+        if not in_tiers:
+            if content == "tiers:":
+                in_tiers = True
+                tiers_indent = indent
+            continue  # ignore every other key (server_rules, email, ...)
+
+        if ":" not in content:
+            continue
+        key, _, raw_value = content.partition(":")
+        accounts[current_account][key.strip()] = _parse_scalar(raw_value)
+
+    return accounts
+
+
+def parse_config_tiers(config_path: Path) -> dict:
+    """parse_config_tiers_text over an on-disk file; {} if it doesn't exist."""
+    if not config_path.is_file():
+        return {}
+    return parse_config_tiers_text(config_path.read_text())
+
+
+def load_tier_maps(config_path: Path, accounts: list) -> dict:
+    """{account: tier_map} for every requested account: the config-parsed
+    map when present and non-empty, else DEFAULT_TIER_MAPS, else {} for a
+    wholly unknown account (everything classifies unrecognized)."""
+    parsed = parse_config_tiers(config_path) if config_path else {}
+    return {
+        account: parsed.get(account) or DEFAULT_TIER_MAPS.get(account, {})
+        for account in accounts
+    }
 
 
 # --------------------------------------------------------------------------
@@ -237,7 +423,7 @@ def derive_flags(suffix: str) -> list:
     return sorted({FLAG_CHARS[c] for c in suffix if c in FLAG_CHARS})
 
 
-def build_snapshot(maildir_root: Path, accounts: list):
+def build_snapshot(maildir_root: Path, accounts: list, tier_maps: dict):
     """Pass 1. Returns (snapshot, folders_seen):
       snapshot: {(account, folder, maildir_key): (filename, path, mtime)}
       folders_seen: {(account, folder): tier} for every folder walked, even
@@ -246,9 +432,10 @@ def build_snapshot(maildir_root: Path, accounts: list):
     snapshot = {}
     folders_seen = {}
     for account in accounts:
+        tier_map = tier_maps.get(account, {})
         account_root = maildir_root / account
         for folder, folder_path in find_folders(account_root):
-            folders_seen[(account, folder)] = classify_folder_tier(folder)
+            folders_seen[(account, folder)] = classify_folder_tier(folder, tier_map)
             for filename, path, mtime in scan_folder_messages(folder_path):
                 key, _suffix = split_maildir_filename(filename)
                 snapshot[(account, folder, key)] = (filename, path, mtime)
@@ -292,7 +479,7 @@ def parse_date_utc(date_str):
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def parse_message_file(path: Path, account: str, folder: str, key: str, filename: str) -> dict:
+def parse_message_file(path: Path, account: str, folder: str, key: str, filename: str, tier_map: dict) -> dict:
     """Parse headers only (BytesHeaderParser -- never the body) and return
     the field dict for INSERT_SQL. Raises on any malformed input; the caller
     counts these as parse_errors and skips the file."""
@@ -345,7 +532,7 @@ def parse_message_file(path: Path, account: str, folder: str, key: str, filename
         "is_answered": int("Answered" in flags),
         "account": account,
         "indexed_at": utc_now(),
-        "folder_tier": classify_folder_tier(folder),
+        "folder_tier": classify_folder_tier(folder, tier_map),
     }
 
 
@@ -403,7 +590,7 @@ def _sort_key_moved(e: dict):
 # --------------------------------------------------------------------------
 
 
-def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list) -> dict:
+def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list, tier_maps: dict) -> dict:
     placeholders = ",".join("?" * len(accounts))
     existing_rows = conn.execute(
         f"SELECT id, account, folder, maildir_key, maildir_file, message_id, subject, from_addr, date_utc "
@@ -429,7 +616,7 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list) -> d
         existing_map[(account, folder, key)] = rec
         current_by_msgid[(account, message_id)].append(rec)
 
-    snapshot, folders_seen = build_snapshot(maildir_root, accounts)
+    snapshot, folders_seen = build_snapshot(maildir_root, accounts, tier_maps)
 
     cur = conn.cursor()
     new_entries = {}  # (account, folder, message_id) -> report entry
@@ -441,7 +628,7 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list) -> d
         existing = existing_map.get((account, folder, key))
         if existing is None:
             try:
-                fields = parse_message_file(path, account, folder, key, filename)
+                fields = parse_message_file(path, account, folder, key, filename, tier_maps.get(account, {}))
             except Exception:
                 parse_errors += 1
                 continue
@@ -530,6 +717,12 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list) -> d
 # DB setup / CLI
 # --------------------------------------------------------------------------
 
+DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
+
+
+def default_config_path() -> Path:
+    return DEFAULT_DATA_DIR / "config.yaml"
+
 
 def init_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -563,10 +756,12 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 def cmd_index(args: argparse.Namespace) -> None:
     accounts = resolve_accounts(args.maildir, args.account)
+    config_path = args.config or default_config_path()
+    tier_maps = load_tier_maps(config_path, accounts)
     conn = init_db(args.db)
     try:
         try:
-            report = run_index(conn, args.maildir, accounts)
+            report = run_index(conn, args.maildir, accounts, tier_maps)
         except sqlite3.Error as e:
             conn.rollback()
             raise FatalError(f"database error: {e}") from e
@@ -574,6 +769,26 @@ def cmd_index(args: argparse.Namespace) -> None:
     finally:
         conn.close()
     print(json.dumps(report, indent=2, sort_keys=True))
+
+
+# Fast-lane tier keys for priority-folders (4.3): untriaged + active + sent +
+# drafts, in this exact order -- archiving activity must never promote cold
+# storage into the fast lane, and under inbox-only delivery no other folder
+# can originate liveness (Phase 4 design note).
+PRIORITY_FAST_TIER_KEYS = ("untriaged", "active", "sent", "drafts")
+
+
+def cmd_priority_folders(args: argparse.Namespace) -> None:
+    config_path = args.config or default_config_path()
+    parsed = parse_config_tiers(config_path)
+    account_names = sorted(parsed.keys()) if parsed else sorted(DEFAULT_TIER_MAPS.keys())
+
+    result = {}
+    for account in account_names:
+        tier_map = parsed.get(account) or DEFAULT_TIER_MAPS.get(account, {})
+        fast = [tier_map[k] for k in PRIORITY_FAST_TIER_KEYS if tier_map.get(k)]
+        result[account] = {"fast": fast, "slow_hint": "full channel"}
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def main() -> None:
@@ -592,7 +807,27 @@ def main() -> None:
         action="append",
         help="limit indexing to this account (repeatable); default: every subdirectory of --maildir",
     )
+    idx_p.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="config.yaml path; default: <data-dir>/config.yaml via $EMAIL_TRIAGE_DATA_DIR "
+             "(falls back to built-in tier-name defaults if absent)",
+    )
     idx_p.set_defaults(func=cmd_index)
+
+    pf_p = sub.add_parser(
+        "priority-folders",
+        help="config-driven mbsync Stage-1 box lists per account (fast = untriaged+active+sent+drafts)",
+    )
+    pf_p.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="config.yaml path; default: <data-dir>/config.yaml via $EMAIL_TRIAGE_DATA_DIR "
+             "(falls back to built-in tier-name defaults if absent)",
+    )
+    pf_p.set_defaults(func=cmd_priority_folders)
 
     args = parser.parse_args()
     try:

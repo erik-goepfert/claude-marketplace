@@ -93,7 +93,7 @@ def insert_event(conn: sqlite3.Connection, **fields) -> int:
 
 
 def insert_envelope(conn: sqlite3.Connection, *, key: str, from_addr: str, date_utc: str,
-                     folder_tier: str = "inbox", folder: str = "INBOX", account: str = "testacct") -> None:
+                     folder_tier: str = "untriaged", folder: str = "INBOX", account: str = "testacct") -> None:
     conn.execute(
         "INSERT INTO envelopes (message_id, folder, maildir_key, maildir_file, from_addr, "
         "date_utc, flags, is_flagged, is_answered, account, indexed_at, folder_tier) "
