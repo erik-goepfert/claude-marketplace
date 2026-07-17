@@ -131,16 +131,37 @@ improvising it here.
    session carries it verbatim.
 4. **Read history context:** `$HIST context [--senders addr1,addr2,...]` —
    recent session notes, active rules, sender stats, contacts.
-5. **Sync (session start, full).** One invocation **per account** —
-   `mbsync -c "$MBSYNCRC" gmail` then `mbsync -c "$MBSYNCRC" icloud` —
-   never combined: combined multi-channel invocations fail ~25% of the
-   time with `read: unexpected EOF` when the second channel opens
-   (observed live, 5/20 invocations; per-account calls or one retry always
-   recover — treat one retry as routine, not an incident). iCloud is
-   seconds; Gmail's full ~30-mailbox channel is ~5–8 min regardless of what
-   changed (per-invocation overhead, not per-message) — accepted once
-   here, not something to repeat mid-session (see step 8).
-6. **Index and consume the change report.**
+5. **Two-stage sync (session start).** Gmail's full channel costs 5–8 min;
+   don't make the user wait for it before triage can even start.
+   **Stage 1 — priority sync, foreground:** exactly the live working set +
+   Sent (Sent is required: replies sent from other clients since last
+   session live there, and `waiting`-state derivation lies without it):
+   ```sh
+   rm -f "$DATA/.fullsync-done"
+   mbsync -c "$MBSYNCRC" 'gmail:INBOX,Active,[Gmail]/Sent Mail'
+   mbsync -c "$MBSYNCRC" 'icloud:INBOX,Active,Sent Messages'
+   ```
+   (~60–90 s total; gmail's per-invocation overhead dominates.)
+   **Stage 2 — full sync, background**, one account per invocation
+   (combined multi-channel invocations flake ~25% with
+   `read: unexpected EOF`; per-account + one routine retry always
+   recovers), completion marker at the end:
+   ```sh
+   nohup sh -c "mbsync -c '$MBSYNCRC' gmail; mbsync -c '$MBSYNCRC' icloud \
+     && touch '$DATA/.fullsync-done'" > "$DATA/fullsync.log" 2>&1 &
+   ```
+   (Double-quote the `sh -c` payload so `$MBSYNCRC`/`$DATA` expand in THIS
+   shell — single quotes would pass empty vars to the child.)
+   Triage classification/discussion proceeds on Stage 1's data
+   immediately. **Acting gates on Stage 2** (step 8) — act.py renaming
+   files while mbsync walks the same folders is a race that must never
+   happen.
+6. **Index and consume the change report.** Runs right after Stage 1 (the
+   priority folders are fresh; everything else reflects last session's
+   final state, which is exactly what makes detected changes provably
+   external). **Consume EVERY index run's change report this way, not
+   just this one** — the pre-act re-index (step 8) will surface external
+   changes from the rest of the mailbox once Stage 2 lands.
    `$IDX index --maildir "$MAILDIR" --db "$IDXDB"` → JSON on stdout:
    `new` / `moved` / `deleted` / `flag_changed` / `parse_errors` /
    `unrecognized_folders`. This is provably-external change (the skill
@@ -166,7 +187,14 @@ improvising it here.
    list, including any Areas/Archive/Sent siblings, always comes back —
    this is what makes reconciliation detectable, see below).
 8. **Priority scan**, then **breakdown**, then **classify-first, easiest-
-   first** (see Triage). **Act in approved batches** (see Acting): resolve-
+   first** (see Triage). **Before the FIRST act batch: verify Stage 2 is
+   done** — `[ -f "$DATA/.fullsync-done" ]`. If not yet, tell the user
+   ("full sync still finishing — a minute or two") and wait for the
+   marker; never act while mbsync may be walking the Maildir. Once
+   present: re-index and consume that change report (external changes
+   from the non-priority folders surface here — log manual events per
+   step 6), then act normally.
+   **Act in approved batches** (see Acting): resolve-
    before-act, `$ACT` for moves/removes, `-local` himalaya for flags,
    IMAP himalaya for replies, log events at act time, re-index touched state
    (a full `$IDX index` run is cheap, ~25 s — no need to scope it), then a
@@ -182,8 +210,24 @@ improvising it here.
    until the user asked "have you pushed our changes to the server?" — a
    crash in that window would have left all of it live in the mailbox.
    Act → log → re-index → **push** is one unit.
-9. **Session end.** Final full sync (per account, as in step 5), final
-   `$IDX index`, `rmdir "$LOCK"`, session note if anything is unfinished.
+9. **Session end — background chain, user is done immediately.** Every
+   batch was already box-pushed (step 8's invariant), so the final full
+   sync mostly *pulls*; run it detached, releasing the lock only on
+   success:
+   ```sh
+   nohup sh -c "mbsync -c '$MBSYNCRC' gmail; mbsync -c '$MBSYNCRC' icloud \
+     && rmdir '$LOCK'" > "$DATA/endsync.log" 2>&1 &
+   ```
+   (Same quoting rule as Stage 2: double-quote the payload so the vars
+   expand here.)
+   Write the session note (if anything is unfinished) BEFORE launching
+   the chain. **Deliberately no `$IDX index` in the chain:** our own
+   actions were re-indexed at batch time, so whatever this sync pulls is
+   provably external — the NEXT session's index run reports and logs it
+   as manual events. Indexing here would silently absorb those changes
+   and lose them. If the chain fails, the lock stays behind and the next
+   session's stale-lock prompt (step 2) catches it — check
+   `endsync.log` then.
    History backup is NOT a session step — it runs as a scheduled system
    task outside Claude (launchd invoking `$HIST backup`; plan 2.9). The
    first live session hit macOS TCC denials trying to write

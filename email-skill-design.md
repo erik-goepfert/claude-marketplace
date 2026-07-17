@@ -256,7 +256,19 @@ flowchart LR
   bootstraps it: `folder list` per account, confirm archive/trash targets with
   the user, write the config.
 - **Scheduling discipline:** all syncs are **skill-invoked at safe points** —
-  session start, after each approved action batch, and session end. Batch-
+  session start, after each approved action batch, and session end.
+  **Two-stage refinement (2026-07-16, latency):** session start splits into
+  a foreground *priority sync* (INBOX + Active + Sent per account, ~60–90 s
+  — Sent included so waiting-state derivation sees phone-side replies) and
+  a backgrounded full sync with a completion marker; classification and
+  discussion proceed on priority data, but **acting gates on the marker**
+  (mbsync walking folders that act.py is renaming in is a race that must
+  never happen). Session end symmetrically backgrounds the final sync in a
+  chain that releases the session lock on success — deliberately WITHOUT
+  an index step: the skill's own actions were re-indexed at batch time, so
+  everything that final sync pulls is provably external and is reported by
+  the next session's index run (indexing in the chain would silently
+  absorb those changes and lose the manual events). Batch-
   boundary syncs are safe because the skill holds the lock and nothing is in
   flight; they keep other clients (the phone) fresh mid-session and cap an
   abandoned session's unsynced exposure at one batch. An incremental mbsync of

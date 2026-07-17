@@ -543,6 +543,19 @@ The local mirror and index land underneath the working MVP practice.
       `~/Documents` from the shell (grants don't attach to already-running
       processes), and per the user, making Claude do it is unnecessary.
       Replaced by 2.9.
+- [x] **2.10 Two-stage session sync (2026-07-16, user request: "initial
+      sync is quite slow").** Session start: foreground priority sync
+      (INBOX+Active+Sent both accounts, ~60–90 s) + backgrounded full sync
+      with `.fullsync-done` marker; triage classification proceeds
+      immediately; **first act batch gates on the marker** + a re-index
+      whose change report is consumed like any other. Session end:
+      final sync backgrounded in a chain that `rmdir`s the lock on
+      success — no index in the chain (would silently absorb external
+      changes that must surface as next session's manual events); a
+      failed chain leaves the lock for the existing stale-lock prompt.
+      Sent's inclusion in the priority set is load-bearing (phone replies
+      → waiting-state correctness). Encoded in SKILL.md steps 5/6/8/9 and
+      design §7.1; validation is the next live session.
 - [ ] **2.9 Scheduled history backup (follow-up).** A launchd user agent
       (daily) invoking `history.py backup` — the subcommand already exists
       and does the right thing (SQLite online-backup API, dated copies,
