@@ -722,8 +722,26 @@ a rebuild, cheapest it will ever be.
       all of the above operationally. Plugin reinstall at the end.
 
 **Explicitly rejected during design (recorded so they stay rejected):**
-date_utc- or indexed_at-recency as the priority-sync signal (both
-polluted by the skill's own filing: archiving yesterday's newsletter
-would make cold storage look "active" — the user's catch);
-skip+to_folder as a stand-in for real action verbs; folder-name-based
-logic anywhere below the config boundary.
+- *Recency as the priority-sync signal.* "Sync recently-active folders
+  first" sounded taxonomy-agnostic, but both available signals (message
+  `date_utc`, row `indexed_at`) are polluted by the skill's own filing:
+  archiving yesterday's newsletter would stamp recent activity onto cold
+  storage and promote it into the fast batch (the user's catch). Chasing
+  "activity minus our own filings" collapses to "receives deliveries,"
+  which under inbox-only delivery is just the untriaged tier — so
+  priority is tier-derived, not activity-derived.
+- *Overloading `skip` instead of adding action verbs.* When a disposition
+  has no verb in the events enum (as "stays open in Active" didn't in
+  2.7, and "saved a draft" didn't in Phase 4), the tempting shortcut is
+  logging it as `final_action=skip` with a distinguishing `to_folder`.
+  Rejected both times: `sender_stats` excludes skips from decisive-action
+  rates, so logging a real decision as a skip silently corrupts the
+  learning signal. Real dispositions get real verbs (`activate`,
+  `draft`), even though that grows the enum.
+- *Folder-name string matching below the config boundary.* Names are
+  translated to tiers exactly once — at the indexer's classifier, fed by
+  config — and every script beneath (threads, act, analytics) reasons in
+  tiers only. Any code that compares against a folder-name string
+  ("Areas/…", "[Gmail]/…") is either doing the classifier's job in the
+  wrong place or hardcoding one user's mailbox; the 2026-07-16 audit
+  found both kinds in the indexer, and 4.2 removes them.
