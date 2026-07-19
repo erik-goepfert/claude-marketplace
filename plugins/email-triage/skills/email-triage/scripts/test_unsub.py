@@ -138,8 +138,9 @@ class UnsubTestCase(unittest.TestCase):
 
     def _ranking_message(self) -> EmailMessage:
         """Header https link present but NOT one-click, AND a body anchor-
-        text unsubscribe link -- the body link must outrank the plain
-        header https link (RFC8058-header > body > header-https > mailto)."""
+        text unsubscribe link -- the header link is the automated offer
+        (GET; designed for programmatic use), the body link is surfaced
+        manual-only (user policy 2026-07-19)."""
         msg = EmailMessage()
         msg["From"] = "deals@example.com"
         msg["To"] = "me@example.com"
@@ -163,7 +164,9 @@ class UnsubTestCase(unittest.TestCase):
         out = self.run_links(msg["Message-ID"])
         self.assertEqual(out["header"], {"https": [], "mailto": [], "one_click_post": False})
         self.assertEqual(out["body"], [])
-        self.assertIsNone(out["recommended"])
+        self.assertEqual(out["recommended"],
+                         {"automated": None, "automated_method": None,
+                          "manual": None, "mailto": None})
 
     def test_links_header_one_click_post_https_and_mailto(self):
         msg = self._header_one_click_message()
@@ -172,7 +175,9 @@ class UnsubTestCase(unittest.TestCase):
         self.assertEqual(out["header"]["https"], ["https://example.com/unsub?u=1"])
         self.assertEqual(out["header"]["mailto"], ["mailto:unsub@example.com"])
         self.assertTrue(out["header"]["one_click_post"])
-        self.assertEqual(out["recommended"], "https://example.com/unsub?u=1")
+        self.assertEqual(out["recommended"]["automated"], "https://example.com/unsub?u=1")
+        self.assertEqual(out["recommended"]["automated_method"], "one-click-post")
+        self.assertIsNone(out["recommended"]["manual"])
 
     def test_links_image_button_unsubscribe_via_img_alt(self):
         msg = self._image_button_message()
@@ -183,18 +188,22 @@ class UnsubTestCase(unittest.TestCase):
         self.assertEqual(link["url"], "https://example.com/img-unsub?u=2")
         self.assertEqual(link["source"], "img-alt")
         self.assertEqual(link["text"], "Unsubscribe")
-        # no header links at all here -> recommended falls through to the body link.
-        self.assertEqual(out["recommended"], "https://example.com/img-unsub?u=2")
+        # No header links at all: nothing automated -- the body link is
+        # offered for MANUAL clicking only (user policy 2026-07-19).
+        self.assertIsNone(out["recommended"]["automated"])
+        self.assertEqual(out["recommended"]["manual"], "https://example.com/img-unsub?u=2")
 
-    def test_links_recommended_ranks_body_link_over_plain_header_https(self):
+    def test_links_plain_header_https_is_automated_get_body_is_manual(self):
         msg = self._ranking_message()
         self.write_message("INBOX", "k4", msg)
         out = self.run_links(msg["Message-ID"])
         self.assertFalse(out["header"]["one_click_post"])
-        self.assertEqual(out["header"]["https"], ["https://example.com/header-only-unsub"])
-        self.assertTrue(any(link["url"] == "https://example.com/body-unsub" for link in out["body"]))
-        # Body link wins because header https alone (no one-click-post) ranks below it.
-        self.assertEqual(out["recommended"], "https://example.com/body-unsub")
+        # Header URL is designed for programmatic use -> the automated
+        # offer even without one-click-post (method GET); the body link is
+        # surfaced separately, manual-only (user policy 2026-07-19).
+        self.assertEqual(out["recommended"]["automated"], "https://example.com/header-only-unsub")
+        self.assertEqual(out["recommended"]["automated_method"], "get")
+        self.assertEqual(out["recommended"]["manual"], "https://example.com/body-unsub")
 
     # -- exec --
 
@@ -223,7 +232,7 @@ class UnsubTestCase(unittest.TestCase):
         stderr_text = self.run_exec_expect_exit1(
             msg["Message-ID"], "--url", "https://not-in-this-message.example.com/unsub", "--dry-run",
         )
-        self.assertIn("provenance check failed", stderr_text)
+        self.assertIn("provenance check failed", stderr_text)  # not in headers
 
     def test_exec_mailto_never_executed(self):
         msg = self._header_one_click_message()
@@ -243,12 +252,23 @@ class UnsubTestCase(unittest.TestCase):
         self.assertEqual(out["method"], "mailto")
         self.assertEqual(out["note"], "route via normal send flow")
 
-    def test_exec_url_get_reuses_a_body_link_with_provenance_ok(self):
+    def test_exec_refuses_body_link_even_with_provenance(self):
+        # The link IS in the message -- provenance would pass -- but body
+        # links are manual-only (user policy 2026-07-19): a confirmation
+        # step usually follows, so a bare GET would claim false success.
         msg = self._image_button_message()
         self.write_message("INBOX", "k10", msg)
-        out = self.run_exec(msg["Message-ID"], "--url", "https://example.com/img-unsub?u=2", "--dry-run")
+        stderr_text = self.run_exec_expect_exit1(
+            msg["Message-ID"], "--url", "https://example.com/img-unsub?u=2", "--dry-run",
+        )
+        self.assertIn("manual-only", stderr_text)
+
+    def test_exec_url_get_on_plain_header_https_ok(self):
+        msg = self._ranking_message()
+        self.write_message("INBOX", "k11", msg)
+        out = self.run_exec(msg["Message-ID"], "--url", "https://example.com/header-only-unsub", "--dry-run")
         self.assertEqual(out["method"], "GET")
-        self.assertEqual(out["url"], "https://example.com/img-unsub?u=2")
+        self.assertEqual(out["url"], "https://example.com/header-only-unsub")
         self.assertIsNone(out["body"])
         self.assertNotIn("Content-Type", out["headers"])
 

@@ -718,6 +718,22 @@ the better signal. Board approval of a plan that includes unsubscribing
 satisfies §4's execution consent (the request is explicit — it's in the
 approved plan).
 
+**Refinement (2026-07-19, user policy): automated execution is
+header-only; body links are manual-only.** `unsub.py exec` fires only
+URLs from `List-Unsubscribe`(-`Post`) — the mechanism *designed* for
+programmatic unsubscribing (one-click POST preferred, plain GET on a
+header URL otherwise) — and refuses body-embedded links even when
+provenance passes. Reason: embedded links routinely land on a page with
+a further manual step, so a bare GET reports 200 while unsubscribing
+nothing — and the event would carry `unsubscribed=true` for a sender
+who keeps mailing (a corrupted learning signal, worse than no
+automation). Presentation follows: offer the automated header option
+first when present (the user prefers it), and additionally print the
+embedded link for hand-clicking; when only the embedded link exists,
+unsubscribing is always a manual act the user confirms. This supersedes
+the 2026-07-16 "body link as primary" guidance, which was written for a
+hand-clicking-only world.
+
 ### Analytics access
 
 For richer analysis than SQLite comfortably expresses (windowed trends, "triage

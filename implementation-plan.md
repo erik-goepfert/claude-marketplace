@@ -827,7 +827,11 @@ Plugin cache refreshed after the final commit.
       mail is noise by default, proposed unsubscribe+trash, until 2+
       declines graduate the sender to newsletter-or-above; counter =
       `sender_stats.declined_unsubs` view column over the same notes
-      convention, live DB migrated.) Promote per-sender
+      convention, live DB migrated. Refined same day: automated exec is
+      HEADER-URL-only — one-click POST or header GET; body links are
+      always manual (confirmation steps make automated GETs claim false
+      success); links output split into recommended.automated/.manual.)
+      Promote per-sender
       dispositions (priority-contact, summarize-then-delete,
       scan-then-trash) from prose session notes into `contacts`/`rules`
       (rule vocabulary extends from actions to interaction patterns);

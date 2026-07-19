@@ -127,12 +127,16 @@ retry each; marker touch / lock rmdir only if ALL succeed).
 `check-fullsync` → `{fullsync_done, log_tail?}`, exit 1 until done.
 `unlock` removes a stale lock (user-approved only).
 
-**`$UNSUB links`:** `List-Unsubscribe`/`List-Unsubscribe-Post` headers +
-body anchors (including image-button links by alt text) with a ranked
-recommendation. `exec` default is the RFC 8058 one-click POST; `--url`
-GET fallback hard-fails unless the URL re-matches the message's own
-extracted links at fire time; `mailto:` never executed. Stdlib urllib, no
-cookies/auth, capped redirects, 15 s timeout, `--dry-run` available.
+**`$UNSUB links`:** `header` (`https`/`mailto`/`one_click_post`), `body`
+anchors (including image-button links by alt text), and `recommended:
+{automated, automated_method (one-click-post|get|null), manual, mailto}`
+— `automated` is header-derived only; `manual` is the top body link.
+`exec` default is the RFC 8058 one-click POST; `--url` GET requires a
+HEADER-derived URL (provenance re-checked at fire time) and **refuses
+body links** (manual-only, user policy 2026-07-19 — a confirmation step
+usually follows, so a bare GET claims false success); `mailto:` never
+executed. Stdlib urllib, no cookies/auth, capped redirects, 15 s
+timeout, `--dry-run` available.
 
 ## Analytics (on demand)
 

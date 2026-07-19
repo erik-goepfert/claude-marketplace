@@ -22,13 +22,17 @@ duplicated -- both modules resolve the message "the same raw-file way", per
 the Phase 5.3 spec.
 
 Subcommands:
-  links  {header: {https, mailto, one_click_post}, body: [...], recommended}
-         for one message. Never touches the network.
+  links  {header: {https, mailto, one_click_post}, body: [...], recommended:
+         {automated, automated_method, manual, mailto}} for one message.
+         Never touches the network.
   exec   Fires the single chosen unsubscribe request. Consent-gated: this
          script performs the HTTP call, but nothing in the email-triage
          skill invokes `exec` without the user's explicit, per-message
-         request (Phase 5.3's Rule 4 carve-out). --dry-run prints the exact
-         request instead of sending it -- no network call.
+         request (Phase 5.3's Rule 4 carve-out). HEADER-derived URLs only
+         (user policy 2026-07-19): body links are manual-only -- they
+         routinely need a confirmation step after the click, so a bare GET
+         reports success while unsubscribing nothing. --dry-run prints the
+         exact request instead of sending it -- no network call.
 
 Both print JSON to stdout (indent=2, sort_keys=True, matching the rest of
 the skill's scripts).
@@ -180,19 +184,23 @@ def extract_all_links(msg) -> dict:
     return {"header": header_links, "body": body_links}
 
 
-def rank_recommended(header_links: dict, body_links: list):
-    """RFC 8058 header https when one_click_post, else a body link, else a
-    header https link, else mailto -- the ranking from Phase 5.3 (native-
-    client-button-equivalent first)."""
-    if header_links["one_click_post"] and header_links["https"]:
-        return header_links["https"][0]
-    if body_links:
-        return body_links[0]["url"]
+def rank_recommended(header_links: dict, body_links: list) -> dict:
+    """Automated/manual split (user policy, 2026-07-19). `automated` is a
+    HEADER-derived https URL only -- List-Unsubscribe(-Post) exists for
+    programmatic unsubscribing, so firing it is safe and complete in one
+    request. Body links are `manual` ONLY: they routinely land on a page
+    with a further confirmation step, so an automated GET "succeeds"
+    without unsubscribing -- and would log unsubscribed=true falsely."""
+    automated, method = None, None
     if header_links["https"]:
-        return header_links["https"][0]
-    if header_links["mailto"]:
-        return header_links["mailto"][0]
-    return None
+        automated = header_links["https"][0]
+        method = "one-click-post" if header_links["one_click_post"] else "get"
+    return {
+        "automated": automated,
+        "automated_method": method,
+        "manual": body_links[0]["url"] if body_links else None,
+        "mailto": header_links["mailto"][0] if header_links["mailto"] else None,
+    }
 
 
 def cmd_links(args: argparse.Namespace) -> None:
@@ -276,9 +284,23 @@ def cmd_exec(args: argparse.Namespace) -> None:
         # now -- not merely "some URL the caller typed in". This is what
         # stops a stale/copy-pasted/hallucinated URL from ever being fired
         # against a live mailbox action.
-        all_urls = set(header_links["https"]) | set(header_links["mailto"]) | {b["url"] for b in body_links}
-        if args.url not in all_urls:
-            print("error: provenance check failed: url not found in message", file=sys.stderr)
+        #
+        # Narrowed 2026-07-19 (user policy): automated execution is for
+        # HEADER-derived URLs only -- the ones designed for programmatic
+        # unsubscribe. Body links are manual-only: they routinely require
+        # a further confirmation step, so a GET here would report success
+        # while unsubscribing nothing.
+        if args.url in {b["url"] for b in body_links}:
+            print(
+                "error: url is a BODY link -- body links are manual-only "
+                "(they often need a confirmation step a bare GET can't "
+                "perform); give it to the user to click instead",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        header_urls = set(header_links["https"]) | set(header_links["mailto"])
+        if args.url not in header_urls:
+            print("error: provenance check failed: url not found in message headers", file=sys.stderr)
             sys.exit(1)
 
         url = args.url

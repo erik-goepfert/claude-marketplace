@@ -339,16 +339,29 @@ Then, for everything else:
    no unsubscribe proposal (re-offer only if their handling changes:
    reading stops, bulk-trashing starts).
    Extraction is one call:
-   `$UNSUB links --account <acct> --message-id <id>` — headers + body anchors, ranked. Present
-   the **body link as primary** for hand-clicking (header links are built
-   for automated POSTs and often fail humans), full bare URL on its own
-   line (rule 6). When `List-Unsubscribe-Post` exists, rank the **native
-   unsubscribe button in the user's mail client first** — same RFC 8058
-   POST, zero copy-paste. Executing (rule 4 — board approval of a plan
-   that includes unsubscribing counts as the explicit request):
-   `$UNSUB exec --account <acct> --message-id <id> [--url <link>] [--dry-run]` (details: reference
-   §JSON). Log confirmations via `--unsubscribed`; a batch answer applies
-   to the whole batch.
+   `$UNSUB links --account <acct> --message-id <id>` — its `recommended`
+   object is the whole policy (automated vs manual, user rule
+   2026-07-19):
+   - **`automated` set** (a HEADER-derived URL — `List-Unsubscribe`
+     exists for programmatic unsubscribing; `automated_method` says
+     one-click-post or get): **offer to run it** — this is the preferred
+     option and the board's default proposal ("unsubscribe (automated) +
+     trash"). Execute with `$UNSUB exec --account <acct> --message-id
+     <id>` (add `--url <automated-url>` when the method is get); rule 4 —
+     board approval of a plan that includes unsubscribing IS the
+     explicit request.
+   - **`manual` set** (a body/embedded link): **additionally print it**,
+     full bare URL on its own line (rule 6), for the user to click
+     themselves. **Body links are NEVER executed** — `$UNSUB exec`
+     refuses them by design: too often a confirmation step follows the
+     click, so a bare GET "succeeds" while unsubscribing nothing (and
+     would log `unsubscribed` falsely).
+   - Only `manual` available → the proposal is "here's the link,
+     unsubscribe by hand + trash"; only after the user confirms doing it
+     does `--unsubscribed` get logged.
+   - `mailto`-only → route through the normal send gate (rule 1).
+   Log confirmations via `--unsubscribed`; a batch answer applies to the
+   whole batch.
    **A confirmed unsubscribe is also trash approval** (user rule):
    "I've unsubscribed" — or a completed `$UNSUB exec` they requested —
    authorizes trashing the associated messages without a separate ask;
