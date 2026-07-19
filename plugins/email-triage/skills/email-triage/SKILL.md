@@ -1,7 +1,7 @@
 ---
 name: email-triage
 description: Triage email across iCloud and Gmail accounts — thread-centric review of a local Maildir mirror (synced by mbsync, indexed to SQLite) with flag/reply/archive/trash decisions, approval gates, and a persistent history DB that makes each session smarter than the last. Use when the user asks to triage, clean up, or process their email/inbox.
-allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*) Bash(*indexer.py*) Bash(*threads.py*) Bash(*act.py*) Bash(*analytics.py*) Bash(mbsync *)
+allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*) Bash(*indexer.py*) Bash(*threads.py*) Bash(*act.py*) Bash(*unsub.py*) Bash(*analytics.py*) Bash(mbsync *)
 ---
 
 # Email Triage
@@ -33,6 +33,7 @@ IDX="${CLAUDE_SKILL_DIR}/scripts/indexer.py"
 THR="${CLAUDE_SKILL_DIR}/scripts/threads.py"
 ACT="${CLAUDE_SKILL_DIR}/scripts/act.py"
 HIST="${CLAUDE_SKILL_DIR}/scripts/history.py"
+UNSUB="${CLAUDE_SKILL_DIR}/scripts/unsub.py"
 ```
 
 - `config.yaml` (in `$DATA`) — schema v2 (Phase 4): per-account `tiers:`
@@ -106,14 +107,22 @@ improvising it here.
    to strand mail (mbsync hard-errors on the `,U=` token himalaya's Maildir
    backend preserves across folders); `$ACT` strips it. This applies to
    every move: Trash, `Active`, `Areas/…`, `Archive/…`.
-4. **Unsubscribe links are surfaced, never followed.** Extract and present
-   them; never fetch, click, or otherwise interact with them.
+4. **Unsubscribe links are surfaced by default; EXECUTED only on the
+   user's explicit request, never autonomously.** Extract and present them
+   freely. When — and only when — the user explicitly asks you to perform
+   an unsubscribe ("unsubscribe me from these"), execute it via
+   `$UNSUB exec` (see Triage step 5); a batch request covers each message
+   in that batch. Never fetch, click, or probe a link on your own
+   initiative, and never execute a `mailto:` unsubscribe directly — that
+   is a send, and it goes through the normal reply/send gate (rule 1).
 5. **`\Seen` is the user's signal, not triage state — your own reads must
    never move it.** A message counts as read only once the user has been
    shown its content or a representative summary of it. Concretely, on the
    `-local` (Maildir) accounts:
-   - Any read for your own purposes (unsubscribe extraction, resolving
-     `ambiguous`, thread-state checks) uses `--preview` —
+   - Any read for your own purposes (resolving `ambiguous`, thread-state
+     checks) uses `$THR read` — raw-file-backed, \Seen-safe by
+     construction (it never touches the Maildir filename). If you must
+     fall back to himalaya for a read, always pass `--preview` —
      verified (2.6): a plain local `message read` stamps `S` on the Maildir
      filename, which mbsync would then sync as `\Seen` to the server;
      `--preview` leaves the filename untouched.
@@ -124,6 +133,19 @@ improvising it here.
      **IMAP** account, since sending is IMAP-only) have no preview
      equivalent and do mark `\Seen`. Accepted, since a reply draft quotes
      the original back to the user before anything sends.
+6. **Deliverables land in a turn's FINAL message.** The harness collapses
+   mid-turn prose to "Ran N commands" — anything you say between tool
+   calls may never be seen. Summaries, boards, link lists, drafts: always
+   restate them in the message that ends the turn. And when the user asks
+   for content (a summary, a link, a body), deliver the content and STOP —
+   no chained follow-on actions in the same turn; the next action waits
+   for their response.
+   **Link formatting (this environment):** markdown links are NOT
+   clickable in this user's terminal. Present each URL bare, in full, on
+   its own line — never truncated/elided (`...` breaks the token), never
+   in backticks, never `[text](url)`-wrapped. This is an environment
+   preference, not doctrine — a different terminal may warrant markdown
+   links again.
 
 ## Session flow
 
@@ -346,42 +368,76 @@ Then, for everything else:
    nothing from the category remains in a live tier first. The first live
    session reported "all 18 handled" twice while a thread still sat in
    Inbox.
-3. **Targeted body reads only**, for exactly two reasons: resolving an
+3. **The batch board loop (user request, 2026-07-18).** When a category
+   batch starts, it is THE active context until the board is empty or the
+   user explicitly redirects. Present the category as a numbered board;
+   after each resolved sub-batch (and its sync, step 8's invariant),
+   **re-present the SAME board minus the resolved items**:
+   - remaining count in the header ("Newsletters — 7 of 12 remaining");
+   - original item numbers preserved (item 9 stays item 9 until it's
+     gone — renumbering breaks the user's in-flight references);
+   - per-item judgment annotations carried forward (recidivist /
+     borderline / new sender);
+   - pipeline footer showing what's queued after this board ("Then:
+     newsletters (8) → passive updates (~34) → ambiguous (9)").
+   **Never end a sub-batch with an open-ended "what next?"** — the
+   re-presented board IS the next prompt (and per rule 6 it must be the
+   turn's final message). Repeat until the board is empty, then move to
+   the next category in the pipeline.
+4. **Targeted body reads only**, for exactly two reasons: resolving an
    `ambiguous` classification, or extracting unsubscribe links — category by
-   category as worked, never upfront. Resolve the current local id
-   immediately before reading (`himalaya envelope list -a <acct>-local -f
-   <folder> -o json`, matched against the thread member by `from_addr` +
-   `date_utc` — Maildir ids are internal to himalaya, not derivable from the
-   index), then:
-   `himalaya message read --preview -a <acct>-local -f <folder> <id>`
+   category as worked, never upfront. The read path is `$THR read`
+   (raw-file-backed: index row → RFC822 file → parsed headers +
+   text/plain body; no himalaya id resolution, no \Seen risk, no lossy
+   rendering):
+   ```sh
+   $THR read --db "$IDXDB" --maildir "$MAILDIR/<acct>" \
+     --account <acct> --message-id <message-id> [--html-text] [--headers-only]
+   ```
+   `--html-text` prefers tag-stripped HTML (also the automatic fallback
+   when there's no text/plain part); `--headers-only` for header checks.
    If resolving the ambiguity means actually showing the user the content,
-   mark it read at that point:
+   mark it read at that point (this one still goes through himalaya —
+   resolve the local id fresh: `himalaya envelope list -a <acct>-local -f
+   <folder> -o json`, matched by `from_addr` + `date_utc`):
    `himalaya flag add -a <acct>-local -f <folder> <id> seen`
-4. **Unsubscribe extraction:** extract BOTH the `List-Unsubscribe` header
-   AND the body's footer unsubscribe link, and **surface the body link as
-   primary** (revised 2026-07-16 after live sessions: header links are
-   built for RFC 8058 automated one-click POSTs and frequently fail when a
-   human clicks them; body links on ESP click-tracking domains worked
-   reliably). Note: `--header list-unsubscribe` does NOT suppress the
-   body — looping it over many ids produces a giant blob. Read each
-   message once to a temp file and grep both the header and the footer out
-   of it:
-   `himalaya message read --preview -a <acct>-local -f <folder> <id> > "$tmp"`
-   **Link formatting is load-bearing:** present the FULL URL as a markdown
-   link — never truncate/elide it (`...` breaks the token) and never wrap
-   it in backticks (unclickable in the terminal). Both failure modes cost
-   real user round-trips in the first live session.
-   The user acts on the link themselves (rule 4). Ask ("unsubscribe too,
-   or just clear this one?") and log the answer via `--unsubscribed` on
-   that event. Don't ask per-thread if the user gave a batch answer
-   ("unsubscribe from all of these") — apply it to each event in the batch.
+5. **Unsubscribe.** Extraction is one call — `$UNSUB links` (same
+   resolution args as `$THR read`) returns the `List-Unsubscribe` /
+   `List-Unsubscribe-Post` headers AND the body's unsubscribe anchors
+   (including image-button links by alt text), with a ranked
+   recommendation. It replaces the old read-to-temp-file-and-grep recipe.
+   Presenting to the user: **surface the body link as primary** for
+   hand-clicking (revised 2026-07-16: header links are built for RFC 8058
+   automated POSTs and frequently fail when a human clicks them; body
+   links on ESP click-tracking domains worked reliably), formatted per
+   rule 6 — full bare URL on its own line. When `List-Unsubscribe-Post`
+   exists, **rank the native unsubscribe button in the user's mail client
+   first** in your guidance — it performs the same RFC 8058 one-click POST
+   with zero copy-paste.
+   Executing for the user (rule 4 — only on their explicit request):
+   ```sh
+   $UNSUB exec --db "$IDXDB" --maildir "$MAILDIR/<acct>" \
+     --account <acct> --message-id <message-id> [--url <link>] [--dry-run]
+   ```
+   Default is the RFC 8058 one-click POST (the same operation as the mail
+   client's native button; a silent 2xx is success). `--url` falls back to
+   GET on a specific link and hard-fails unless that URL re-matches the
+   message's own extracted links at fire time (provenance check). `mailto:`
+   entries are reported but never executed — they route through the normal
+   send gate. Stdlib urllib, no cookies/auth, capped redirects, 15 s
+   timeout.
+   Ask ("unsubscribe too, or just clear this one?") and log the answer via
+   `--unsubscribed` on that event. Don't ask per-thread if the user gave a
+   batch answer ("unsubscribe from all of these") — apply it to each event
+   in the batch.
    **A confirmed unsubscribe is also trash approval** (user rule,
-   2026-07-10): "I've unsubscribed" means you may trash the associated
-   message or batch without a separate ask — the confirmation IS the
-   approval for those specific messages. Log normally
+   2026-07-10): "I've unsubscribed" — or a completed `$UNSUB exec` the
+   user requested — means you may trash the associated message or batch
+   without a separate ask; the confirmation IS the approval for those
+   specific messages. Log normally
    (`final_action=trash, decided_by=approved, --unsubscribed`). It approves
    only the messages the unsubscribe was about, nothing wider.
-5. **Noise escalation — when unsubscribe isn't possible.** Three-step
+6. **Noise escalation — when unsubscribe isn't possible.** Three-step
    ladder: (1) unsubscribe if possible; (2) when it isn't (or the user
    declines but still wants the mail gone), **propose a server-side filter**
    — draft the exact match expression, action, and carve-outs (e.g.
@@ -394,7 +450,7 @@ Then, for everything else:
    session note — server-deleted mail generates no events, and the registry
    is what explains the silence to future sessions. (3) Last resort, a
    triage rule or continued manual triage.
-6. Apply active rules from `history.db` when they match — still within the
+7. Apply active rules from `history.db` when they match — still within the
    approval gates; a rule justifies a proposal, not an autonomous action
    (flags excepted).
 

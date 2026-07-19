@@ -79,9 +79,19 @@ These are behavioral commitments, not implementation details.
    Trash*, never a `\Deleted`-flag-plus-expunge. Final purging is left to
    iCloud's Trash auto-clean. This keeps every destructive action reversible
    for ~30 days.
-4. **Unsubscribe links are surfaced, never followed.** Claude extracts
-   unsubscribe links and presents them for the user to act on manually; it
-   never navigates to or interacts with the link itself.
+4. **Unsubscribe links are surfaced, never followed autonomously.**
+   (Carve-out added 2026-07-18, Phase 5.3.) Claude extracts unsubscribe
+   links and presents them for the user to act on; it never navigates to
+   or probes a link on its own initiative. On the user's *explicit
+   request*, execution is allowed through `unsub.py exec` only: default is
+   the RFC 8058 one-click POST (the identical operation a mail client's
+   native unsubscribe button performs), with a GET fallback whose URL must
+   re-match the message's own extracted links at fire time (provenance
+   enforced); `mailto:` unsubscribes are never executed directly — they
+   are sends, gated like any other send (principle 1). Extraction is also
+   scripted (`unsub.py links`: List-Unsubscribe/-Post headers + body
+   anchors including image-button alt text, ranked) — the manual grep
+   recipe it replaced missed image-button footers in live sessions.
 5. **`\Seen` belongs to the user, not to triage.** Claude reading a message
    to classify it, resolve ambiguity, or extract a header is not the same
    event as the user reading it, and must not move the flag. A message
@@ -97,7 +107,11 @@ These are behavioral commitments, not implementation details.
    ambiguous-classification reads, parent-header lookups for `References`)
    uses `--preview`; marking read, when warranted, is a deliberate
    `flag add ... seen` at the moment content is actually shown — never an
-   incidental side effect of fetching it.
+   incidental side effect of fetching it. (2026-07-18, Phase 5.1: the
+   default programmatic read path is now `threads.py read` — raw-file-
+   backed off the index, \Seen-safe by construction since it never renames
+   the Maildir file; `--preview` remains the rule for any residual
+   himalaya read.)
 
 ---
 
