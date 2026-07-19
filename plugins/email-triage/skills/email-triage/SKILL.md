@@ -8,7 +8,7 @@ allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*) Ba
 
 You are running an email triage session. You are the interface — there is no
 other UI. Work thread-by-thread, propose actions, and let the user decide.
-This file is the operational spine. **`${CLAUDE_SKILL_DIR}/reference.md`**
+This file is the operational spine. **`reference.md`, next to this file,**
 holds the on-demand detail — account/tool quirks, exact JSON shapes,
 analytics, the PARA review phase, bootstrap, and the incident history
 behind these rules — read it when you need those. Design rationale lives
@@ -44,11 +44,11 @@ The scripts live in this skill's `scripts/` directory. In this document,
   prompt. No wrappers either (`uv run`, `python3` prefixes) — sole
   exception: analytics.py REQUIRES `uv run <scripts-dir>/analytics.py`
   (PEP 723 self-provisioned duckdb).
-- **`<scripts-dir>` is the real path of the skill you are reading** —
-  resolve it once from where this SKILL.md was loaded (the harness
-  reports it; `$SES start` also echoes back `CLAUDE_SKILL_DIR` /
-  `CLAUDE_PLUGIN_ROOT` under `env` for confirmation) and write it
-  literally in every command.
+- **`<scripts-dir>` is the base directory from the skill launch banner**
+  ("Base directory for this skill: ...") plus `/scripts` — write it
+  literally in every command. `$CLAUDE_SKILL_DIR` is NOT set in live
+  sessions (verified 2026-07-19; `$SES start`'s `env` block confirms it
+  each session) — the banner is the source of truth.
 - **No setup preamble is needed:** every script defaults its paths from
   `$EMAIL_TRIAGE_DATA_DIR` (falling back to `~/.local/share/...`) —
   `--db`, `--maildir`, `--maildir-root`, `--data-dir`, `--mbsyncrc` are
@@ -326,9 +326,10 @@ Then, for everything else:
    ```sh
    $THR read --account <acct> --message-id <id> [--html-text] [--headers-only]
    ```
-   If resolving ambiguity means showing the user the content, mark read at
-   that point (himalaya path; resolve the local id fresh — reference
-   §Quirks): `himalaya flag add -a <acct>-local -f <folder> <id> seen`
+   If resolving ambiguity means showing the user the content, mark read
+   at that point: `$THR flag --account <acct> --message-id <id> --seen`
+   (himalaya id resolution happens inside the script — reference §Quirks
+   for why that dance is never done by hand).
 5. **Unsubscribe — assume-out by default (user policy, 2026-07-19).**
    Assume the user wants to unsubscribe: for noise-board senders below
    the decline threshold, the board's default proposed disposition is
@@ -404,10 +405,13 @@ graph plus a guarded subject fallback, and derives state directly.
   any broad listing; use the filters to answer "which thread is X"
   directly; never dump-and-refilter with ad-hoc python.
 - `$THR show --account <acct> --message-id <id>` — the full
-  thread containing a message, any tier. **Before acting on a
-  multi-member thread, pull its members here** — compact output carries
-  only the latest member, and batch items need each member's
-  message_id + from_folder.
+  thread containing a message, any tier. Needed for reply `References`,
+  reconciliation decisions, and member-level inspection; **standard
+  trash/activate batches don't need it** — `$BATCH`'s `thread_of` items
+  expand members themselves.
+- `$THR flag --account <acct> --message-id <id> --seen|--block|--unblock`
+  — mechanized flag ops (himalaya id resolution inside; rule 2's
+  clear-then-set is `--block`).
 - `$THR residue` — end-of-session leftovers check (step 7).
 - A thread's messages live in one tier location at a time (system folders
   excepted — Sent copies never move). **Threads never move to Inbox.**
@@ -436,13 +440,23 @@ events + echo-absorbed re-index + box-scoped push):
 $BATCH run --session "<session_started_at>" \
   --category newsletter [--notes "..."] [--unsubscribed] [--dry-run] <<'JSON'
 [
-  {"account": "gmail", "message_id": "m1@x", "from_folder": "INBOX",
-   "to_folder": "[Gmail]/Trash"},
+  {"account": "gmail", "thread_of": "m1@x", "disposition": "trash"},
+  {"account": "icloud", "thread_of": "m9@y", "disposition": "trash"},
   {"account": "gmail", "message_id": "m2@x", "from_folder": "INBOX",
    "remove": true}
 ]
 JSON
 ```
+
+**`thread_of` + `disposition` is the standard board form** (R1,
+2026-07-19): name ANY member of the thread; the script expands to every
+LIVE-tier member (untriaged/active) with each member's real current
+folder — never guess `from_folder` yourself, and never enumerate members
+by hand (a live batch once included a Trash sibling that way).
+`disposition` (`trash` | `activate`) resolves the destination from each
+account's tier map, so one batch spans accounts. Named destinations
+(ongoing groups, cold chapters) still use explicit
+`message_id`/`from_folder`/`to_folder` items; `remove` likewise.
 
 Message-ids are the index's bare form (no angle brackets). `final_action`
 derives from the destination tier; sender/subject from the index; per-item
@@ -457,12 +471,11 @@ drafts).
 built in — "message file not found on disk" means the index is stale:
 rerun `$IDX index` and retry.
 
-- **Flag / unflag** (autonomous; thread-wide clear-then-set, rule 2):
-  resolve current local ids fresh for every flagged member
-  (`himalaya envelope list -a <acct>-local -f <folder> -s 500 -o json` —
-  the default page is 10, silently truncated; matched by
-  `from_addr`+`date_utc`), `flag remove ... flagged` on all, then
-  `flag add ... flagged` on at most one (the latest).
+- **Flag / unflag** (autonomous; thread-wide clear-then-set, rule 2 —
+  mechanized): `$THR flag --account <acct> --message-id <any member>
+  --block` clears `\Flagged` from every member and sets it on the latest
+  state-eligible one; `--unblock` clears only. Never hand-roll the
+  himalaya id dance — the script resolves ids fresh internally.
 - **Move / resolve / trash** (approved): `$BATCH run` (or `$ACT` one-off)
   applied to every non-system, non-trash/junk member.
 - **Reply** (approved; IMAP account — the one non-local operation):

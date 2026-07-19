@@ -717,6 +717,109 @@ def compact_thread_object(account: str, mlist: list):
     return obj, (newest.get("date_utc") or "")
 
 
+# --------------------------------------------------------------------------
+# flag: mechanized himalaya-local flag ops (session-review R2, 2026-07-19).
+# The id-resolution dance (resolve FRESH, match by from_addr + date -- ids
+# are an unstable id-mapper; envelope JSON has NO message_id field) was the
+# last himalaya interaction done by hand, and it misfired in a live session
+# (an ad-hoc filter on the nonexistent message_id field). Here it's code.
+# --------------------------------------------------------------------------
+
+
+def _parse_himalaya_date(s: str):
+    """himalaya envelope date: '2026-07-19 17:40+00:00' (no seconds)."""
+    try:
+        return datetime.datetime.strptime(s.strip(), "%Y-%m-%d %H:%M%z")
+    except (ValueError, AttributeError):
+        return None
+
+
+def _parse_index_date(s: str):
+    try:
+        return datetime.datetime.strptime(s.strip(), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _himalaya(himalaya_bin, *cli_args) -> str:
+    import subprocess
+    proc = subprocess.run([himalaya_bin, *cli_args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise FatalError(f"himalaya {' '.join(cli_args[:3])}... failed: "
+                         f"{(proc.stderr or proc.stdout).strip()[:300]}")
+    return proc.stdout
+
+
+def resolve_himalaya_id(himalaya_bin: str, hima_account: str, member: dict) -> str:
+    """Current himalaya-local id for one member: envelope list in the
+    member's folder, matched by from_addr + date (minute precision -- the
+    envelope JSON carries no seconds and NO message_id field)."""
+    out = _himalaya(himalaya_bin, "envelope", "list", "-a", hima_account,
+                    "-f", member["folder"], "-s", "500", "-o", "json")
+    envelopes = json.loads(out)
+    want_addr = (member["from_addr"] or "").lower()
+    want_dt = _parse_index_date(member["date_utc"])
+    matches = []
+    for env in envelopes:
+        addr = ((env.get("from") or {}).get("addr") or "").lower()
+        if addr != want_addr:
+            continue
+        edt = _parse_himalaya_date(env.get("date") or "")
+        if want_dt is None or edt is None:
+            continue
+        if edt.astimezone(datetime.timezone.utc).replace(second=0) == want_dt.replace(second=0):
+            matches.append(env["id"])
+    if len(matches) == 1:
+        return matches[0]
+    raise FatalError(
+        f"himalaya id resolution for {member['message_id']!r} in "
+        f"{member['folder']!r}: {len(matches)} matches by from+date "
+        f"({want_addr}, {member['date_utc']}) -- "
+        + ("ambiguous; act on it manually" if matches else
+           "not found; run the indexer / sync and retry"))
+
+
+def cmd_flag(args: argparse.Namespace) -> None:
+    """--seen: mark ONE message read (the moment its content is shown).
+    --block / --unblock: rule 2's thread-wide clear-then-set, mechanized —
+    clear \\Flagged from every currently-flagged member, then (--block)
+    set it on the thread's latest state-eligible member only."""
+    conn = connect_db(args.db)
+    try:
+        members = load_account_members(conn, args.account)
+    finally:
+        conn.close()
+    if args.message_id not in members:
+        raise FatalError(f"unknown message-id for account {args.account!r}: {args.message_id}")
+    hima_account = args.himalaya_account or f"{args.account}-local"
+    actions = []
+
+    def op(member, verb, flag):
+        hid = resolve_himalaya_id(args.himalaya, hima_account, member)
+        _himalaya(args.himalaya, "flag", verb, "-a", hima_account,
+                  "-f", member["folder"], hid, flag)
+        actions.append({"message_id": member["message_id"], "folder": member["folder"],
+                        "himalaya_id": hid, "op": f"{verb} {flag}"})
+
+    if args.mode == "seen":
+        op(members[args.message_id], "add", "seen")
+    else:
+        group = next(g for g in assemble_account_threads(members) if args.message_id in g)
+        mlist = [members[m] for m in group]
+        for m in mlist:
+            if m["is_flagged"] and m["tier"] not in HISTORY_TIERS:
+                op(m, "remove", "flagged")
+        if args.mode == "block":
+            eligible = [m for m in mlist if m["tier"] not in STATE_EXCLUDED_TIERS]
+            target = latest_dated(eligible)
+            if target is None:
+                raise FatalError("thread has no state-eligible member to flag")
+            op(target, "add", "flagged")
+    print(json.dumps({"account": args.account, "mode": args.mode,
+                      "actions": actions}, indent=2, sort_keys=True))
+
+
 def cmd_residue(args: argparse.Namespace) -> None:
     """End-of-session residue check (5.7): everything still sitting in the
     untriaged tier, compact -- one entry per thread, not full member dumps.
@@ -843,6 +946,27 @@ def build_parser() -> argparse.ArgumentParser:
              "detail is needed",
     )
     list_p.set_defaults(func=cmd_list)
+
+    flag_p = sub.add_parser(
+        "flag",
+        help="mechanized himalaya-local flag ops: --seen one message, or "
+             "--block/--unblock = rule 2's thread-wide clear-then-set",
+    )
+    flag_p.add_argument("--db", type=Path, default=None, help="index.db; default <data-dir>/index.db")
+    flag_p.add_argument("--account", required=True)
+    flag_p.add_argument("--message-id", required=True, dest="message_id",
+                        help="--seen: the message to mark read; --block/--unblock: any member of the thread")
+    mode = flag_p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--seen", dest="mode", action="store_const", const="seen",
+                      help="mark this one message \\Seen (content was shown to the user)")
+    mode.add_argument("--block", dest="mode", action="store_const", const="block",
+                      help="thread needs the user's reply: clear \\Flagged everywhere, set it on the latest state-eligible member")
+    mode.add_argument("--unblock", dest="mode", action="store_const", const="unblock",
+                      help="clear \\Flagged from every member")
+    flag_p.add_argument("--himalaya", default="himalaya", help="himalaya binary (tests override)")
+    flag_p.add_argument("--himalaya-account", default=None,
+                        help="himalaya account name; default <account>-local")
+    flag_p.set_defaults(func=cmd_flag)
 
     res_p = sub.add_parser(
         "residue",

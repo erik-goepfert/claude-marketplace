@@ -105,32 +105,41 @@ def cmd_start(args) -> int:
     except FileExistsError:
         acquired = False
 
+    # Diagnostic (2026-07-19; verified null in live sessions -- the base
+    # dir comes from the skill launch banner): kept cheap, catches a
+    # future harness change.
+    env = {
+        "CLAUDE_SKILL_DIR": os.environ.get("CLAUDE_SKILL_DIR"),
+        "CLAUDE_PLUGIN_ROOT": os.environ.get("CLAUDE_PLUGIN_ROOT"),
+    }
+
+    if not acquired:
+        # R8: a held lock means no session started -- the only question on
+        # the table is "unlock?"; don't dump config/priority noise into it.
+        emit({
+            "lock": "held",
+            "hint": ("a session may be live elsewhere or was abandoned -- "
+                     "ask the user before `session.py unlock`; check "
+                     "endsync.log if the last session's end chain failed"),
+            "env": env,
+        })
+        return 1
+
     out = {
         "session_started_at": utc_now(),
-        "lock": "acquired" if acquired else "held",
+        "lock": "acquired",
         "config": config_text,
         "config_path": str(cfg),
         "priority_folders": indexer.priority_fast_map(cfg),
-        # Diagnostic (2026-07-19): settles which invocation form live
-        # sessions can actually rely on. If null, the harness did not set
-        # the var and literal paths are the correct fallback.
-        "env": {
-            "CLAUDE_SKILL_DIR": os.environ.get("CLAUDE_SKILL_DIR"),
-            "CLAUDE_PLUGIN_ROOT": os.environ.get("CLAUDE_PLUGIN_ROOT"),
-        },
+        "env": env,
     }
     if config_text is None:
         out["warning"] = ("config.yaml missing -- from-scratch setup; see "
                           "reference.md Bootstrap, do not improvise")
-    if acquired:
-        marker.unlink(missing_ok=True)
-        out["fullsync_marker_cleared"] = True
-    else:
-        out["hint"] = ("a session may be live elsewhere or was abandoned -- "
-                       "ask the user before `session.py unlock`; check "
-                       "endsync.log if the last session's end chain failed")
+    marker.unlink(missing_ok=True)
+    out["fullsync_marker_cleared"] = True
     emit(out)
-    return 0 if acquired else 1
+    return 0
 
 
 def cmd_unlock(args) -> int:

@@ -28,7 +28,14 @@ Items JSON (stdin or --file), an array of:
   {"account": "gmail", "message_id": "<...>", "from_folder": "INBOX",
    "to_folder": "[Gmail]/Trash"}                # move, OR
   {"account": "gmail", "message_id": "<...>", "from_folder": "INBOX",
-   "remove": true}                              # Gmail label strip
+   "remove": true}                              # Gmail label strip, OR
+  {"account": "gmail", "thread_of": "<any member id>",
+   "disposition": "trash"}                      # whole-thread sugar (R1):
+     expands to every LIVE-tier member (untriaged/active) with each
+     member's real current folder; disposition resolves the destination
+     from the account's tier map (trash|activate; archive destinations
+     are named folders -- pass to_folder). disposition also works on
+     plain message_id items.
 plus optional per-item event overrides: category, thread_state,
 inactive_days, proposed_action, decided_by, notes, unsubscribed, rule_id,
 thread_root_id, sender_addr, subject.
@@ -46,6 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import act  # noqa: E402
 import history  # noqa: E402
 import indexer  # noqa: E402
+import threads  # noqa: E402
 
 # Destination tier -> logged action. Anything absent is not a triage
 # destination and fails pre-flight (untriaged, sent, drafts, all_mail,
@@ -60,6 +68,17 @@ TIER_TO_ACTION = {
 
 ENVELOPE_SQL = """SELECT from_addr, subject FROM envelopes
                   WHERE account = ? AND message_id = ? AND folder = ?"""
+
+# thread_of expansion (session-review R1, 2026-07-19): only the LIVE tiers.
+# Trash/junk siblings never move (a live batch once tried; pre-flight caught
+# it at the cost of a turn + 4 show calls); sent/drafts are system folders;
+# resolved-tier members move only in explicit reconciliation flows with
+# explicit per-message items.
+THREAD_EXPAND_TIERS = {"untriaged", "active"}
+
+# disposition -> config tier key. Resolved per account, so one batch can mix
+# accounts ("trash" -> [Gmail]/Trash on gmail, Deleted Messages on icloud).
+DISPOSITION_TO_TIER_KEY = {"trash": "trash", "activate": "active"}
 
 
 class BatchError(Exception):
@@ -76,9 +95,79 @@ def load_items(raw: str) -> list:
     return items
 
 
+def expand_items(conn, items: list, tier_maps: dict) -> list:
+    """Resolve thread_of and disposition sugar into concrete per-message
+    items (R1, 2026-07-19). A thread_of item names ANY member of a thread;
+    it expands to every member in a LIVE tier (THREAD_EXPAND_TIERS) with
+    each member's real current folder -- no more hand-guessed from_folder,
+    no trash-sibling slips. `disposition` resolves the destination from the
+    account's tier map, so one batch can span accounts."""
+    assembly_cache = {}  # account -> (members, [groups])
+
+    def thread_live_members(account, mid, where):
+        if account not in assembly_cache:
+            members = threads.load_account_members(conn, account)
+            groups = threads.assemble_account_threads(members)
+            assembly_cache[account] = (members, groups)
+        members, groups = assembly_cache[account]
+        if mid not in members:
+            raise BatchError(f"{where}: thread_of={mid!r} not indexed for account {account!r}")
+        for group in groups:
+            if mid in group:
+                live = [members[m] for m in group if members[m]["tier"] in THREAD_EXPAND_TIERS]
+                if not live:
+                    raise BatchError(
+                        f"{where}: thread of {mid!r} has no members in a live tier "
+                        f"({'/'.join(sorted(THREAD_EXPAND_TIERS))}) -- nothing to act on")
+                return live
+        raise BatchError(f"{where}: thread_of={mid!r} not assembled into any thread")
+
+    def resolve_disposition(item, account, where):
+        disp = item.get("disposition")
+        if disp is None:
+            return item
+        if item.get("to_folder") or item.get("remove"):
+            raise BatchError(f"{where}: disposition excludes to_folder/remove")
+        key = DISPOSITION_TO_TIER_KEY.get(disp)
+        if key is None:
+            raise BatchError(f"{where}: unknown disposition {disp!r} "
+                             f"(one of {sorted(DISPOSITION_TO_TIER_KEY)}; archive "
+                             "destinations are named folders -- pass to_folder)")
+        name = (tier_maps.get(account) or {}).get(key)
+        if not name:
+            raise BatchError(f"{where}: account {account!r} has no {key!r} tier "
+                             "configured (null) -- pass to_folder/remove explicitly")
+        item = dict(item)
+        item.pop("disposition")
+        item["to_folder"] = name
+        return item
+
+    concrete = []
+    for i, item in enumerate(items):
+        where = f"item {i}"
+        account = item.get("account")
+        if not account:
+            raise BatchError(f"{where}: account is required")
+        item = resolve_disposition(item, account, where)
+        anchor = item.get("thread_of")
+        if anchor is None:
+            concrete.append(item)
+            continue
+        if item.get("message_id") or item.get("from_folder"):
+            raise BatchError(f"{where}: thread_of excludes message_id/from_folder "
+                             "(members and folders are derived)")
+        for m in thread_live_members(account, anchor, where):
+            expanded = {k: v for k, v in item.items() if k != "thread_of"}
+            expanded["message_id"] = m["message_id"]
+            expanded["from_folder"] = m["folder"]
+            concrete.append(expanded)
+    return concrete
+
+
 def prepare(conn, items: list, tier_maps: dict, args) -> list:
     """Validate every item and derive its act plan + event dict. Raises
     BatchError on the first problem -- nothing has acted yet."""
+    items = expand_items(conn, items, tier_maps)
     prepared = []
     for i, item in enumerate(items):
         where = f"item {i}"

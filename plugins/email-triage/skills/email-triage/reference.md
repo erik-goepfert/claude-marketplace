@@ -73,7 +73,11 @@ skill's config: `icloud`/`gmail` are IMAP (reply/send only),
 **himalaya envelope JSON** (verified against himalaya v1.2.0, both
 backends): bare array; `id` is a **string**; `flags` is an array of
 strings (e.g. `["Flagged"]`); `from`/`to` are `{name, addr}` objects;
-`date` is local-tz RFC-ish.
+`date` is local-tz, minute precision (`2026-07-19 17:40+00:00`).
+**There is NO `message_id` field** — you cannot filter envelopes by
+Message-ID (a live session tried and got an empty match); the only join
+back to the index is from_addr + date, which is exactly what
+`$THR flag` does internally — use it instead of doing this by hand.
 
 **`$THR list` / `show` thread object:** `account`, `root_message_id`,
 `state` (`needs-reply` | `waiting` | `holding`), `drafted` (bool),
@@ -94,6 +98,12 @@ No `members[]`.
 drafted, subject, from_addr, date_utc, residual_count, folders}],
 "threads": N, "messages": N}`.
 
+**`$THR flag`:** `--seen` (one message) or `--block`/`--unblock`
+(thread-wide, rule 2) → `{"account", "mode", "actions": [{message_id,
+folder, himalaya_id, op}]}`. Resolution is internal (from_addr + minute
+date against `envelope list`); 0 or 2+ matches is a hard error (stale
+index → re-index/sync; ambiguous → act manually).
+
 **`$IDX index` change report:** `new` / `moved` / `deleted` /
 `flag_changed` / `parse_errors` / `unrecognized_folders`. Entries carry
 `account`, `folder`, `message_id`, `subject`, `from_addr`, `date_utc`;
@@ -106,7 +116,13 @@ pass `mbsync_fast` verbatim as ONE mbsync argument.
 
 **`$BATCH run` items** (stdin or `--file`), array of:
 `{"account", "message_id", "from_folder"}` plus exactly one of
-`"to_folder"` / `"remove": true`; optional per-item event overrides:
+`"to_folder"` / `"remove": true` / `"disposition": "trash"|"activate"`
+(disposition resolves the folder from the account's tier map) — OR the
+whole-thread form `{"account", "thread_of": <any member id>,
+"disposition"|"to_folder": ...}`, which expands to every LIVE-tier
+member (untriaged/active) with real current folders (trash/junk/sent/
+resolved members never expand; R1 2026-07-19). Optional per-item event
+overrides (inherited by expanded members):
 `category`, `thread_state`, `inactive_days`, `proposed_action`,
 `decided_by`, `notes`, `unsubscribed`, `rule_id`, `thread_root_id`,
 `sender_addr`, `subject`. Output: `acted.moved/removed`, `failed`,
@@ -117,9 +133,9 @@ pass `mbsync_fast` verbatim as ONE mbsync argument.
 **`$SES` (session.py):** `start` → `{session_started_at, lock:
 "acquired"|"held", config (raw yaml text), config_path, priority_folders
 (same map as $IDX priority-folders), fullsync_marker_cleared, env
-(CLAUDE_SKILL_DIR / CLAUDE_PLUGIN_ROOT as the harness set them — the
-invocation-path diagnostic)}` — exit 1 and touches nothing when the lock
-is held. All scripts default `--db`/`--maildir`/`--maildir-root`/
+(CLAUDE_SKILL_DIR / CLAUDE_PLUGIN_ROOT — verified null in live sessions;
+the launch banner is the base-dir source of truth)}`. When the lock is
+held: exit 1, touches nothing, and emits ONLY `{lock, hint, env}` (R8). All scripts default `--db`/`--maildir`/`--maildir-root`/
 `--data-dir`/`--mbsyncrc` from `$EMAIL_TRIAGE_DATA_DIR` (2026-07-19) —
 path flags are overrides, not boilerplate. `sync-background` / `end` →
 `{pid, accounts, log}` (detached chain: per-account mbsync with one

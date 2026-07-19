@@ -393,6 +393,108 @@ class ThreadsTestCase(unittest.TestCase):
         self.assertEqual(out, {"residue": [], "threads": 0, "messages": 0})
 
 
+HIMALAYA_STUB = """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["HIMA_LOG"], "a") as f:
+    f.write(" ".join(args) + "\\n")
+if args and args[0] == "envelope":
+    folder = args[args.index("-f") + 1]
+    data = json.load(open(os.environ["HIMA_DATA"]))
+    print(json.dumps(data.get(folder, [])))
+else:
+    print("Flag(s) ok")
+"""
+
+
+class FlagCommandTests(unittest.TestCase):
+    """threads.py flag (R2): stubbed himalaya; asserts the resolution
+    matching (from_addr + minute-precision date, no message_id field) and
+    rule 2's thread-wide clear-then-set order."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        tmp = Path(self._tmpdir.name)
+        self.db_path = tmp / "index.db"
+        self.conn = indexer.init_db(self.db_path)
+        self.addCleanup(self.conn.close)
+        self.addCleanup(self._tmpdir.cleanup)
+        self.hima = tmp / "himalaya-stub"
+        self.hima.write_text(HIMALAYA_STUB)
+        self.hima.chmod(0o755)
+        self.hima_log = tmp / "hima.log"
+        self.hima_data = tmp / "hima-data.json"
+        os.environ["HIMA_LOG"] = str(self.hima_log)
+        os.environ["HIMA_DATA"] = str(self.hima_data)
+
+    def insert(self, **kw):
+        ThreadsTestCase.insert(self, **kw)
+
+    def run_flag(self, message_id, mode):
+        parser = threads.build_parser()
+        args = parser.parse_args([
+            "flag", "--db", str(self.db_path), "--account", "ic",
+            "--message-id", message_id, f"--{mode}",
+            "--himalaya", str(self.hima)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            threads.cmd_flag(args)
+        return json.loads(buf.getvalue())
+
+    def test_block_clears_then_sets_latest_eligible(self):
+        # A flagged in Active (stale flag), B latest in INBOX unflagged.
+        self.insert(message_id="A", folder="Active", folder_tier="active", account="ic",
+                    subject="Quote", from_addr="a@x.com", date_utc="2026-07-10T10:00:23Z",
+                    is_flagged=1, flags=["Flagged", "Seen"])
+        self.insert(message_id="B", folder="INBOX", folder_tier="untriaged", account="ic",
+                    in_reply_to="A", subject="Re: Quote", from_addr="b@x.com",
+                    date_utc="2026-07-18T09:30:11Z")
+        json.dump({
+            "Active": [{"id": "4", "from": {"addr": "a@x.com"}, "date": "2026-07-10 10:00+00:00"}],
+            "INBOX": [
+                {"id": "9", "from": {"addr": "b@x.com"}, "date": "2026-07-18 09:30+00:00"},
+                {"id": "10", "from": {"addr": "other@x.com"}, "date": "2026-07-18 09:30+00:00"},
+            ],
+        }, open(self.hima_data, "w"))
+        out = self.run_flag("A", "block")
+        self.assertEqual([a["op"] for a in out["actions"]],
+                         ["remove flagged", "add flagged"])
+        self.assertEqual(out["actions"][0]["himalaya_id"], "4")   # cleared in Active
+        self.assertEqual(out["actions"][1]["himalaya_id"], "9")   # set on latest, INBOX
+        log = self.hima_log.read_text()
+        self.assertIn("flag remove -a ic-local -f Active 4 flagged", log)
+        self.assertIn("flag add -a ic-local -f INBOX 9 flagged", log)
+
+    def test_seen_marks_single_message(self):
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
+                    subject="Note", from_addr="a@x.com", date_utc="2026-07-18T09:30:59Z")
+        json.dump({"INBOX": [{"id": "3", "from": {"addr": "a@x.com"},
+                              "date": "2026-07-18 09:30+00:00"}]},
+                  open(self.hima_data, "w"))
+        out = self.run_flag("A", "seen")
+        self.assertEqual(out["actions"], [{"message_id": "A", "folder": "INBOX",
+                                           "himalaya_id": "3", "op": "add seen"}])
+
+    def test_resolution_ambiguity_is_a_hard_error(self):
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
+                    subject="Note", from_addr="a@x.com", date_utc="2026-07-18T09:30:00Z")
+        json.dump({"INBOX": [
+            {"id": "3", "from": {"addr": "a@x.com"}, "date": "2026-07-18 09:30+00:00"},
+            {"id": "4", "from": {"addr": "a@x.com"}, "date": "2026-07-18 09:30+00:00"},
+        ]}, open(self.hima_data, "w"))
+        with self.assertRaises(threads.FatalError) as cm:
+            self.run_flag("A", "seen")
+        self.assertIn("2 matches", str(cm.exception))
+
+    def test_resolution_not_found_says_resync(self):
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
+                    subject="Note", from_addr="a@x.com", date_utc="2026-07-18T09:30:00Z")
+        json.dump({"INBOX": []}, open(self.hima_data, "w"))
+        with self.assertRaises(threads.FatalError) as cm:
+            self.run_flag("A", "seen")
+        self.assertIn("not found", str(cm.exception))
+
+
 def make_maildir_folder(root, folder):
     for sub in ("cur", "new", "tmp"):
         os.makedirs(os.path.join(root, folder, sub), exist_ok=True)

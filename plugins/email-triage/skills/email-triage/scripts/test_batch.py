@@ -255,6 +255,65 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(out["sync"][0]["attempts"], 2)
         self.assertTrue(out["sync"][0]["ok"])
 
+    def test_thread_of_expands_live_members_only(self):
+        # The DoorDash-shaped case from the 2026-07-19 session: a thread
+        # with an INBOX arrival and an old Trash sibling. thread_of must
+        # act on the INBOX member ONLY -- the trash sibling never moves.
+        write_message(self.acct / "Trash", "k7", "S",
+                      msg_headers("m7@x", "shop@example.com", "Order ready"))
+        write_message(self.acct / "INBOX", "k8", "",
+                      {**msg_headers("m8@x", "shop@example.com", "Re: Order ready"),
+                       "In-Reply-To": "<m7@x>"})
+        self.reindex()
+        code, out, _ = self.run_batch(
+            [{"account": "acct", "thread_of": "m8@x", "disposition": "trash"}],
+            "--category", "passive-update")
+        self.assertEqual(code, 0, out)
+        (mv,) = out["acted"]["moved"]
+        self.assertEqual(mv["message_id"], "m8@x")
+        self.assertEqual(mv["from_folder"], "INBOX")
+        self.assertEqual(mv["to_folder"], "Trash")  # resolved from config tiers
+        # trash sibling untouched
+        self.assertTrue(list((self.acct / "Trash" / "cur").iterdir()))
+        (ev,) = self.events()
+        self.assertEqual(ev["final_action"], "trash")
+
+    def test_thread_of_works_by_any_member_and_carries_overrides(self):
+        # Anchor by the TRASH member's id; expansion still yields the live
+        # member, and per-item overrides ride along to expanded items.
+        write_message(self.acct / "Trash", "k7", "S",
+                      msg_headers("m7@x", "shop@example.com", "Order ready"))
+        write_message(self.acct / "INBOX", "k8", "",
+                      {**msg_headers("m8@x", "shop@example.com", "Re: Order ready"),
+                       "In-Reply-To": "<m7@x>"})
+        self.reindex()
+        code, out, _ = self.run_batch(
+            [{"account": "acct", "thread_of": "m7@x", "disposition": "trash",
+              "notes": "recidivist"}])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["acted"]["moved"][0]["message_id"], "m8@x")
+        (ev,) = self.events()
+        self.assertEqual(ev["notes"], "recidivist")
+
+    def test_thread_of_with_no_live_members_refuses_preflight(self):
+        write_message(self.acct / "Trash", "k7", "S",
+                      msg_headers("m7@x", "shop@example.com", "Old noise"))
+        self.reindex()
+        code, out, err = self.run_batch(
+            [{"account": "acct", "thread_of": "m7@x", "disposition": "trash"}])
+        self.assertEqual(code, 1)
+        self.assertIn("no members in a live tier", err)
+        self.assertIn("nothing was acted", err)
+
+    def test_disposition_on_plain_item_resolves_per_account(self):
+        code, out, _ = self.run_batch(
+            [{"account": "acct", "message_id": "m2@x", "from_folder": "INBOX",
+              "disposition": "activate"}])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["acted"]["moved"][0]["to_folder"], "Active")
+        (ev,) = self.events()
+        self.assertEqual(ev["final_action"], "activate")
+
     def test_activate_derived_from_active_tier(self):
         code, out, _ = self.run_batch(
             [{"account": "acct", "message_id": "m2@x", "from_folder": "INBOX",

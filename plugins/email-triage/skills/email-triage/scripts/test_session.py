@@ -92,6 +92,11 @@ class SessionTests(unittest.TestCase):
         self.assertIn("hint", out)
         # marker survives: a held lock means we did NOT start a session
         self.assertTrue((self.tmp / ".fullsync-done").exists())
+        # R8: held-lock output is minimal -- no config/priority dump, no
+        # session stamp (nothing started)
+        self.assertNotIn("config", out)
+        self.assertNotIn("priority_folders", out)
+        self.assertNotIn("session_started_at", out)
 
     def test_unlock(self):
         (self.tmp / "session.lock").mkdir()
