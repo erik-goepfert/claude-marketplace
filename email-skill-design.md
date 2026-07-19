@@ -941,6 +941,19 @@ The correctness checklist for a running session:
   priority — a direct user action outranks the skill — but history can record
   an action whose effect never survived.
 
+**Amendment (2026-07-18, Phase 5.4): the whole checklist above is mechanized
+for move/remove batches by `batch.py run`** — one call performs act (via the
+act layer), event logging (auto-derived: `final_action` from the
+destination's tier, sender/subject from the index row; all-or-nothing
+pre-flight before anything acts), a full re-index that absorbs the batch's
+own echo and returns only provably-external residue, and the box-scoped
+per-account mbsync push with one automatic retry. Rationale: in a
+model-driven loop the cost unit is the tool call — the same four-step unit
+hand-orchestrated cost 4+ calls per batch (12+ cycles in one live session)
+and made hand-written event JSON the norm rather than the exception.
+Hand-written events remain only for decisions with no move attached
+(skips, flags, replies, drafts).
+
 ---
 
 ## 13. Pre-build verification suite

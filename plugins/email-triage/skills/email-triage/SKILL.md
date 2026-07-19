@@ -1,7 +1,7 @@
 ---
 name: email-triage
 description: Triage email across iCloud and Gmail accounts — thread-centric review of a local Maildir mirror (synced by mbsync, indexed to SQLite) with flag/reply/archive/trash decisions, approval gates, and a persistent history DB that makes each session smarter than the last. Use when the user asks to triage, clean up, or process their email/inbox.
-allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*) Bash(*indexer.py*) Bash(*threads.py*) Bash(*act.py*) Bash(*unsub.py*) Bash(*analytics.py*) Bash(mbsync *)
+allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*) Bash(*indexer.py*) Bash(*threads.py*) Bash(*act.py*) Bash(*batch.py*) Bash(*unsub.py*) Bash(*analytics.py*) Bash(mbsync *)
 ---
 
 # Email Triage
@@ -34,6 +34,7 @@ THR="${CLAUDE_SKILL_DIR}/scripts/threads.py"
 ACT="${CLAUDE_SKILL_DIR}/scripts/act.py"
 HIST="${CLAUDE_SKILL_DIR}/scripts/history.py"
 UNSUB="${CLAUDE_SKILL_DIR}/scripts/unsub.py"
+BATCH="${CLAUDE_SKILL_DIR}/scripts/batch.py"
 ```
 
 - `config.yaml` (in `$DATA`) — schema v2 (Phase 4): per-account `tiers:`
@@ -240,22 +241,27 @@ improvising it here.
    present: re-index and consume that change report (external changes
    from the non-priority folders surface here — log manual events per
    step 6), then act normally.
-   **Act in approved batches** (see Acting): resolve-
-   before-act, `$ACT` for moves/removes, `-local` himalaya for flags,
-   IMAP himalaya for replies, log events at act time, re-index touched state
-   (a full `$IDX index` run is cheap, ~25 s — no need to scope it), then a
-   **box-scoped sync** at the batch boundary:
-   `mbsync -c "$MBSYNCRC" 'gmail:INBOX,Areas/Taxes'` (list exactly the
-   folders the batch touched) — never a full-channel sync per action; Gmail's
-   ~60–80 s per-invocation overhead is paid regardless of scope, so batch
-   actions per sync.
+   **Act in approved batches** (see Acting). For move/remove batches — the
+   dominant case — **one `$BATCH run` call is the whole unit**: it acts
+   (via the act layer), auto-derives and logs the events, re-indexes with
+   this batch's own echo absorbed (returning only provably-external
+   residue — consume it per step 6), and runs the box-scoped sync itself.
+   Flags stay on `-local` himalaya, replies on IMAP himalaya; for those,
+   log events at act time and keep the same act → log → re-index → push
+   unit by hand (a full `$IDX index` run is cheap, ~25 s; box-scoped sync
+   `mbsync -c "$MBSYNCRC" 'gmail:INBOX,Areas/Taxes'` — exactly the folders
+   touched, never a full-channel sync per action; Gmail's ~60–80 s
+   per-invocation overhead is paid regardless of scope, so batch actions
+   per sync).
    **HARD INVARIANT: a batch is not complete until its sync has run.**
    Never begin the next batch — and never report a batch as done — while
    the previous batch's changes exist only in the local mirror. Why: in the
    first live session, six batches of trashes sat local-only for 35 minutes
    until the user asked "have you pushed our changes to the server?" — a
    crash in that window would have left all of it live in the mailbox.
-   Act → log → re-index → **push** is one unit.
+   Act → log → re-index → **push** is one unit — `$BATCH run` IS that unit
+   in one call; check its `sync` result and re-run the push on a reported
+   failure.
 9. **Session end — background chain, user is done immediately.** Every
    batch was already box-pushed (step 8's invariant), so the final full
    sync mostly *pulls*; run it detached, releasing the lock only on
@@ -493,14 +499,46 @@ slots in by config alone):
 | Discard | `$ACT move --to <tiers.trash>` |
 | Save reply for later | see Reply step 5b — `himalaya message save` into `<tiers.drafts>` |
 
+**The standard path for an approved move/remove batch is `$BATCH run`**
+(5.4) — act + auto-derived event log + echo-absorbed re-index + box-scoped
+sync in one call. Items JSON on stdin or `--file`:
+
+```sh
+$BATCH run --db "$IDXDB" --maildir-root "$MAILDIR" --data-dir "$DATA" \
+  --mbsyncrc "$MBSYNCRC" --session "$SESSION" \
+  --category newsletter [--decided-by approved] [--notes "..."] \
+  [--unsubscribed] [--dry-run] <<'JSON'
+[
+  {"account": "gmail", "message_id": "m1@x", "from_folder": "INBOX",
+   "to_folder": "[Gmail]/Trash"},
+  {"account": "gmail", "message_id": "m2@x", "from_folder": "INBOX",
+   "remove": true}
+]
+JSON
+```
+
+Message-ids are the INDEX's bare form (no angle brackets — as `$THR`
+reports them). Events are derived, not hand-written: `final_action` from
+the destination's tier (trash/junk → `trash`, active → `activate`,
+ongoing/cold or a `remove` → `archive`), sender/subject from the index
+row; per-item overrides (`category`, `notes`, `thread_state`,
+`inactive_days`, `unsubscribed`, ...) win over the batch-level flags.
+Pre-flight validates EVERY item before anything acts (all-or-nothing —
+a bad destination stops the batch with the mailbox untouched); a
+destination must classify as trash/junk/active/ongoing/cold. The output's
+`change_report.external` is step-6 material (self-echo already absorbed);
+check `sync[].ok` — the batch invariant is only satisfied when the push
+succeeded. Hand-written `$HIST log-events` JSON remains only for events
+with no move attached (skips, flag decisions, replies, drafts).
+
 `$ACT move --db "$IDXDB" --maildir "$MAILDIR/<acct>" --account <acct> --from
 <folder> --to <folder> <message-id>...` and `$ACT remove ... --from <folder>
-<message-id>...` both take multiple message-ids in one call — use this for
-batch actions. `$ACT remove` refuses to strip a message's only copy (guards
+<message-id>...` are the low-level layer underneath (one-off moves,
+recovery). `$ACT remove` refuses to strip a message's only copy (guards
 against deleting mail instead of archiving it). **Resolve-before-act is
-built into `$ACT`** — it reads the current filename off disk at call time,
-never from a cached listing; if it reports "message file not found on disk,"
-the index is stale — rerun `$IDX index` and retry.
+built into the act layer** — it reads the current filename off disk at call
+time, never from a cached listing; if it reports "message file not found on
+disk," the index is stale — rerun `$IDX index` and retry.
 
 - **Flag / unflag** (autonomous allowed; thread-wide clear-then-set, rule 2):
   resolve current local ids for every currently-flagged member of the thread
