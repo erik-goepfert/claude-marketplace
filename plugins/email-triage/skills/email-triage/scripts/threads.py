@@ -55,6 +55,18 @@ Subcommands:
   list    All threads (per account) having >=1 member whose per-message tier
           is in the given set (default: untriaged + active, the live tiers).
   show    The full thread containing a given message-id.
+  read    Phase 5.1 / review §4 ("the biggest tooling gap: content access"):
+          one message's headers + body, read straight off its raw Maildir
+          file. Kills the himalaya id-resolution dance, lossy `--preview`
+          rendering, and the \\Seen risk in one move -- a raw open() for
+          reading can't touch flags, and this module never writes to the
+          file it resolves. Resolution reuses this module's existing
+          account+message_id -> (folder, maildir_key) precedence (see
+          `resolve_message_row`), then act.py's on-disk stem-match
+          (`resolve_current_file`) to find the current filename -- imported
+          rather than duplicated (act.py is left unmodified). unsub.py
+          shares this same read path (see its `load_message`) rather than
+          re-implementing it, per implementation-plan.md 5.3.
 
 Both print JSON to stdout (indent=2, sort_keys=True, matching indexer.py's
 report style).
@@ -62,13 +74,19 @@ report style).
 
 import argparse
 import datetime
+import email
+import email.policy
 import json
+import os
 import re
 import sqlite3
 import sys
 from collections import defaultdict
 from email.utils import getaddresses
+from html.parser import HTMLParser
 from pathlib import Path
+
+import act
 
 # --------------------------------------------------------------------------
 # Constants
@@ -190,6 +208,166 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
 def all_accounts(conn: sqlite3.Connection) -> list:
     rows = conn.execute("SELECT DISTINCT account FROM envelopes ORDER BY account").fetchall()
     return [r[0] for r in rows]
+
+
+def resolve_message_row(conn: sqlite3.Connection, account: str, message_id: str):
+    """Return (folder, maildir_key) for one message, using the SAME
+    non-allmail-preferred / TIER_RANK precedence as `load_account_members`
+    (module docstring; matches indexer.py's message_tiers view). A message
+    with rows in more than one folder (e.g. a Gmail All-Mail duplicate)
+    resolves to its single highest-precedence row -- there is exactly one
+    "the message" for read/unsub purposes, same as everywhere else in this
+    module."""
+    rows = conn.execute(
+        "SELECT folder, maildir_key, folder_tier FROM envelopes WHERE account = ? AND message_id = ?",
+        (account, message_id),
+    ).fetchall()
+    if not rows:
+        raise FatalError(f"no index row for account={account!r} message_id={message_id!r}")
+
+    non_allmail = [r for r in rows if r[2] != "allmail"]
+    if non_allmail:
+        folder, maildir_key, _tier = min(non_allmail, key=lambda r: TIER_RANK.get(r[2], 999))
+    else:
+        # Every row is All-Mail-only: no better copy to prefer, take the first.
+        folder, maildir_key, _tier = rows[0]
+    return folder, maildir_key
+
+
+def resolve_message_file(maildir_root, account: str, message_id: str, conn: sqlite3.Connection) -> str:
+    """Full current path to one message's raw file. Wraps act.py's
+    resolve_current_file (disk stem-match, tolerant of renames since the
+    last index run) so callers get one FatalError type regardless of
+    whether the failure was a missing index row or a missing file."""
+    folder, maildir_key = resolve_message_row(conn, account, message_id)
+    try:
+        return act.resolve_current_file(str(maildir_root), folder, maildir_key)
+    except act.FatalError as e:
+        raise FatalError(str(e)) from e
+
+
+# --------------------------------------------------------------------------
+# Raw-file content access (Phase 5.1 / review §4): headers + body straight
+# off the Maildir file, via the stdlib email module (policy=default).
+# --------------------------------------------------------------------------
+
+# The `read` default's header selection -- deliberately narrow (review §4's
+# complaint was too much noise from himalaya's own dumps, not too little).
+SELECTED_HEADERS = ("From", "To", "Cc", "Date", "Subject", "Message-ID", "In-Reply-To")
+
+
+def load_raw_message(path: str):
+    """Read + parse a message's raw file. Plain read-only open() -- no
+    rename, no flag touch, and (unlike a flag-changing tool) no reason to
+    ever call os.utime either, so the file's mtime is untouched by
+    construction."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    return email.message_from_bytes(raw, policy=email.policy.default)
+
+
+def selected_message_headers(msg) -> dict:
+    return {name: (str(msg[name]) if msg[name] is not None else None) for name in SELECTED_HEADERS}
+
+
+def full_message_headers(msg) -> dict:
+    """Every header in the raw file, in first-seen order; a header repeated
+    (e.g. Received) collects into a list rather than silently keeping only
+    the last occurrence."""
+    headers = {}
+    for name in dict.fromkeys(msg.keys()):
+        values = [str(v) for v in msg.get_all(name, [])]
+        headers[name] = values[0] if len(values) == 1 else values
+    return headers
+
+
+def find_part(msg, subtype: str):
+    """First non-multipart part of content type text/<subtype> that isn't
+    an attachment (walks in document order, so multipart/alternative's
+    preferred ordering is respected for the common plain-then-html case)."""
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        if part.get_content_type() != f"text/{subtype}":
+            continue
+        if part.get_content_disposition() == "attachment":
+            continue
+        return part
+    return None
+
+
+def decode_text_part(part) -> str:
+    """Charset-aware decode of a text part's payload: get_payload(decode=True)
+    undoes the transfer encoding (base64/quoted-printable) to raw bytes,
+    then the part's own declared charset (falling back to utf-8) decodes
+    those bytes to str."""
+    payload = part.get_payload(decode=True) or b""
+    charset = part.get_content_charset() or "utf-8"
+    return payload.decode(charset, errors="replace")
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Tag-stripped plain text from an HTML body: drops <script>/<style>
+    content entirely, inserts a line break at block-level tags so the
+    result isn't one giant run-on line, and collapses interior whitespace."""
+
+    _BLOCK_TAGS = {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6"}
+    _SKIPPED_TAGS = {"script", "style"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._chunks = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIPPED_TAGS:
+            self._skip_depth += 1
+        elif tag in self._BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIPPED_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if not self._skip_depth:
+            self._chunks.append(data)
+
+    def text(self) -> str:
+        raw = "".join(self._chunks)
+        lines = (re.sub(r"[ \t]+", " ", ln).strip() for ln in raw.splitlines())
+        return "\n".join(ln for ln in lines if ln)
+
+
+def strip_html(html_text: str) -> str:
+    parser = _HTMLTextExtractor()
+    parser.feed(html_text)
+    parser.close()
+    return parser.text()
+
+
+def extract_body(msg, force_html: bool):
+    """Returns (body, source_part). Default is the message's text/plain
+    part; falls back to tag-stripped text/html when there is no text/plain
+    part OR --html-text was given -- design review §4's two trigger
+    conditions ("when no text/plain, or flag given") are ORed, not
+    exclusive alternatives, so a plain-text message is unaffected by
+    --html-text. If --html-text is given but the message has no text/html
+    part at all, falls back to text/plain rather than returning nothing
+    (an ambiguity the spec didn't cover; returning no body when a
+    perfectly readable plain part exists would be a worse default)."""
+    plain_part = find_part(msg, "plain")
+    if plain_part is not None and not force_html:
+        return decode_text_part(plain_part), "text/plain"
+
+    html_part = find_part(msg, "html")
+    if html_part is not None:
+        return strip_html(decode_text_part(html_part)), "text/html-stripped"
+
+    if plain_part is not None:
+        return decode_text_part(plain_part), "text/plain"
+
+    return None, None
 
 
 def load_account_members(conn: sqlite3.Connection, account: str) -> dict:
@@ -524,6 +702,34 @@ def cmd_show(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def cmd_read(args: argparse.Namespace) -> None:
+    conn = connect_db(args.db)
+    try:
+        path = resolve_message_file(args.maildir, args.account, args.message_id, conn)
+    finally:
+        conn.close()
+
+    msg = load_raw_message(path)
+    rel_file = os.path.relpath(path, str(args.maildir))
+
+    if args.headers_only:
+        result = {
+            "headers": full_message_headers(msg),
+            "body": None,
+            "source_part": None,
+            "file": rel_file,
+        }
+    else:
+        body, source_part = extract_body(msg, force_html=args.html_text)
+        result = {
+            "headers": selected_message_headers(msg),
+            "body": body,
+            "source_part": source_part,
+            "file": rel_file,
+        }
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -554,6 +760,29 @@ def build_parser() -> argparse.ArgumentParser:
     show_p.add_argument("--account", required=True)
     show_p.add_argument("--message-id", required=True, dest="message_id")
     show_p.set_defaults(func=cmd_show)
+
+    read_p = sub.add_parser(
+        "read",
+        help="raw-file-backed content read for one message: headers + body "
+             "(Phase 5.1 / review §4 -- replaces the himalaya read path)",
+    )
+    read_p.add_argument("--db", required=True, type=Path)
+    read_p.add_argument("--account", required=True)
+    read_p.add_argument("--message-id", required=True, dest="message_id")
+    read_p.add_argument(
+        "--maildir", required=True, type=Path,
+        help="account Maildir root (e.g. .../mail/icloud) -- same convention as act.py's --maildir",
+    )
+    read_p.add_argument(
+        "--html-text", action="store_true", dest="html_text",
+        help="prefer tag-stripped text/html over text/plain; also the automatic "
+             "fallback when there is no text/plain part",
+    )
+    read_p.add_argument(
+        "--headers-only", action="store_true", dest="headers_only",
+        help="full header block only, no body",
+    )
+    read_p.set_defaults(func=cmd_read)
 
     return parser
 

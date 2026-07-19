@@ -847,3 +847,30 @@ Execute top-down; each independently committable.
       verified format from the 2026-07-18 session, requested live:
       "repeat that initial message minus the ones we've dealt with until
       we've cleared them all.")
+
+---
+
+## Phase 6 — Batch presentation design (added 2026-07-18, user request)
+
+5.8 defines the batch-board LOOP (board stays active until empty); this
+phase designs the LOOK — expected to take live iteration, not one pass.
+
+- [ ] **6.1 Survey CLI mail clients for borrowable idioms.** himalaya's
+      own table output (baseline — user suggested emulating with tweaks);
+      mutt/neomutt `index_format` (a %-format DSL purpose-built for
+      dense one-line-per-message displays — likely the richest source);
+      aerc's column config; notmuch/alot; mu4e headers view. Deliverable:
+      a short comparison with 2–3 concrete board-format candidates.
+- [ ] **6.2 Live iteration.** Present the candidates in a real triage
+      session; the user picks/tweaks in place; repeat until it stops
+      changing. Surfaces to cover beyond the batch board: category
+      breakdown summary, priority-scan interrupt, thread detail view,
+      session-close summary.
+- [ ] **6.3 Encode the winner as exact templates** (in the skill, or
+      reference.md once 5.6 lands). Open design question to resolve
+      during iteration: freehand-from-template vs. script-rendered —
+      a `threads.py board`/`render` subcommand would make boards
+      deterministic tool output (consistent, cheap) with the model adding
+      only the judgment annotations (recidivist / borderline / new
+      sender); pure prose allows more adaptation but drifts. Likely
+      hybrid; decide from what the iteration reveals.

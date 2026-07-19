@@ -16,9 +16,11 @@ import contextlib
 import datetime
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
+from email.message import EmailMessage
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -317,6 +319,172 @@ class ThreadsTestCase(unittest.TestCase):
         result = self.run_list(tier=["untriaged"])
         self.assertEqual(len(result), 1)
         self.assertFalse(result[0]["drafted"])
+
+
+def make_maildir_folder(root, folder):
+    for sub in ("cur", "new", "tmp"):
+        os.makedirs(os.path.join(root, folder, sub), exist_ok=True)
+
+
+def put_maildir_file(root, folder, name, raw_bytes: bytes) -> str:
+    make_maildir_folder(root, folder)
+    path = os.path.join(root, folder, "cur", name)
+    with open(path, "wb") as f:
+        f.write(raw_bytes)
+    return path
+
+
+class ReadCommandTests(unittest.TestCase):
+    """Tests for the `read` subcommand (Phase 5.1 / review §4). Own setUp
+    (rather than reusing ThreadsTestCase's) because these need a real
+    Maildir tree on disk in addition to index.db -- same shape as
+    test_act.py's fixtures, matching how `read` actually resolves a
+    message: index row -> act.resolve_current_file -> raw bytes -> email
+    module."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.maildir_root = os.path.join(self._tmpdir.name, "acct")
+        self.db_path = Path(self._tmpdir.name) / "index.db"
+        self.conn = indexer.init_db(self.db_path)
+
+    def tearDown(self):
+        self.conn.close()
+        self._tmpdir.cleanup()
+
+    def index_row(self, folder, key, message_id, filename, folder_tier="untriaged"):
+        self.conn.execute(
+            """INSERT INTO envelopes (message_id, folder, maildir_key, maildir_file,
+               account, folder_tier) VALUES (?, ?, ?, ?, 'acct', ?)""",
+            (message_id, folder, key, filename, folder_tier),
+        )
+        self.conn.commit()
+
+    def run_read(self, message_id, extra_args=()):
+        parser = threads.build_parser()
+        argv = [
+            "read", "--db", str(self.db_path), "--account", "acct",
+            "--message-id", message_id, "--maildir", self.maildir_root, *extra_args,
+        ]
+        args = parser.parse_args(argv)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            threads.cmd_read(args)
+        return json.loads(buf.getvalue())
+
+    def test_read_default_returns_text_plain_body(self):
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "me@example.com"
+        msg["Subject"] = "Plain hello"
+        msg["Date"] = "Mon, 1 Jan 2026 00:00:00 +0000"
+        msg["Message-ID"] = "<plain1@example.com>"
+        msg.set_content("Hello in plain text.\n")
+        msg.add_alternative("<html><body><p>Hello in <b>html</b>.</p></body></html>", subtype="html")
+        put_maildir_file(self.maildir_root, "INBOX", "k1:2,", msg.as_bytes())
+        self.index_row("INBOX", "k1", "<plain1@example.com>", "k1:2,")
+
+        out = self.run_read("<plain1@example.com>")
+        self.assertEqual(out["source_part"], "text/plain")
+        self.assertIn("Hello in plain text.", out["body"])
+        self.assertEqual(out["headers"]["Subject"], "Plain hello")
+        self.assertEqual(out["headers"]["Message-ID"], "<plain1@example.com>")
+        self.assertEqual(out["file"], "INBOX/cur/k1:2,")
+
+    def test_read_html_only_falls_back_automatically_without_flag(self):
+        msg = EmailMessage()
+        msg["From"] = "news@example.com"
+        msg["To"] = "me@example.com"
+        msg["Subject"] = "HTML only"
+        msg["Message-ID"] = "<html1@example.com>"
+        msg.set_content("<html><body><p>Only <b>HTML</b> here.</p></body></html>", subtype="html")
+        put_maildir_file(self.maildir_root, "INBOX", "k2:2,", msg.as_bytes())
+        self.index_row("INBOX", "k2", "<html1@example.com>", "k2:2,")
+
+        out = self.run_read("<html1@example.com>")
+        self.assertEqual(out["source_part"], "text/html-stripped")
+        self.assertIn("Only", out["body"])
+        self.assertIn("HTML", out["body"])
+        self.assertNotIn("<p>", out["body"])
+        self.assertNotIn("<b>", out["body"])
+
+    def test_read_html_text_flag_prefers_html_over_plain(self):
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "me@example.com"
+        msg["Subject"] = "Both parts"
+        msg["Message-ID"] = "<both1@example.com>"
+        msg.set_content("Plain version.\n")
+        msg.add_alternative("<html><body><div>HTML version.</div></body></html>", subtype="html")
+        put_maildir_file(self.maildir_root, "INBOX", "k3:2,", msg.as_bytes())
+        self.index_row("INBOX", "k3", "<both1@example.com>", "k3:2,")
+
+        out = self.run_read("<both1@example.com>", extra_args=["--html-text"])
+        self.assertEqual(out["source_part"], "text/html-stripped")
+        self.assertIn("HTML version.", out["body"])
+
+    def test_read_headers_only_has_full_header_block_and_no_body(self):
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "me@example.com"
+        msg["Subject"] = "Headers only"
+        msg["Message-ID"] = "<headers1@example.com>"
+        msg["X-Custom-Header"] = "custom-value"
+        msg.set_content("Body text.\n")
+        put_maildir_file(self.maildir_root, "INBOX", "k4:2,", msg.as_bytes())
+        self.index_row("INBOX", "k4", "<headers1@example.com>", "k4:2,")
+
+        out = self.run_read("<headers1@example.com>", extra_args=["--headers-only"])
+        self.assertIsNone(out["body"])
+        self.assertIsNone(out["source_part"])
+        self.assertEqual(out["headers"]["X-Custom-Header"], "custom-value")
+        self.assertEqual(out["headers"]["Subject"], "Headers only")
+
+    def test_read_prefers_non_allmail_row_same_precedence_as_elsewhere(self):
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["Subject"] = "Dup"
+        msg["Message-ID"] = "<dup1@example.com>"
+        msg.set_content("dup body\n")
+        put_maildir_file(self.maildir_root, "Active", "k5-active:2,", msg.as_bytes())
+        put_maildir_file(self.maildir_root, "[Gmail]/All Mail", "k5-allmail:2,", msg.as_bytes())
+        self.index_row("Active", "k5-active", "<dup1@example.com>", "k5-active:2,", folder_tier="active")
+        self.index_row("[Gmail]/All Mail", "k5-allmail", "<dup1@example.com>", "k5-allmail:2,", folder_tier="allmail")
+
+        out = self.run_read("<dup1@example.com>")
+        self.assertEqual(out["file"], "Active/cur/k5-active:2,")
+
+    def test_read_unknown_message_raises_fatal_error(self):
+        parser = threads.build_parser()
+        args = parser.parse_args([
+            "read", "--db", str(self.db_path), "--account", "acct",
+            "--message-id", "<nope@example.com>", "--maildir", self.maildir_root,
+        ])
+        with self.assertRaises(threads.FatalError):
+            threads.cmd_read(args)
+
+    def test_read_does_not_modify_the_raw_file(self):
+        """\\Seen-safety (Phase 5.1): a raw read must not rename the file or
+        touch its mtime -- a plain read-only open() can't rename, and
+        load_raw_message never calls os.utime, so this is really asserting
+        that stays true."""
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["Subject"] = "Untouched"
+        msg["Message-ID"] = "<untouched1@example.com>"
+        msg.set_content("untouched body\n")
+        path = put_maildir_file(self.maildir_root, "INBOX", "k6:2,", msg.as_bytes())
+        self.index_row("INBOX", "k6", "<untouched1@example.com>", "k6:2,")
+
+        before_stat = os.stat(path)
+        before_bytes = Path(path).read_bytes()
+        self.run_read("<untouched1@example.com>")
+        after_stat = os.stat(path)
+        after_bytes = Path(path).read_bytes()
+
+        self.assertEqual(before_bytes, after_bytes)
+        self.assertEqual(before_stat.st_mtime_ns, after_stat.st_mtime_ns)
+        self.assertEqual(before_stat.st_size, after_stat.st_size)
 
 
 if __name__ == "__main__":

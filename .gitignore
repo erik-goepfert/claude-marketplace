@@ -22,3 +22,7 @@ yarn-error.log
 # Python
 __pycache__/
 *.pyc
+
+# Session reviews/notes contain personal mail metadata — never commit
+email-triage-notes.md
+email-triage-skill-review.md
