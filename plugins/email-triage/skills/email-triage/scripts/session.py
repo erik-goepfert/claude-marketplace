@@ -92,6 +92,7 @@ def launch_detached(chain: str, log_path: Path) -> int:
 
 def cmd_start(args) -> int:
     data_dir = args.data_dir
+    data_dir.mkdir(parents=True, exist_ok=True)
     lock = data_dir / "session.lock"
     marker = data_dir / ".fullsync-done"
     cfg = config_path_for(args)
@@ -110,6 +111,13 @@ def cmd_start(args) -> int:
         "config": config_text,
         "config_path": str(cfg),
         "priority_folders": indexer.priority_fast_map(cfg),
+        # Diagnostic (2026-07-19): settles which invocation form live
+        # sessions can actually rely on. If null, the harness did not set
+        # the var and literal paths are the correct fallback.
+        "env": {
+            "CLAUDE_SKILL_DIR": os.environ.get("CLAUDE_SKILL_DIR"),
+            "CLAUDE_PLUGIN_ROOT": os.environ.get("CLAUDE_PLUGIN_ROOT"),
+        },
     }
     if config_text is None:
         out["warning"] = ("config.yaml missing -- from-scratch setup; see "

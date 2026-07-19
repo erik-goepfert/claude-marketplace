@@ -36,6 +36,7 @@ the skill's scripts).
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -309,13 +310,17 @@ def cmd_exec(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------
 
 
+DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
+
+
 def _add_common_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--db", required=True, type=Path)
+    p.add_argument("--db", type=Path, default=None,
+                   help="index.db; default <data-dir>/index.db")
     p.add_argument("--account", required=True)
     p.add_argument("--message-id", required=True, dest="message_id")
     p.add_argument(
-        "--maildir", required=True, type=Path,
-        help="account Maildir root (e.g. .../mail/icloud) -- same convention as act.py's --maildir",
+        "--maildir", type=Path, default=None,
+        help="account Maildir root; default <data-dir>/mail/<account>",
     )
 
 
@@ -349,6 +354,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.db is None:
+        args.db = DEFAULT_DATA_DIR / "index.db"
+    if args.maildir is None:
+        args.maildir = DEFAULT_DATA_DIR / "mail" / args.account
     try:
         args.func(args)
     except FatalError as e:

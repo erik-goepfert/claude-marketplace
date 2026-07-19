@@ -233,9 +233,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("run", help="execute one approved batch: act + log + index + sync")
-    p.add_argument("--db", required=True, type=Path, help="path to index.db")
-    p.add_argument("--maildir-root", required=True, type=Path,
-                   help="Maildir root containing one subdirectory per account")
+    p.add_argument("--db", type=Path, default=None,
+                   help="index.db; default <data-dir>/index.db")
+    p.add_argument("--maildir-root", type=Path, default=None,
+                   help="Maildir root (one subdirectory per account); default <data-dir>/mail")
     p.add_argument("--data-dir", type=Path, default=history.DEFAULT_DATA_DIR,
                    help="data dir holding history.db (and default config.yaml)")
     p.add_argument("--config", type=Path, default=None,
@@ -259,6 +260,10 @@ def main(argv=None) -> int:
                    help="skip the mbsync push (caller owns the invariant then)")
     args = ap.parse_args(argv)
 
+    if args.db is None:
+        args.db = args.data_dir / "index.db"
+    if args.maildir_root is None:
+        args.maildir_root = args.data_dir / "mail"
     config_path = args.config or (args.data_dir / "config.yaml")
     out: dict = {}
     try:

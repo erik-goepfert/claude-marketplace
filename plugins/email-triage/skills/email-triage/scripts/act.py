@@ -121,9 +121,9 @@ def main(argv=None) -> int:
     rm = sub.add_parser("remove", help="delete a message's file from one folder "
                         "(Gmail tier-label strip; guarded against last-copy loss)")
     for p in (mv, rm):
-        p.add_argument("--db", required=True, help="path to index.db")
-        p.add_argument("--maildir", required=True,
-                       help="account Maildir root (e.g. .../mail/icloud)")
+        p.add_argument("--db", default=None, help="index.db; default <data-dir>/index.db")
+        p.add_argument("--maildir", default=None,
+                       help="account Maildir root; default <data-dir>/mail/<account>")
         p.add_argument("--account", required=True, help="account name in the index")
         p.add_argument("--from", dest="src", required=True, help="source folder")
         p.add_argument(
@@ -133,6 +133,13 @@ def main(argv=None) -> int:
                  "containing backslashes etc. — bit a live session once)")
     mv.add_argument("--to", dest="dst", required=True, help="destination folder")
     args = ap.parse_args(argv)
+
+    data_dir = os.path.expanduser(
+        os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage"))
+    if args.db is None:
+        args.db = os.path.join(data_dir, "index.db")
+    if args.maildir is None:
+        args.maildir = os.path.join(data_dir, "mail", args.account)
 
     if args.message_ids == ["-"]:
         args.message_ids = [ln.strip() for ln in sys.stdin if ln.strip()]

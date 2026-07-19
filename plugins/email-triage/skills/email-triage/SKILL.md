@@ -23,39 +23,50 @@ reading, flagging, moving — is local.
 
 All mutable state lives in the data directory — default
 `~/.local/share/email-triage/`, overridable via `$EMAIL_TRIAGE_DATA_DIR`.
-Never write state into the plugin directory.
+Never write state into the plugin directory. Inside it: `config.yaml`,
+`history.db`, `index.db`, `mail/<account>/` (the mirror),
+`session.lock`, `.fullsync-done`, `fullsync.log`, `endsync.log`.
 
-```
-DATA="${EMAIL_TRIAGE_DATA_DIR:-$HOME/.local/share/email-triage}"
-MAILDIR="$DATA/mail"                    # $MAILDIR/icloud, $MAILDIR/gmail
-IDXDB="$DATA/index.db"
-LOCK="$DATA/session.lock"
-MBSYNCRC=~/.config/isync/mbsyncrc       # NOT auto-discovered — every mbsync call needs -c
-IDX="${CLAUDE_SKILL_DIR}/scripts/indexer.py"
-THR="${CLAUDE_SKILL_DIR}/scripts/threads.py"
-ACT="${CLAUDE_SKILL_DIR}/scripts/act.py"
-HIST="${CLAUDE_SKILL_DIR}/scripts/history.py"
-UNSUB="${CLAUDE_SKILL_DIR}/scripts/unsub.py"
-BATCH="${CLAUDE_SKILL_DIR}/scripts/batch.py"
-SES="${CLAUDE_SKILL_DIR}/scripts/session.py"
-```
+The scripts live in this skill's `scripts/` directory. In this document,
+`$SES` / `$IDX` / `$THR` / `$ACT` / `$HIST` / `$UNSUB` / `$BATCH` /
+`$ANA` are **notation** for `<scripts-dir>/session.py`, `indexer.py`,
+`threads.py`, `act.py`, `history.py`, `unsub.py`, `batch.py`,
+`analytics.py` — NOT shell variables to define.
 
-**Standard session steps live in scripts, never in ad-hoc shell** (user
-rule, 2026-07-19): raw `cat`/`mkdir`/`date`/`nohup` glue falls outside
-allowed-tools and interrupts the user with permission prompts. If a new
-every-session step appears, add it to a script (session.py is the home
-for lifecycle glue) rather than typing shell for it.
+**Invocation rules (learned from live-session permission prompts):**
 
-**Run the scripts directly, through their `$VAR`s** — `$SES start`,
-`$THR list`, `$BATCH run` — they are executable with shebangs. Don't
-wrap them (`uv run`, `python3` prefixes) and don't substitute literal
-filesystem paths for `${CLAUDE_SKILL_DIR}`: a literal path bypasses the
-installed plugin and breaks on any other machine. If direct execution
-ever fails with permission denied, that's a broken install to surface to
-the user, not something to route around. Sole exception: analytics.py
-REQUIRES `uv run "$ANA" ...` (PEP 723 self-provisioned duckdb).
+- **One statement per call, script filename written out literally:**
+  `<scripts-dir>/session.py start`. Claude Code's permission engine
+  matches the LITERAL text of each statement — a call through a shell
+  variable (`SES=...; "$SES" start`) can never auto-approve because the
+  matcher can't see through the variable, and every extra statement in a
+  compound command (`FOO=...`, `echo`, `cd`) is another chance to
+  prompt. No wrappers either (`uv run`, `python3` prefixes) — sole
+  exception: analytics.py REQUIRES `uv run <scripts-dir>/analytics.py`
+  (PEP 723 self-provisioned duckdb).
+- **`<scripts-dir>` is the real path of the skill you are reading** —
+  resolve it once from where this SKILL.md was loaded (the harness
+  reports it; `$SES start` also echoes back `CLAUDE_SKILL_DIR` /
+  `CLAUDE_PLUGIN_ROOT` under `env` for confirmation) and write it
+  literally in every command.
+- **No setup preamble is needed:** every script defaults its paths from
+  `$EMAIL_TRIAGE_DATA_DIR` (falling back to `~/.local/share/...`) —
+  `--db`, `--maildir`, `--maildir-root`, `--data-dir`, `--mbsyncrc` are
+  overrides, not required boilerplate. `threads.py list`,
+  `session.py start`, `batch.py run --session ... <<JSON` are complete
+  commands as-is.
+- **mbsync still needs `-c` spelled out** (never auto-discovered):
+  `mbsync -c ~/.config/isync/mbsyncrc '<boxes>'` — one statement,
+  starts with `mbsync`.
+- **Standard session steps live in scripts, never in ad-hoc shell**
+  (user rule, 2026-07-19): raw `cat`/`mkdir`/`date`/`nohup` glue
+  prompts. A new every-session step goes into a script (session.py is
+  the home for lifecycle glue), not into typed shell.
+- If direct execution fails with permission denied, that's a broken
+  install (missing exec bit) to surface to the user — never route
+  around it with wrappers.
 
-- `config.yaml` (in `$DATA`) — schema v2: per-account `tiers:` map
+- `config.yaml` (in the data dir) — schema v2: per-account `tiers:` map
   realizing each canonical tier CONCEPT as this account's folder name,
   plus `maildir_path` and the `server_rules` registry. **Read it at
   session start; never improvise folder names — every folder name in
@@ -152,7 +163,7 @@ REQUIRES `uv run "$ANA" ...` (PEP 723 self-provisioned duckdb).
 3. **Two-stage sync.** Stage 1 — priority sync, foreground (the live
    working set + Sent + Drafts; Sent is required or `waiting` derivation
    lies): pass each account's `mbsync_fast` value from `start`'s output
-   verbatim as ONE argument — `mbsync -c "$MBSYNCRC" '<mbsync_fast>'`
+   verbatim as ONE argument — `mbsync -c ~/.config/isync/mbsyncrc '<mbsync_fast>'`
    (~60–90 s total). Never hand-assemble or hardcode folder names. **Run
    Stage-1 invocations SEQUENTIALLY, one account at a time.**
    Stage 2 — full sync, background: `$SES sync-background` (one mbsync
@@ -162,7 +173,7 @@ REQUIRES `uv run "$ANA" ...` (PEP 723 self-provisioned duckdb).
    on Stage 2** (step 6) — never rename files while mbsync may be walking
    the same folders.
 4. **Index and consume the change report.**
-   `$IDX index --maildir "$MAILDIR" --db "$IDXDB"` → JSON change report
+   `$IDX index` → JSON change report
    (shape: reference §JSON). Detected changes are provably external —
    everything non-priority still reflects last session's final state.
    **Consume EVERY index run's report this way** — the pre-act re-index
@@ -187,7 +198,7 @@ REQUIRES `uv run "$ANA" ...` (PEP 723 self-provisioned duckdb).
    - `parse_errors` > 0 → surface, don't drop.
    - `unrecognized_folders` → surface as audit debt + session note; don't
      infer.
-5. **Assemble threads.** `$THR list --db "$IDXDB"` — default tiers
+5. **Assemble threads.** `$THR list` — default tiers
    `untriaged`+`active`; full member list always returned (this is what
    makes reconciliation detectable). Each thread carries `state` and
    `drafted` (object shape: reference §JSON).
@@ -208,7 +219,7 @@ REQUIRES `uv run "$ANA" ...` (PEP 723 self-provisioned duckdb).
    Never begin the next batch — or report one done — while its changes
    exist only in the local mirror. `$BATCH run` IS the unit in one call;
    check its `sync[].ok` and re-run the push on failure.
-7. **Session end — residue check first.** `$THR residue --db "$IDXDB"` —
+7. **Session end — residue check first.** `$THR residue` —
    every thread still holding untriaged messages. Empty = clean close.
    Anything listed must be either deliberate (waiting thread, explicit
    "leave it" — say so in one line) or unfinished work (surface it; put
@@ -301,8 +312,7 @@ Then, for everything else:
 4. **Targeted body reads only** — resolving `ambiguous` or extracting
    unsubscribe links; category by category, never upfront:
    ```sh
-   $THR read --db "$IDXDB" --maildir "$MAILDIR/<acct>" \
-     --account <acct> --message-id <id> [--html-text] [--headers-only]
+   $THR read --account <acct> --message-id <id> [--html-text] [--headers-only]
    ```
    If resolving ambiguity means showing the user the content, mark read at
    that point (himalaya path; resolve the local id fresh — reference
@@ -317,15 +327,14 @@ Then, for everything else:
    no unsubscribe proposal (re-offer only if their handling changes:
    reading stops, bulk-trashing starts).
    Extraction is one call:
-   `$UNSUB links --db "$IDXDB" --maildir "$MAILDIR/<acct>" --account
-   <acct> --message-id <id>` — headers + body anchors, ranked. Present
+   `$UNSUB links --account <acct> --message-id <id>` — headers + body anchors, ranked. Present
    the **body link as primary** for hand-clicking (header links are built
    for automated POSTs and often fail humans), full bare URL on its own
    line (rule 6). When `List-Unsubscribe-Post` exists, rank the **native
    unsubscribe button in the user's mail client first** — same RFC 8058
    POST, zero copy-paste. Executing (rule 4 — board approval of a plan
    that includes unsubscribing counts as the explicit request):
-   `$UNSUB exec ... [--url <link>] [--dry-run]` (details: reference
+   `$UNSUB exec --account <acct> --message-id <id> [--url <link>] [--dry-run]` (details: reference
    §JSON). Log confirmations via `--unsubscribed`; a batch answer applies
    to the whole batch.
    **A confirmed unsubscribe is also trash approval** (user rule):
@@ -356,12 +365,12 @@ Then, for everything else:
 `$THR` builds threads from the index's Message-ID/In-Reply-To/References
 graph plus a guarded subject fallback, and derives state directly.
 
-- `$THR list --db "$IDXDB" [--account a] [--tier t ...] [--sender substr]
+- `$THR list [--account a] [--tier t ...] [--sender substr]
   [--subject-contains substr]` — use the filters to answer "which thread
   is X" directly; never dump-and-refilter with ad-hoc python.
-- `$THR show --db "$IDXDB" --account <acct> --message-id <id>` — the full
+- `$THR show --account <acct> --message-id <id>` — the full
   thread containing a message, any tier.
-- `$THR residue --db "$IDXDB"` — end-of-session leftovers check (step 7).
+- `$THR residue` — end-of-session leftovers check (step 7).
 - A thread's messages live in one tier location at a time (system folders
   excepted — Sent copies never move). **Threads never move to Inbox.**
   When a decision changes a thread's location, **every non-system member
@@ -386,8 +395,7 @@ hardcoded:**
 events + echo-absorbed re-index + box-scoped push):
 
 ```sh
-$BATCH run --db "$IDXDB" --maildir-root "$MAILDIR" --data-dir "$DATA" \
-  --mbsyncrc "$MBSYNCRC" --session "$SESSION" \
+$BATCH run --session "<session_started_at>" \
   --category newsletter [--notes "..."] [--unsubscribed] [--dry-run] <<'JSON'
 [
   {"account": "gmail", "message_id": "m1@x", "from_folder": "INBOX",
@@ -406,8 +414,7 @@ external` per step 4; check `sync[].ok`. Hand-written `$HIST log-events`
 JSON remains only for events with no move attached (skips, flags, replies,
 drafts).
 
-`$ACT move`/`$ACT remove` (same args per account, `--maildir
-"$MAILDIR/<acct>"`) are the low-level layer for one-offs and recovery;
+`$ACT move`/`$ACT remove` are the low-level layer for one-offs and recovery;
 `remove` refuses to strip a message's only copy. Resolve-before-act is
 built in — "message file not found on disk" means the index is stale:
 rerun `$IDX index` and retry.
@@ -467,7 +474,7 @@ stays-resolved"` / `"reopens"` / `"refiles"` in the event's `notes`.
 
 ```sh
 # One event:
-$HIST log-event --session "$SESSION" \
+$HIST log-event --session "<session_started_at>" \
   --account gmail --sender "who@example.com" --subject "..." \
   --thread-state holding --category newsletter --inactive-days 4 \
   --proposed trash --final trash --decided-by approved \
@@ -475,8 +482,9 @@ $HIST log-event --session "$SESSION" \
   [--message-id "..."] [--thread-root-id "..."] [--rule-id N] \
   [--notes "..."] [--unsubscribed]
 
-# Batch insert (all-or-nothing). WARNING: a quoted heredoc (<<'JSON') does
-# NOT expand $SESSION — write the real timestamp into the JSON:
+# Batch insert (all-or-nothing). <session_started_at> means the literal
+# timestamp from session start — always written out, never a shell
+# variable (a quoted heredoc wouldn't expand one anyway):
 $HIST log-events <<'JSON'
 [{"session_started_at": "2026-07-09T18:15:00Z", "account": "gmail",
   "sender_addr": "a@example.com", "category": "spam-noise",
@@ -486,7 +494,7 @@ $HIST log-events <<'JSON'
 JSON
 
 # Notes, the moment something is noteworthy:
-$HIST log-note --session "$SESSION" "resume state / watch item"
+$HIST log-note --session "<session_started_at>" "resume state / watch item"
 ```
 
 `decided_by`: `auto` (autonomous — flags only), `approved` (as-is),

@@ -1022,6 +1022,20 @@ manual-event detection). The whole session flow now runs inside
 whitelisted scripts; a new every-session step goes into a script, not
 into typed shell.
 
+**Follow-up (2026-07-19, same day): the invocation contract.** A second
+startup prompt revealed the deeper rule: Claude Code's permission engine
+matches the literal text of each shell statement, so invoking through a
+shell variable (`"$SES" start`) can never auto-approve, and setup
+preambles (assignments, `echo`) add unmatched statements. Consequently:
+all scripts default their path flags from `$EMAIL_TRIAGE_DATA_DIR`
+(single-statement, zero-preamble calls); the SKILL's `$VAR`s are
+documentation notation, not shell state; commands write the script's
+literal path (the harness-reported skill dir — for a directory-source
+marketplace that is the repo itself); and durable auto-approval comes
+from prefix-matched allow rules on the scripts directories in the user's
+settings, the same documented mechanism as the long-standing
+`Bash(himalaya *)` rule.
+
 ---
 
 ## 13. Pre-build verification suite

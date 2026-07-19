@@ -775,7 +775,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     list_p = sub.add_parser("list", help="list all threads with >=1 member in the given tier set")
-    list_p.add_argument("--db", required=True, type=Path)
+    list_p.add_argument("--db", type=Path, default=None, help="index.db; default <data-dir>/index.db")
     list_p.add_argument("--account", action="append", help="limit to this account (repeatable); default: all accounts")
     list_p.add_argument(
         "--tier",
@@ -800,7 +800,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="end-of-session check: compact list of threads still holding "
              "untriaged-tier messages (empty = clean close)",
     )
-    res_p.add_argument("--db", required=True, type=Path)
+    res_p.add_argument("--db", type=Path, default=None, help="index.db; default <data-dir>/index.db")
     res_p.add_argument("--account", action="append", help="limit to this account (repeatable); default: all accounts")
     res_p.add_argument(
         "--tier", action="append",
@@ -809,7 +809,7 @@ def build_parser() -> argparse.ArgumentParser:
     res_p.set_defaults(func=cmd_residue)
 
     show_p = sub.add_parser("show", help="show the full thread containing a message-id")
-    show_p.add_argument("--db", required=True, type=Path)
+    show_p.add_argument("--db", type=Path, default=None, help="index.db; default <data-dir>/index.db")
     show_p.add_argument("--account", required=True)
     show_p.add_argument("--message-id", required=True, dest="message_id")
     show_p.set_defaults(func=cmd_show)
@@ -819,12 +819,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="raw-file-backed content read for one message: headers + body "
              "(Phase 5.1 / review §4 -- replaces the himalaya read path)",
     )
-    read_p.add_argument("--db", required=True, type=Path)
+    read_p.add_argument("--db", type=Path, default=None, help="index.db; default <data-dir>/index.db")
     read_p.add_argument("--account", required=True)
     read_p.add_argument("--message-id", required=True, dest="message_id")
     read_p.add_argument(
-        "--maildir", required=True, type=Path,
-        help="account Maildir root (e.g. .../mail/icloud) -- same convention as act.py's --maildir",
+        "--maildir", type=Path, default=None,
+        help="account Maildir root; default <data-dir>/mail/<account>",
     )
     read_p.add_argument(
         "--html-text", action="store_true", dest="html_text",
@@ -843,6 +843,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    data_dir = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
+    if getattr(args, "db", None) is None:
+        args.db = data_dir / "index.db"
+    if hasattr(args, "maildir") and args.maildir is None:
+        args.maildir = data_dir / "mail" / args.account
     try:
         args.func(args)
     except FatalError as e:

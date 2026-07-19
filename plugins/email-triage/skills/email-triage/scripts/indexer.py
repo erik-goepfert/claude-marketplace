@@ -813,12 +813,13 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     init_p = sub.add_parser("init", help="create index.db schema only")
-    init_p.add_argument("--db", required=True, type=Path)
+    init_p.add_argument("--db", type=Path, default=DEFAULT_DATA_DIR / "index.db")
     init_p.set_defaults(func=cmd_init)
 
     idx_p = sub.add_parser("index", help="index a Maildir root into index.db (auto-inits schema)")
-    idx_p.add_argument("--maildir", required=True, type=Path, help="root containing one subdirectory per account")
-    idx_p.add_argument("--db", required=True, type=Path)
+    idx_p.add_argument("--maildir", type=Path, default=DEFAULT_DATA_DIR / "mail",
+                       help="root containing one subdirectory per account; default <data-dir>/mail")
+    idx_p.add_argument("--db", type=Path, default=DEFAULT_DATA_DIR / "index.db")
     idx_p.add_argument(
         "--account",
         action="append",

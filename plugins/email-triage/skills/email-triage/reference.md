@@ -108,8 +108,12 @@ pass `mbsync_fast` verbatim as ONE mbsync argument.
 
 **`$SES` (session.py):** `start` → `{session_started_at, lock:
 "acquired"|"held", config (raw yaml text), config_path, priority_folders
-(same map as $IDX priority-folders), fullsync_marker_cleared}` — exit 1
-and touches nothing when the lock is held. `sync-background` / `end` →
+(same map as $IDX priority-folders), fullsync_marker_cleared, env
+(CLAUDE_SKILL_DIR / CLAUDE_PLUGIN_ROOT as the harness set them — the
+invocation-path diagnostic)}` — exit 1 and touches nothing when the lock
+is held. All scripts default `--db`/`--maildir`/`--maildir-root`/
+`--data-dir`/`--mbsyncrc` from `$EMAIL_TRIAGE_DATA_DIR` (2026-07-19) —
+path flags are overrides, not boilerplate. `sync-background` / `end` →
 `{pid, accounts, log}` (detached chain: per-account mbsync with one
 retry each; marker touch / lock rmdir only if ALL succeed).
 `check-fullsync` → `{fullsync_done, log_tail?}`, exit 1 until done.

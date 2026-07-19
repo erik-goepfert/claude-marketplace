@@ -877,6 +877,24 @@ Plugin cache refreshed after the final commit.
       per-account retry and success-gated marker/lock-release, acting
       gate check. SKILL session flow collapsed 9 steps → 7, all inside
       whitelisted scripts; 7 tests.
+- [x] **5.10 Prompt-free invocation contract (2026-07-19, from the second
+      startup permission prompt).** Root cause found: Claude Code's
+      permission engine matches LITERAL statement text — `"$SES" start`
+      can never auto-approve (the matcher can't see through a shell
+      variable), and every extra statement in a compound command
+      (assignments, `echo`) is another prompt trigger. Fixes: (a) every
+      script now defaults `--db`/`--maildir`/`--maildir-root` from
+      `$EMAIL_TRIAGE_DATA_DIR` — zero-preamble single-statement calls;
+      (b) SKILL invocation convention rewritten: `$VAR`s are notation,
+      commands are one statement with the script filename literal,
+      `<scripts-dir>` written out from where the skill loaded (correct:
+      the erik-plugins marketplace is a DIRECTORY source — the repo path
+      IS the install on this machine); (c) `session.py start` reports
+      `CLAUDE_SKILL_DIR`/`CLAUDE_PLUGIN_ROOT` as a diagnostic; (d) two
+      prefix-matched allow rules for the scripts dirs go in
+      `~/.claude/settings.json` (documented semantics, like the existing
+      himalaya rule) — USER adds these; the agent is guardrail-blocked
+      from widening its own permissions.
 
 ---
 
