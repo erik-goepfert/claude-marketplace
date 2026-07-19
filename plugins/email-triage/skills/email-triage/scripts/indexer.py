@@ -649,13 +649,17 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list, tier
         elif existing["maildir_file"] != filename:
             # Known key, changed filename: flags changed. Re-derive from the
             # filename suffix only -- no full re-parse.
+            _, old_suffix = split_maildir_filename(existing["maildir_file"])
             _, suffix = split_maildir_filename(filename)
             flags = derive_flags(suffix)
             is_flagged = int("Flagged" in flags)
             is_answered = int("Answered" in flags)
             cur.execute(UPDATE_FLAGS_SQL, (filename, json.dumps(flags), is_flagged, is_answered, utc_now(), existing["id"]))
             existing["maildir_file"] = filename
-            flag_changed_entries.append(envelope_report_entry(account, folder, existing))
+            entry = envelope_report_entry(account, folder, existing)
+            entry["old_flags"] = derive_flags(old_suffix)
+            entry["new_flags"] = flags
+            flag_changed_entries.append(entry)
         # else: filename unchanged -> nothing to do (this is what makes
         # unchanged runs idempotent and report-silent).
 

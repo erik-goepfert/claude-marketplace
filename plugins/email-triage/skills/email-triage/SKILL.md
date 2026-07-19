@@ -173,16 +173,29 @@ improvising it here.
    changes from the rest of the mailbox once Stage 2 lands.
    `$IDX index --maildir "$MAILDIR" --db "$IDXDB"` → JSON on stdout:
    `new` / `moved` / `deleted` / `flag_changed` / `parse_errors` /
-   `unrecognized_folders`. This is provably-external change (the skill
-   re-indexes its own actions immediately as it acts, §Acting) — log it:
+   `unrecognized_folders`. Interpretation rules, in order:
+   - **Self-echo exclusion FIRST.** Before logging anything, drop every
+     entry that matches an action you executed and already logged this
+     session (same message, same movement/flag change). Those are your own
+     actions echoing back — logging them again as `manual` double-counts
+     the decision and corrupts sender stats. Only what remains is
+     external.
    - `moved` entries whose destination tier is `trash` → one manual event,
      `final_action=trash`. Destination tier `cold`/`ongoing` →
      `final_action=archive`. Destination tier `active` →
      `final_action=activate`.
      All: `decided_by=manual`, `proposed_action=final_action`,
      `from_folder`/`to_folder` from the report entry.
-   - `flag_changed` entries → `final_action=flag`, `decided_by=manual`
-     (covers both an external flag-set and an external flag-clear).
+   - `deleted` entries FROM a trash/junk-tier folder → server auto-purge
+     (retention expiry), a non-event: no event log, no user mention.
+     `deleted` from ANY other folder → mail vanished without passing
+     through trash; surface it to the user (server rule? another client?)
+     and log a manual `trash` event only if the user confirms intent.
+   - `flag_changed` entries → compare `old_flags`/`new_flags`: log a
+     manual event (`final_action=flag`, `decided_by=manual`) **only when
+     `\Flagged` itself changed** (set or cleared). Deltas in `\Seen` or
+     other flags are read-churn, not decisions — never log them (a single
+     external mark-all-read once produced 460 would-be events).
    - `new` entries whose folder is the account's Sent folder → a manual
      *reply* event (`final_action=reply`, `decided_by=manual`); resolve
      `sender_addr` via `$THR show --account <acct> --message-id <id>` and

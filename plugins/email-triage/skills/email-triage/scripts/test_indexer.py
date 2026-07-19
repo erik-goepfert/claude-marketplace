@@ -246,6 +246,8 @@ class IndexerTest(unittest.TestCase):
         self.assertEqual(fc["message_id"], "m1@example.com")
         self.assertEqual(fc["account"], "icloud")
         self.assertEqual(fc["folder"], "INBOX")
+        self.assertEqual(fc["old_flags"], ["Seen"])
+        self.assertEqual(fc["new_flags"], ["Flagged", "Seen"])
 
         self.assertEqual(len(report3["moved"]), 1)
         mv = report3["moved"][0]
