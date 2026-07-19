@@ -774,13 +774,19 @@ still pending.
 
 Execute top-down; each independently committable.
 
-- [ ] **5.1 Content access — `$THR read`.** Raw-file-backed (index
+**Phase 5 executed to completion 2026-07-18** (commits 57b2aa6 [5.1+5.3
+scripts], 07a1eaf [5.2], 65efe12 [5.3 prose+5.8, +5.1 prose], 32901ca
+[5.4], 4c0a7d7 [5.5], d050029 [5.7], 8652282 [5.6]). All test suites
+green (indexer 22, threads 16+7, act 6, unsub 12, batch 7, history 3).
+Plugin cache refreshed after the final commit.
+
+- [x] **5.1 Content access — `$THR read`.** Raw-file-backed (index
       `maildir_file` → RFC822 → email module): headers + text/plain body,
       `--html-text` for tag-stripped HTML. Kills the dominant friction
       class (unstable himalaya-local ids + lossy rendering + \Seen risk);
       \Seen-safe by construction. Replaces the himalaya read path for all
       content purposes.
-- [ ] **5.2 Change-report correctness.** Indexer: `flag_changed` entries
+- [x] **5.2 Change-report correctness.** Indexer: `flag_changed` entries
       gain old/new flag sets. SKILL step 6 rules: (a) self-echo exclusion —
       entries matching actions you executed and logged this session are
       your own echo, never manual events (fixes the double-logging
@@ -788,7 +794,7 @@ Execute top-down; each independently committable.
       non-event, from anywhere else = surface to user; (c) manual flag
       events for `\Flagged` deltas ONLY (460 \Seen-churn entries nearly
       poisoned sender_stats).
-- [ ] **5.3 Presentation & consent.**
+- [x] **5.3 Presentation & consent.**
       - Operating rule: deliverables only in a turn's FINAL message (the
         harness collapses mid-turn prose to "Ran N commands"; user missed
         summaries twice). Content requests get content + a full stop, no
@@ -809,12 +815,14 @@ Execute top-down; each independently committable.
         urllib, no cookies/auth, capped redirects, timeout).
         allowed-tools += Bash(*unsub.py*). Native-client-button ranked
         first in guidance when List-Unsubscribe-Post exists.
-- [ ] **5.4 `batch.py`** — act + log-events + index + box-scoped sync in
+- [x] **5.4 `batch.py`** — act + log-events + index + box-scoped sync in
       ONE call, events auto-derived from act results plus per-batch
       category/decided_by context (call-count is the cost unit in a
       model-driven loop; 12+ four-call cycles last session). Hand-written
       event JSON becomes the exception, not the norm.
-- [ ] **5.5 Interaction patterns into the DB.** Promote per-sender
+- [x] **5.5 Interaction patterns into the DB.** (Outcome: history.py
+      `add-rule`/`set-rule`/`add-contact`; rule actions may be interaction
+      patterns; declined-unsubscribe = notes convention.) Promote per-sender
       dispositions (priority-contact, summarize-then-delete,
       scan-then-trash) from prose session notes into `contacts`/`rules`
       (rule vocabulary extends from actions to interaction patterns);
@@ -823,10 +831,16 @@ Execute top-down; each independently committable.
       analytics later demand it). Fixes the learning loop's blind spot:
       sender stats can't distinguish "noise I clear" from "content I
       consume then clear."
-- [ ] **5.6 SKILL split:** ~250-line operational spine + on-demand
+- [x] **5.6 SKILL split:** ~250-line operational spine + on-demand
       `reference.md` (quirks, JSON shapes, PARA, analytics). At 646 lines
-      the file is all load-bearing but past its ceiling.
-- [ ] **5.7 Small cleanups:** trash/junk siblings never trigger
+      the file is all load-bearing but past its ceiling. (Outcome: the
+      file had grown to 822 lines by execution time; landed as a 505-line
+      spine — every rule/command/trap kept, which set the floor above the
+      ~250 estimate — plus 180-line reference.md; token-level loss audit
+      clean.)
+- [x] **5.7 Small cleanups:** (Outcome: all landed; ZZZ-Skilltest artifact
+      deleted from [Gmail]/Trash live — verified sole \Deleted message,
+      then expunged.) trash/junk siblings never trigger
       reconciliation; thread-unit moves never touch trash/junk members
       (mega-thread reality); Stage-1 syncs are SEQUENTIAL; \Seen-marking
       exception en route to trash; priority scan modulated by sender
@@ -836,7 +850,7 @@ Execute top-down; each independently committable.
       mbsync-ready box strings; delete the leftover flagged ZZZ-Skilltest
       artifact in [Gmail]/Trash; waiting-threads-in-priority-scan
       clarified (unseen security interrupt allowed, still no proposal).
-- [ ] **5.8 The batch board loop (user request, 2026-07-18).** When a
+- [x] **5.8 The batch board loop (user request, 2026-07-18).** When a
       category batch starts, it stays the active context until empty or
       the user explicitly redirects: after each resolved sub-batch,
       re-present the SAME numbered board minus resolved items — count in
