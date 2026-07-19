@@ -662,7 +662,10 @@ def cmd_list(args: argparse.Namespace) -> None:
                     subject_q in (m["subject"] or "").lower() for m in mlist
                 ):
                     continue
-                thread_obj, sort_date = build_thread_object(account, mlist)
+                if args.compact:
+                    thread_obj, sort_date = compact_thread_object(account, mlist)
+                else:
+                    thread_obj, sort_date = build_thread_object(account, mlist)
                 result.append((thread_obj, sort_date))
 
         # (account asc, newest date desc): stable-sort by date desc first,
@@ -673,6 +676,45 @@ def cmd_list(args: argparse.Namespace) -> None:
         print(json.dumps([t for t, _ in result], indent=2, sort_keys=True))
     finally:
         conn.close()
+
+
+def compact_thread_object(account: str, mlist: list):
+    """Classification-sized thread summary (5.11): everything the triage
+    breakdown, priority scan, and reconciliation check need, WITHOUT the
+    full members array. A full `list` over a busy mailbox overflows the
+    tool-result budget and the dump gets poked at with ad-hoc shell — the
+    exact anti-pattern the member dump was already known for. Full member
+    lists come from `show` (or non-compact `list`), needed only when
+    acting on a multi-message thread or building reply References."""
+    state, inactive_days = compute_state(mlist)
+    # Priority-scan scope: the chronologically latest non-trash/junk
+    # member (same rule the SKILL states); its flags carry Seen.
+    eligible = [m for m in mlist if m["tier"] not in HISTORY_TIERS]
+    newest = latest_dated(eligible) or latest_dated(mlist)
+    if newest is None:
+        newest = sorted(mlist, key=lambda m: m["message_id"])[0]
+    obj = {
+        "account": account,
+        "root_message_id": thread_root_id(mlist),
+        "state": state,
+        "drafted": compute_drafted(mlist),
+        "inactive_days": inactive_days,
+        "member_count": len(mlist),
+        "subject": normalize_subject(newest["subject"]),
+        # spanning untriaged + ongoing/cold here IS the reconciliation
+        # signal; trash/junk presence answers the never-count-as-resolved
+        # rule without a second query.
+        "tiers_present": sorted({m["tier"] for m in mlist}),
+        "latest": {
+            "message_id": newest["message_id"],
+            "folder": newest["folder"],
+            "folder_tier": newest["tier"],
+            "date_utc": newest["date_utc"],
+            "from_addr": newest["from_addr"],
+            "flags": newest["flags"],
+        },
+    }
+    return obj, (newest.get("date_utc") or "")
 
 
 def cmd_residue(args: argparse.Namespace) -> None:
@@ -792,6 +834,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="subject_contains",
         help="only threads where some member's subject contains this "
              "(case-insensitive substring)",
+    )
+    list_p.add_argument(
+        "--compact", action="store_true",
+        help="classification-sized summaries (no members array): state, "
+             "drafted, tiers_present, latest member. The default for "
+             "session-start assembly; full output only when member-level "
+             "detail is needed",
     )
     list_p.set_defaults(func=cmd_list)
 

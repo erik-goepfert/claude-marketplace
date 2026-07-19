@@ -65,6 +65,12 @@ The scripts live in this skill's `scripts/` directory. In this document,
 - If direct execution fails with permission denied, that's a broken
   install (missing exec bit) to surface to the user — never route
   around it with wrappers.
+- **Oversized tool results:** when the harness saves a big output to a
+  `tool-results` file, inspect it with the **Read tool** — never
+  `python3 -c`/`jq`/ad-hoc shell (arbitrary code is unwhitelistable and
+  prompts, 5.11). Better: don't produce the dump — `$THR list
+  --compact` for assembly, `--sender`/`--subject-contains` for lookups,
+  `$THR show` for one thread.
 
 - `config.yaml` (in the data dir) — schema v2: per-account `tiers:` map
   realizing each canonical tier CONCEPT as this account's folder name,
@@ -198,10 +204,15 @@ The scripts live in this skill's `scripts/` directory. In this document,
    - `parse_errors` > 0 → surface, don't drop.
    - `unrecognized_folders` → surface as audit debt + session note; don't
      infer.
-5. **Assemble threads.** `$THR list` — default tiers
-   `untriaged`+`active`; full member list always returned (this is what
-   makes reconciliation detectable). Each thread carries `state` and
-   `drafted` (object shape: reference §JSON).
+5. **Assemble threads.** `$THR list --compact` — default tiers
+   `untriaged`+`active`; per-thread summaries carrying everything
+   classification needs: `state`, `drafted`, `tiers_present` (spanning
+   untriaged + a resolved tier here IS the reconciliation signal) and
+   `latest` (the newest non-trash/junk member — the priority scan's
+   scope). **Always `--compact` for session assembly** — the full-member
+   dump over a busy mailbox overflows the tool-result budget into a
+   saved file (5.11). Full members come from `$THR show` per thread,
+   only when needed (object shapes: reference §JSON).
 6. **Priority scan → breakdown → classify-first, easiest-first** (see
    Triage). **Before the FIRST act batch: verify Stage 2 is done** —
    `$SES check-fullsync` (exit 0 = marker present; exit 1 includes the
@@ -270,8 +281,9 @@ Classify from thread data + history (`sender_stats`, `contacts`, `rules`)
   are trashed noise gets a fresh decision, not gravity toward Trash.
 
 **Priority scan — before the breakdown, every session.** Scope: **unseen
-only** — the thread's latest non-trash/junk member lacks `"Seen"` (already
-in `$THR list` output; works because rule 5 keeps `\Seen` honest). Flag:
+only** — the thread's latest non-trash/junk member lacks `"Seen"` (the
+compact list's `latest.flags`, no extra read; works because rule 5 keeps
+`\Seen` honest). Flag:
 security notifications (new sign-in/device/key/password/MFA changes,
 suspicious activity); financial/time-boxed items (suspicious charge,
 payment method change, expiration); urgent/deadline-bound framing.
@@ -365,11 +377,15 @@ Then, for everything else:
 `$THR` builds threads from the index's Message-ID/In-Reply-To/References
 graph plus a guarded subject fallback, and derives state directly.
 
-- `$THR list [--account a] [--tier t ...] [--sender substr]
-  [--subject-contains substr]` — use the filters to answer "which thread
-  is X" directly; never dump-and-refilter with ad-hoc python.
+- `$THR list [--compact] [--account a] [--tier t ...] [--sender substr]
+  [--subject-contains substr]` — `--compact` for session assembly and
+  any broad listing; use the filters to answer "which thread is X"
+  directly; never dump-and-refilter with ad-hoc python.
 - `$THR show --account <acct> --message-id <id>` — the full
-  thread containing a message, any tier.
+  thread containing a message, any tier. **Before acting on a
+  multi-member thread, pull its members here** — compact output carries
+  only the latest member, and batch items need each member's
+  message_id + from_folder.
 - `$THR residue` — end-of-session leftovers check (step 7).
 - A thread's messages live in one tier location at a time (system folders
   excepted — Sent copies never move). **Threads never move to Inbox.**

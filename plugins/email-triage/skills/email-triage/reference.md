@@ -82,6 +82,14 @@ oldest→newest — each member: `message_id`, `folder`, `folder_tier`,
 `date_utc`, `from_addr`, `subject`, `flags`, `is_flagged`. Message-ids
 are the index's bare form (no angle brackets).
 
+**`$THR list --compact` thread object (5.11):** `account`,
+`root_message_id`, `state`, `drafted`, `inactive_days`, `member_count`,
+`subject`, `tiers_present[]` (all member tiers — untriaged + ongoing/cold
+spanning = reconciliation signal), `latest` (`message_id`, `folder`,
+`folder_tier`, `date_utc`, `from_addr`, `flags` — the newest
+non-trash/junk member; its flags drive the priority-scan unseen check).
+No `members[]`.
+
 **`$THR residue`:** `{"residue": [{account, root_message_id, state,
 drafted, subject, from_addr, date_utc, residual_count, folders}],
 "threads": N, "messages": N}`.

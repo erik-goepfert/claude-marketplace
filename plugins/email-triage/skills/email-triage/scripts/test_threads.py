@@ -76,6 +76,8 @@ class ThreadsTestCase(unittest.TestCase):
             argv += ["--account", a]
         for t in kwargs.pop("tier", []) or []:
             argv += ["--tier", t]
+        if kwargs.pop("compact", False):
+            argv += ["--compact"]
         assert not kwargs
         parser = threads.build_parser()
         args = parser.parse_args(argv)
@@ -327,6 +329,37 @@ class ThreadsTestCase(unittest.TestCase):
         result = self.run_list(tier=["untriaged"])
         self.assertEqual(len(result), 1)
         self.assertFalse(result[0]["drafted"])
+
+    # --compact (5.11): classification-sized list output.
+    def test_compact_list_carries_scan_and_reconciliation_signals(self):
+        # Filed thread with a fresh unseen Inbox arrival: compact output
+        # must expose the reconciliation span (tiers_present) and the
+        # priority-scan scope (latest member's flags) without members[].
+        self.insert(message_id="A", folder="Archive/Trip", folder_tier="cold", account="ic",
+                    subject="Booking", from_addr="hotel@x.com", to_addr="me@x.com",
+                    date_utc=days_ago(9), flags=["Seen"])
+        self.insert(message_id="B", folder="INBOX", folder_tier="untriaged", account="ic",
+                    in_reply_to="A", subject="Re: Booking", from_addr="hotel@x.com",
+                    to_addr="me@x.com", date_utc=days_ago(1), flags=[])
+        (t,) = self.run_list(compact=True)
+        self.assertNotIn("members", t)
+        self.assertEqual(t["tiers_present"], ["cold", "untriaged"])
+        self.assertEqual(t["member_count"], 2)
+        self.assertEqual(t["latest"]["message_id"], "B")
+        self.assertEqual(t["latest"]["folder_tier"], "untriaged")
+        self.assertEqual(t["latest"]["flags"], [])  # unseen -> scan-eligible
+        self.assertEqual(t["state"], "holding")
+        self.assertFalse(t["drafted"])
+
+    def test_compact_latest_skips_trash_members(self):
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
+                    subject="Offer", from_addr="shop@x.com", date_utc=days_ago(5),
+                    flags=["Seen"])
+        self.insert(message_id="B", folder="Trash", folder_tier="trash", account="ic",
+                    in_reply_to="A", subject="Re: Offer", from_addr="shop@x.com",
+                    date_utc=days_ago(1))
+        (t,) = self.run_list(compact=True)
+        self.assertEqual(t["latest"]["message_id"], "A")  # trash never the scan target
 
     # residue (5.7): compact end-of-session leftovers check.
     def test_residue_lists_only_untriaged_leftovers(self):

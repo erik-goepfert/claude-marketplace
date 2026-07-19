@@ -895,6 +895,16 @@ Plugin cache refreshed after the final commit.
       `~/.claude/settings.json` (documented semantics, like the existing
       himalaya rule) — USER adds these; the agent is guardrail-blocked
       from widening its own permissions.
+- [x] **5.11 Compact thread listing (2026-07-19, third startup prompt).**
+      A full `$THR list` over a busy mailbox overflowed the tool-result
+      budget into a saved file, which the session then inspected with
+      `python3 -c` (unwhitelistable → prompt). `threads.py list
+      --compact`: per-thread summaries (state/drafted/tiers_present/
+      latest member) sized for classification — reconciliation signal
+      and priority-scan scope included, no members[]. SKILL: compact is
+      THE session-assembly form; `$THR show` before acting on
+      multi-member threads; oversized tool-results files are inspected
+      with the Read tool, never ad-hoc shell. 2 tests.
 
 ---
 
