@@ -767,3 +767,83 @@ still pending.
   ("Areas/…", "[Gmail]/…") is either doing the classifier's job in the
   wrong place or hardcoding one user's mailbox; the 2026-07-16 audit
   found both kinds in the indexer, and 4.2 removes them.
+
+---
+
+## Phase 5 — Post-review hardening (designed 2026-07-18 from the second live session's notes + full review; see `email-triage-notes.md` / `email-triage-skill-review.md`)
+
+Execute top-down; each independently committable.
+
+- [ ] **5.1 Content access — `$THR read`.** Raw-file-backed (index
+      `maildir_file` → RFC822 → email module): headers + text/plain body,
+      `--html-text` for tag-stripped HTML. Kills the dominant friction
+      class (unstable himalaya-local ids + lossy rendering + \Seen risk);
+      \Seen-safe by construction. Replaces the himalaya read path for all
+      content purposes.
+- [ ] **5.2 Change-report correctness.** Indexer: `flag_changed` entries
+      gain old/new flag sets. SKILL step 6 rules: (a) self-echo exclusion —
+      entries matching actions you executed and logged this session are
+      your own echo, never manual events (fixes the double-logging
+      contradiction); (b) `deleted` handling — from trash/junk = auto-purge
+      non-event, from anywhere else = surface to user; (c) manual flag
+      events for `\Flagged` deltas ONLY (460 \Seen-churn entries nearly
+      poisoned sender_stats).
+- [ ] **5.3 Presentation & consent.**
+      - Operating rule: deliverables only in a turn's FINAL message (the
+        harness collapses mid-turn prose to "Ran N commands"; user missed
+        summaries twice). Content requests get content + a full stop, no
+        chained actions.
+      - Link formatting: bare full URL on its own line (markdown links are
+        NOT clickable in this user's terminal — the previous rule
+        universalized one environment's fix). Environment preference, not
+        doctrine.
+      - Rule 4 carve-out: unsubscribe links surfaced by default; EXECUTED
+        only on the user's explicit request, never autonomously.
+      - `unsub.py`: `links` (raw-file extraction: List-Unsubscribe +
+        -Post, body anchors incl. image-button alt text; replaces the
+        failed grep recipe) and `exec` (consent-gated: RFC 8058 POST
+        preferred — same op as the mail client's native button, silent
+        2xx = success; GET fallback with --url that MUST re-match the
+        message's own extracted links — provenance enforced at fire time;
+        mailto reported but routed through the normal send gate; stdlib
+        urllib, no cookies/auth, capped redirects, timeout).
+        allowed-tools += Bash(*unsub.py*). Native-client-button ranked
+        first in guidance when List-Unsubscribe-Post exists.
+- [ ] **5.4 `batch.py`** — act + log-events + index + box-scoped sync in
+      ONE call, events auto-derived from act results plus per-batch
+      category/decided_by context (call-count is the cost unit in a
+      model-driven loop; 12+ four-call cycles last session). Hand-written
+      event JSON becomes the exception, not the norm.
+- [ ] **5.5 Interaction patterns into the DB.** Promote per-sender
+      dispositions (priority-contact, summarize-then-delete,
+      scan-then-trash) from prose session notes into `contacts`/`rules`
+      (rule vocabulary extends from actions to interaction patterns);
+      `$HIST context` already surfaces both tables. "Declined unsubscribe"
+      = soft dampening signal via notes convention (schema only if
+      analytics later demand it). Fixes the learning loop's blind spot:
+      sender stats can't distinguish "noise I clear" from "content I
+      consume then clear."
+- [ ] **5.6 SKILL split:** ~250-line operational spine + on-demand
+      `reference.md` (quirks, JSON shapes, PARA, analytics). At 646 lines
+      the file is all load-bearing but past its ceiling.
+- [ ] **5.7 Small cleanups:** trash/junk siblings never trigger
+      reconciliation; thread-unit moves never touch trash/junk members
+      (mega-thread reality); Stage-1 syncs are SEQUENTIAL; \Seen-marking
+      exception en route to trash; priority scan modulated by sender
+      history (deflating context, not interrupt) and logs the TRUE
+      category with the scan hit in notes; `$THR residue` subcommand +
+      explicit end-of-session residue step; `priority-folders` emits
+      mbsync-ready box strings; delete the leftover flagged ZZZ-Skilltest
+      artifact in [Gmail]/Trash; waiting-threads-in-priority-scan
+      clarified (unseen security interrupt allowed, still no proposal).
+- [ ] **5.8 The batch board loop (user request, 2026-07-18).** When a
+      category batch starts, it stays the active context until empty or
+      the user explicitly redirects: after each resolved sub-batch,
+      re-present the SAME numbered board minus resolved items — count in
+      the header, per-item annotations preserved (recidivist / borderline
+      / new sender), pipeline footer ("Then: newsletters (8) → passive
+      (~34) → ..."). Never end a sub-batch with an open-ended "what
+      next?" — the re-presented board IS the next prompt. (Transcript-
+      verified format from the 2026-07-18 session, requested live:
+      "repeat that initial message minus the ones we've dealt with until
+      we've cleared them all.")
