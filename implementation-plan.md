@@ -984,3 +984,14 @@ Tasks (draft — firm up after Phase 6):
       session-end chain, history/notes — app-managed, engine-logged.
       Then a real A/B week: same mailbox, alternating frontends; fold
       what the TUI teaches back into the shared engine.
+- [ ] **7.6 Packaging consideration (noted 2026-07-19, from the
+      PATH/exec-bit discussion).** In-skill sessions stay on
+      `$VAR`s/`${CLAUDE_SKILL_DIR}` — version-correct, self-contained,
+      no PATH pollution (script names like session.py/batch.py are far
+      too generic for the global PATH, and PATH would silently pick one
+      of repo-vs-cache). But once multiple consumers exist (TUI, launchd
+      backup/pre-classification jobs), package the scripts as a proper
+      CLI: pyproject.toml with prefixed entry points
+      (`email-triage-session`, `email-triage-batch`, ...) installed via
+      `uv tool install`/pipx — unique names, versioned installs, callable
+      from any shell. The skill keeps its `$VAR` convention regardless.
