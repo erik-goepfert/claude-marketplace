@@ -55,6 +55,35 @@ class HistoryCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("no rule with id 99", proc.stderr)
 
+    def test_declined_unsubs_counted_in_sender_stats(self):
+        # Two declines + one unrelated trash for the same sender: the
+        # assume-unsubscribe policy's threshold counter must read 2.
+        for notes in ("declined-unsubscribe", "declined-unsubscribe; keeps reading", None):
+            args = ["log-event", "--session", "2026-07-19T00:00:00Z",
+                    "--sender", "News@Example.com", "--category", "newsletter",
+                    "--proposed", "trash", "--final", "skip",
+                    "--decided-by", "override"]
+            if notes:
+                args += ["--notes", notes]
+            self.hist(*args)
+        (s,) = json.loads(self.hist("context"))["sender_stats"]
+        self.assertEqual(s["sender_addr"], "news@example.com")
+        self.assertEqual(s["declined_unsubs"], 2)
+
+    def test_migration_recreates_old_view_with_declined_unsubs(self):
+        import sqlite3
+        db = self.tmp / "history.db"
+        conn = sqlite3.connect(db)
+        conn.execute("DROP VIEW sender_stats")
+        conn.execute("CREATE VIEW sender_stats AS SELECT sender_addr FROM events GROUP BY sender_addr")
+        conn.commit()
+        conn.close()
+        self.run_ok(str(SCRIPTS / "init_history_db.py"), "--data-dir", str(self.tmp))
+        conn = sqlite3.connect(db)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sender_stats)")}
+        conn.close()
+        self.assertIn("declined_unsubs", cols)
+
     def test_add_contact_upsert_preserves_unset_fields(self):
         self.hist("add-contact", "Dad@Example.com",
                   "--relation", "dad", "--vip", "1")

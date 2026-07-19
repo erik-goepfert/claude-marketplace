@@ -92,9 +92,11 @@ BATCH="${CLAUDE_SKILL_DIR}/scripts/batch.py"
    user's explicit request, never autonomously.** Extract and present
    freely. When — and only when — the user explicitly asks ("unsubscribe
    me from these"), execute via `$UNSUB exec` (Triage step 5); a batch
-   request covers each message in it. Never fetch, click, or probe a link
-   on your own initiative; never execute a `mailto:` unsubscribe — that
-   is a send, gated by rule 1.
+   request covers each message in it, and **approving a board whose
+   proposed plan includes unsubscribing IS that request** (the
+   assume-unsubscribe default, step 5). Never fetch, click, or probe a
+   link on your own initiative; never execute a `mailto:` unsubscribe —
+   that is a send, gated by rule 1.
 5. **`\Seen` is the user's signal — your own reads must never move it.**
    A message counts as read only once the user has been shown its content
    or a representative summary.
@@ -233,6 +235,13 @@ Classify from thread data + history (`sender_stats`, `contacts`, `rules`)
   discarded, with staleness as nudge material.
 - **Content category:** `spam-noise` | `marketing` | `newsletter` |
   `passive-update` | `ambiguous` | `actionable`.
+  **Unsubscribable ⇒ noise, by default (user policy, 2026-07-19):** bulk
+  mail with unsubscribe affordances classifies into the noise tiers and
+  gets the assume-unsubscribe treatment (step 5) — however
+  newsletter-ish the content looks — until the sender crosses the
+  decline threshold: `sender_stats.declined_unsubs >= 2` graduates them
+  to at least `newsletter` (a consume tier), and unsubscribe stops being
+  proposed. The decline count decides content quality; you don't.
 - **Current tier frames the decision.** An untriaged thread needs the full
   3-way disposition (stay open / resolve / discard). A thread already in
   `active` just needs flag maintenance — it's already filed.
@@ -291,26 +300,37 @@ Then, for everything else:
    If resolving ambiguity means showing the user the content, mark read at
    that point (himalaya path; resolve the local id fresh — reference
    §Quirks): `himalaya flag add -a <acct>-local -f <folder> <id> seen`
-5. **Unsubscribe.** Extraction is one call:
+5. **Unsubscribe — assume-out by default (user policy, 2026-07-19).**
+   Assume the user wants to unsubscribe: for noise-board senders below
+   the decline threshold, the board's default proposed disposition is
+   **unsubscribe + trash** — don't ask "unsubscribe too?"; propose it and
+   let the user pull out senders they want to keep. Check
+   `sender_stats.declined_unsubs` (in `$HIST context`) per sender first:
+   at **2+ declines the sender has graduated** — at least `newsletter`,
+   no unsubscribe proposal (re-offer only if their handling changes:
+   reading stops, bulk-trashing starts).
+   Extraction is one call:
    `$UNSUB links --db "$IDXDB" --maildir "$MAILDIR/<acct>" --account
    <acct> --message-id <id>` — headers + body anchors, ranked. Present
    the **body link as primary** for hand-clicking (header links are built
    for automated POSTs and often fail humans), full bare URL on its own
    line (rule 6). When `List-Unsubscribe-Post` exists, rank the **native
    unsubscribe button in the user's mail client first** — same RFC 8058
-   POST, zero copy-paste. Executing (rule 4 — explicit request only):
+   POST, zero copy-paste. Executing (rule 4 — board approval of a plan
+   that includes unsubscribing counts as the explicit request):
    `$UNSUB exec ... [--url <link>] [--dry-run]` (details: reference
-   §JSON). Ask ("unsubscribe too, or just clear this one?") and log via
-   `--unsubscribed`; a batch answer applies to the whole batch.
+   §JSON). Log confirmations via `--unsubscribed`; a batch answer applies
+   to the whole batch.
    **A confirmed unsubscribe is also trash approval** (user rule):
    "I've unsubscribed" — or a completed `$UNSUB exec` they requested —
    authorizes trashing the associated messages without a separate ask;
    log `final_action=trash, decided_by=approved, --unsubscribed`. Only
    those messages, nothing wider.
-   **A declined unsubscribe is a dampening signal:** put
-   `declined-unsubscribe` in that event's `--notes`; don't re-offer for
-   that sender unless their handling changes (reading stops,
-   bulk-trashing starts).
+   **Every decline feeds the threshold counter:** when the user keeps a
+   sender the board proposed unsubscribing from, log that event with
+   `declined-unsubscribe` in `--notes` — verbatim, that exact token; it
+   is what `sender_stats.declined_unsubs` counts. One decline dampens
+   nothing yet; the second graduates the sender out of the noise tiers.
 6. **Noise escalation — when unsubscribe isn't possible:** (1)
    unsubscribe if possible; (2) else **propose a server-side filter** —
    draft the exact match expression, action, and carve-outs for the user

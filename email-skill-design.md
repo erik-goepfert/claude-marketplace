@@ -583,6 +583,8 @@ SELECT sender_addr,
        AVG(final_action = 'trash') FILTER (WHERE final_action != 'skip') AS trash_rate,
        AVG(decided_by = 'override') FILTER (WHERE decided_by != 'manual')
                                            AS override_rate,  -- over Claude's proposals only
+       SUM(notes LIKE '%declined-unsubscribe%')
+                                           AS declined_unsubs, -- assume-unsubscribe threshold (2026-07-19)
        MAX(occurred_at)                    AS last_seen_at
 FROM events GROUP BY sender_addr;
 ```
@@ -695,6 +697,26 @@ stated in live sessions were evaporating into prose session notes. CLI:
 facts only). "Declined unsubscribe" is a soft dampening signal recorded
 as an events `notes` convention (`declined-unsubscribe`), not schema —
 schema only if analytics later demand it.
+
+**Amendment (2026-07-19, user policy): assume-unsubscribe with a
+2-decline graduation threshold.** The default posture inverts: assume
+the user wants out of anything unsubscribable. Unsubscribable bulk mail
+is classified and treated as noise — the board's default proposed
+disposition is unsubscribe + trash, however newsletter-ish the content
+looks — until the user has declined unsubscribing from that sender **2+
+times**. At the threshold the sender graduates to at least the
+`newsletter` tier (content they consume) and unsubscribe stops being
+proposed. The counter is `sender_stats.declined_unsubs`, derived from
+the existing `declined-unsubscribe` notes convention (the "schema only
+if analytics later demand it" line above was answered the same day: a
+policy demanded it, and it landed as a view column — still derived,
+never asserted). Rationale: the previous flow asked "unsubscribe too?"
+per sender, spending a user round-trip to learn what two declines teach
+for free, and it let Claude's content-quality judgment decide what
+counts as a keeper newsletter when the user's own decline history is
+the better signal. Board approval of a plan that includes unsubscribing
+satisfies §4's execution consent (the request is explicit — it's in the
+approved plan).
 
 ### Analytics access
 

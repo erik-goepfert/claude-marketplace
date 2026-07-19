@@ -70,6 +70,11 @@ SELECT sender_addr,
        AVG(final_action = 'trash') FILTER (WHERE final_action != 'skip') AS trash_rate,
        AVG(decided_by = 'override') FILTER (WHERE decided_by != 'manual')
                                            AS override_rate,
+       -- Counted from the 5.5 notes convention. Feeds the assume-unsubscribe
+       -- policy (user, 2026-07-19): unsubscribable mail is noise until the
+       -- user has declined that sender 2+ times; at the threshold the sender
+       -- graduates to newsletter-or-above and unsubscribe stops being proposed.
+       SUM(notes LIKE '%declined-unsubscribe%') AS declined_unsubs,
        MAX(occurred_at)                    AS last_seen_at
 FROM events GROUP BY sender_addr;
 """
@@ -80,6 +85,11 @@ def migrate(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
     if "unsubscribed" not in cols:
         conn.execute("ALTER TABLE events ADD COLUMN unsubscribed INTEGER NOT NULL DEFAULT 0")
+    view_cols = {row[1] for row in conn.execute("PRAGMA table_info(sender_stats)")}
+    if view_cols and "declined_unsubs" not in view_cols:
+        # Views can't ALTER; drop and let the SCHEMA block recreate it.
+        conn.execute("DROP VIEW sender_stats")
+        conn.executescript(SCHEMA)
 
 
 def main() -> None:

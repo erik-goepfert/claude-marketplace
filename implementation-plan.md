@@ -822,7 +822,12 @@ Plugin cache refreshed after the final commit.
       event JSON becomes the exception, not the norm.
 - [x] **5.5 Interaction patterns into the DB.** (Outcome: history.py
       `add-rule`/`set-rule`/`add-contact`; rule actions may be interaction
-      patterns; declined-unsubscribe = notes convention.) Promote per-sender
+      patterns; declined-unsubscribe = notes convention. Upgraded
+      2026-07-19 by user policy: **assume-unsubscribe** — unsubscribable
+      mail is noise by default, proposed unsubscribe+trash, until 2+
+      declines graduate the sender to newsletter-or-above; counter =
+      `sender_stats.declined_unsubs` view column over the same notes
+      convention, live DB migrated.) Promote per-sender
       dispositions (priority-contact, summarize-then-delete,
       scan-then-trash) from prose session notes into `contacts`/`rules`
       (rule vocabulary extends from actions to interaction patterns);
