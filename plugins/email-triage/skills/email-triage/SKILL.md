@@ -46,6 +46,15 @@ allowed-tools and interrupts the user with permission prompts. If a new
 every-session step appears, add it to a script (session.py is the home
 for lifecycle glue) rather than typing shell for it.
 
+**Run the scripts directly, through their `$VAR`s** — `$SES start`,
+`$THR list`, `$BATCH run` — they are executable with shebangs. Don't
+wrap them (`uv run`, `python3` prefixes) and don't substitute literal
+filesystem paths for `${CLAUDE_SKILL_DIR}`: a literal path bypasses the
+installed plugin and breaks on any other machine. If direct execution
+ever fails with permission denied, that's a broken install to surface to
+the user, not something to route around. Sole exception: analytics.py
+REQUIRES `uv run "$ANA" ...` (PEP 723 self-provisioned duckdb).
+
 - `config.yaml` (in `$DATA`) — schema v2: per-account `tiers:` map
   realizing each canonical tier CONCEPT as this account's folder name,
   plus `maildir_path` and the `server_rules` registry. **Read it at
