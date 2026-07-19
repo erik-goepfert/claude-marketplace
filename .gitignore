@@ -23,6 +23,6 @@ yarn-error.log
 __pycache__/
 *.pyc
 
-# Session reviews/notes contain personal mail metadata — never commit
-email-triage-notes.md
-email-triage-skill-review.md
+# Near-the-code scratch space that must never be committed (session
+# reviews/notes with personal mail metadata, local experiments, etc.)
+gitignored/
