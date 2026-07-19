@@ -734,6 +734,18 @@ unsubscribing is always a manual act the user confirms. This supersedes
 the 2026-07-16 "body link as primary" guidance, which was written for a
 hand-clicking-only world.
 
+**Second refinement (2026-07-19, user): unsubscribe-exempt channels.**
+An active rule outranks both the assume-unsubscribe default and the
+decline threshold. Some senders bundle indispensable signals with their
+noise on one subscription (Credit Karma: unsubscribing is synonymous
+with turning the service's alerts off — new credit lines, significant
+score changes). The rule action vocabulary gains `unsubscribe-exempt`:
+never propose unsubscribing, scan each mail for the important content,
+trash the engagement promos. First live rules were promoted from prose
+session notes into the rules table the same day (CK, Waking Up
+summarize-then-trash, priority-contact as a contacts row) — the 5.5
+machinery doing what it was built for.
+
 ### Analytics access
 
 For richer analysis than SQLite comfortably expresses (windowed trends, "triage

@@ -338,6 +338,15 @@ Then, for everything else:
    at **2+ declines the sender has graduated** — at least `newsletter`,
    no unsubscribe proposal (re-offer only if their handling changes:
    reading stops, bulk-trashing starts).
+   **An active rule outranks all of this.** Some senders are
+   **unsubscribe-exempt**: the same channel carries both noise and
+   signals the user must not lose, and unsubscribing kills both (e.g.
+   Credit Karma — leaving means no more new-credit-line or score-change
+   alerts; "can't unsubscribe" means *won't*, deliberately). For a
+   sender whose rule says `unsubscribe-exempt` / `scan-then-trash`:
+   never propose unsubscribe, ignore the decline counter, scan each mail
+   for the important content the channel exists for, and trash the
+   generic engagement promos.
    Extraction is one call:
    `$UNSUB links --account <acct> --message-id <id>` — its `recommended`
    object is the whole policy (automated vs manual, user rule
