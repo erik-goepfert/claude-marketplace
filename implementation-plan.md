@@ -770,7 +770,7 @@ still pending.
 
 ---
 
-## Phase 5 — Post-review hardening (designed 2026-07-18 from the second live session's notes + full review; see `email-triage-notes.md` / `email-triage-skill-review.md`)
+## Phase 5 — Post-review hardening (designed 2026-07-18 from the second live session's notes + full review; relocated to `~/.local/share/email-triage/reviews/` — personal mail metadata, kept out of the repo; deletable once Phases 5–6 close)
 
 Execute top-down; each independently committable.
 
