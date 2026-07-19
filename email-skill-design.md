@@ -381,6 +381,22 @@ Notes:
 - Reads history context (recent session notes, rules, sender stats) at session
   start; logs every decision and noteworthy observation as it goes (§9).
 
+**Amendment (2026-07-19, Phase 7 decision): the skill session is one of
+two planned frontends over the same engine.** The user decided on both
+interaction models: (a) the freeform Claude Code session (this section) —
+conversational, fastest to iterate; and (b) a TUI app with a Claude Agent
+SDK streaming session as the engine, where presentation inverts from
+prose to custom tool calls (`present_board`, `request_approval`, ...) the
+TUI renders, and the §4 approval gate is enforced structurally via the
+SDK permission callback rather than by prompt discipline. Everything
+below the frontend — config/tier model, scripts, both DBs, sync
+invariants, logging — is shared and must stay frontend-agnostic; rules
+that exist only to survive the Claude Code harness (e.g. the
+final-message discipline) are frontend rules, not engine rules. Sequenced
+after Phase 6, whose winning board format (as a `threads.py board`
+renderer) is the artifact both frontends share. Details:
+implementation-plan.md Phase 7.
+
 ### 7.7 Packaging & installation
 
 - Shipped as a **Claude Code plugin**: a repo with `.claude-plugin/plugin.json`

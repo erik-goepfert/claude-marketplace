@@ -888,3 +888,83 @@ phase designs the LOOK — expected to take live iteration, not one pass.
       only the judgment annotations (recidivist / borderline / new
       sender); pure prose allows more adaptation but drifts. Likely
       hybrid; decide from what the iteration reveals.
+      **Phase 7 note (2026-07-19):** whatever wins, build the renderer as
+      a real `threads.py board` subcommand taking structured input — it
+      is the pivot artifact both frontends share (see Phase 7): Claude
+      Code sessions call it for deterministic boards; the TUI later
+      embeds the same logic as its list widget.
+
+---
+
+## Phase 7 — TUI frontend via the Claude Agent SDK (designed 2026-07-19, user request; sequenced AFTER Phase 6 settles)
+
+**Decision (user, 2026-07-19): both interaction models, same engine.**
+Phase 6 keeps the freeform Claude Code session as-is — it stays the
+fast-iteration, conversational way to run triage. Phase 7 adds a second
+frontend: a dedicated TUI app with an Agent SDK session as the triage
+engine behind it. Nothing in the engine forks: config.yaml, the tier
+model, indexer/threads/batch/unsub/history scripts, history.db, and the
+skill's rules are the shared substrate; the two frontends differ only in
+who owns presentation and how approval is captured.
+
+Architecture sketch (from the 2026-07-19 design discussion):
+
+- **TUI app owns the terminal** (Textual is the working assumption —
+  Python, same language as the scripts; board pane, thread-detail pane,
+  prompt/status line). A free-text lane to the model is designed in from
+  the start, not bolted on — live sessions are full of "wait, what's
+  this thread about" digressions and the TUI must not lose them.
+- **Long-lived Agent SDK streaming session** (`ClaudeSDKClient` shape,
+  not one-shot `query()`) inside the app process. Skill content becomes
+  the system prompt; the Bash tool still drives the existing scripts
+  unchanged.
+- **Presentation inverts from prose to tool calls:** the model gets
+  custom tools — `present_board(items, annotations)`,
+  `request_approval(batch_spec)`, `show_thread(...)`,
+  `update_pipeline(...)` — and stops printing boards. The TUI renders
+  deterministically and returns the user's selections (approve / pull
+  item N / redirect) as structured tool results. The model contributes
+  classification and judgment annotations only.
+- **Approval gate becomes code:** the SDK's permission callback
+  (`canUseTool`) structurally refuses any `batch.py run` / send that
+  wasn't preceded by a confirmed `request_approval` — rule 1 enforced by
+  the harness, not by prompt discipline.
+- **Sync becomes supervised subprocesses** (progress line, retries)
+  instead of nohup chains + marker files.
+- **Headless door:** the same session shape minus the TUI = a scheduled
+  pre-classification run that leaves a filled board waiting in the
+  morning. Explicitly out of scope until the TUI itself works.
+
+What the TUI dissolves (and what stays CC-only): SKILL rule 6
+(final-message discipline) is a Claude Code harness artifact — the TUI
+has no such failure mode; board re-presentation cost (5.8's re-printed
+boards are re-tokenized every sub-batch; the TUI sends deltas); stable
+item numbering (free in a list widget). The costs, eyes-open: it's a
+real application with app code where Phases 0–6 have none; it gives up
+Claude Code's free conversation UI, transcripts, compaction, and plugin
+distribution; iteration is a code cycle, not a SKILL.md edit.
+
+Tasks (draft — firm up after Phase 6):
+
+- [ ] **7.1 Engine/frontend boundary audit.** Read the post-Phase-6
+      SKILL and mark each rule ENGINE (holds in both frontends: tier
+      model, sync invariants, logging, \Seen discipline) or FRONTEND
+      (presentation/consent mechanics that the TUI implements in code:
+      rule 6, board re-presentation, approval phrasing). Deliverable: the
+      system prompt for the SDK session, derived from the spine with
+      frontend-only rules stripped.
+- [ ] **7.2 Walking skeleton.** Textual app + SDK streaming session +
+      ONE custom tool (`present_board`) + the free-text lane. Success:
+      a real session start (two-stage sync, index, threads, priority
+      scan) ending in a rendered board the user can scroll.
+- [ ] **7.3 Approval + acting loop.** `request_approval` tool +
+      `canUseTool` gate wired to `$BATCH run`; resolved items leave the
+      board; sync status line. The 5.8 loop as UI state.
+- [ ] **7.4 Thread detail + reply flow.** `show_thread` pane ($THR
+      read-backed), reply drafting in an editor pane, the three exits
+      (send / save-for-later / discard) as keybindings over the same
+      himalaya recipes.
+- [ ] **7.5 Session lifecycle.** Lock, session stamp, residue check,
+      session-end chain, history/notes — app-managed, engine-logged.
+      Then a real A/B week: same mailbox, alternating frontends; fold
+      what the TUI teaches back into the shared engine.
