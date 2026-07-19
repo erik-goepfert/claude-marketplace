@@ -668,6 +668,18 @@ sender unread — auto-trash rule?"). `origin` records whether a rule was
 user-stated or Claude-proposed; effectiveness is derivable by joining events on
 `rule_id` rather than tracked in the table.
 
+**Amendment (2026-07-18, Phase 5.5):** the rule `action` vocabulary is
+deliberately wider than the event enum — an action may name an *interaction
+pattern* ("summarize-then-trash", "scan-then-trash",
+"surface-immediately"), not just a disposition. This closes the learning
+loop's blind spot: sender stats alone cannot distinguish "noise I clear"
+from "content I consume and then clear," and per-sender dispositions
+stated in live sessions were evaporating into prose session notes. CLI:
+`history.py add-rule / set-rule / add-contact` (contacts upsert asserted
+facts only). "Declined unsubscribe" is a soft dampening signal recorded
+as an events `notes` convention (`declined-unsubscribe`), not schema —
+schema only if analytics later demand it.
+
 ### Analytics access
 
 For richer analysis than SQLite comfortably expresses (windowed trends, "triage

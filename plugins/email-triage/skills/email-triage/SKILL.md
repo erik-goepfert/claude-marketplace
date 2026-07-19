@@ -443,6 +443,13 @@ Then, for everything else:
    specific messages. Log normally
    (`final_action=trash, decided_by=approved, --unsubscribed`). It approves
    only the messages the unsubscribe was about, nothing wider.
+   **A declined unsubscribe is a soft dampening signal (5.5):** if the
+   user declines the offer but still clears the sender's mail, put
+   `declined-unsubscribe` in that event's `--notes`, and don't re-offer
+   for that sender in later sessions (prior events surface via context) —
+   they're consuming the content. Re-offer only if their handling changes
+   (reading stops, bulk-trashing starts). Notes convention only — no
+   schema for it unless analytics later demand one.
 6. **Noise escalation — when unsubscribe isn't possible.** Three-step
    ladder: (1) unsubscribe if possible; (2) when it isn't (or the user
    declines but still wants the mail gone), **propose a server-side filter**
@@ -671,6 +678,28 @@ Skip rules:
   batch is not a decision point — pass over it silently.
 - Threads never reviewed (session abandoned, "skip the rest") are **not
   logged as events**. Leave resume state in a session note instead.
+
+**Interaction patterns are DB facts, not prose (5.5).** When the user
+states a per-sender/per-source disposition — "always surface these
+immediately," "summarize these for me, then toss them," "scan for anything
+odd and trash the rest" — promote it into the DB **the moment it's
+stated**, never just into a session note:
+- Who-someone-is facts → `$HIST add-contact <addr> [--relation "plumber"]
+  [--vip 1] [--notes "..."]` (upsert; asserted facts only — stats stay
+  derived).
+- Repeatable dispositions → `$HIST add-rule --predicate "sender = ..."
+  --action <x> --origin user`. The rule action vocabulary is WIDER than
+  the event enum: alongside plain actions (`trash`), an action may name an
+  interaction pattern — `summarize-then-trash`, `scan-then-trash`,
+  `surface-immediately`. Rules you propose from analytics evidence use
+  `--origin claude-proposed` and are only added after the user approves.
+- Retire with `$HIST set-rule <id> --active 0` when the user reverses.
+
+Why this matters: `$HIST context` surfaces both tables every session, so a
+pattern recorded once frames all future triage — while the same pattern in
+prose notes scrolls away, and sender_stats alone can't distinguish "noise
+I clear" from "content I consume and then clear." The rule records which
+one it is.
 
 Session notes (`session_notes` table) carry resume state, stats context,
 watch items, and `unrecognized_folders`/`parse_errors` audit debt from the

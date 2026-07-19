@@ -165,6 +165,61 @@ def cmd_log_note(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     print("note logged")
 
 
+def cmd_add_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Rules are history turned into behavior (§9). Since 5.5 the action
+    vocabulary is wider than the event enum: alongside plain actions
+    ('trash') an action may name an INTERACTION PATTERN — how to handle the
+    matching mail, e.g. 'summarize-then-trash', 'scan-then-trash',
+    'surface-immediately'. Free text by design; the enum lives on events,
+    not rules."""
+    cur = conn.execute(
+        "INSERT INTO rules (created_at, active, predicate, action, origin) VALUES (?, 1, ?, ?, ?)",
+        (utc_now(), args.predicate, args.action, args.origin),
+    )
+    conn.commit()
+    print(f"rule {cur.lastrowid} added")
+
+
+def cmd_set_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    cur = conn.execute(
+        "UPDATE rules SET active = ? WHERE id = ?",
+        (int(args.active), args.rule_id),
+    )
+    if cur.rowcount == 0:
+        sys.exit(f"error: no rule with id {args.rule_id}")
+    conn.commit()
+    print(f"rule {args.rule_id} active={int(args.active)}")
+
+
+def cmd_add_contact(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Upsert one contact (asserted facts only — stats stay in views).
+    Only the fields given are touched on an existing row."""
+    addr = args.addr.strip().lower()
+    existing = conn.execute("SELECT addr FROM contacts WHERE addr = ?", (addr,)).fetchone()
+    if existing:
+        sets, params = ["updated_at = ?"], [utc_now()]
+        for col, val in (("display_name", args.display_name), ("relation", args.relation),
+                         ("notes", args.notes)):
+            if val is not None:
+                sets.append(f"{col} = ?")
+                params.append(val)
+        if args.vip is not None:
+            sets.append("is_vip = ?")
+            params.append(int(args.vip))
+        conn.execute(f"UPDATE contacts SET {', '.join(sets)} WHERE addr = ?", (*params, addr))
+        verb = "updated"
+    else:
+        conn.execute(
+            "INSERT INTO contacts (addr, display_name, relation, is_vip, notes, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (addr, args.display_name, args.relation,
+             int(args.vip) if args.vip is not None else 0, args.notes, utc_now()),
+        )
+        verb = "added"
+    conn.commit()
+    print(f"contact {addr} {verb}")
+
+
 def cmd_backup(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     """history.db is the one irreplaceable file (design §9); the data dir
     (~/.local/...) sits outside iCloud/Documents sync, so backups must land
@@ -273,6 +328,32 @@ def main() -> None:
     nt.add_argument("--session", required=True, help="session_started_at (UTC ISO 8601)")
     nt.add_argument("note")
     nt.set_defaults(func=cmd_log_note)
+
+    ar = sub.add_parser(
+        "add-rule",
+        help="add an active rule (action may be a plain action OR an "
+             "interaction pattern like 'summarize-then-trash')")
+    ar.add_argument("--predicate", required=True,
+                    help="e.g. \"sender = ship-confirm@amazon.com\"")
+    ar.add_argument("--action", required=True,
+                    help="trash | summarize-then-trash | scan-then-trash | "
+                         "surface-immediately | ... (free text)")
+    ar.add_argument("--origin", required=True, choices=("user", "claude-proposed"))
+    ar.set_defaults(func=cmd_add_rule)
+
+    sr = sub.add_parser("set-rule", help="activate/deactivate a rule")
+    sr.add_argument("rule_id", type=int)
+    sr.add_argument("--active", required=True, type=int, choices=(0, 1))
+    sr.set_defaults(func=cmd_set_rule)
+
+    ac = sub.add_parser("add-contact",
+                        help="upsert a contact (asserted facts only)")
+    ac.add_argument("addr", help="email address (normalized to lowercase)")
+    ac.add_argument("--display-name")
+    ac.add_argument("--relation", help="concise human framing: 'dad', 'plumber', 'HOA'")
+    ac.add_argument("--vip", type=int, choices=(0, 1), default=None)
+    ac.add_argument("--notes")
+    ac.set_defaults(func=cmd_add_contact)
 
     cx = sub.add_parser("context", help="print session-start context as JSON")
     cx.add_argument("--sessions", type=int, default=5, help="how many recent sessions of notes")
