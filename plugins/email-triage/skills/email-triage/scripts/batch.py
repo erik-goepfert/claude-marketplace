@@ -20,7 +20,7 @@ context) and the script does the rest:
      (this script only runs on approved batches).
   4. Re-index the whole Maildir root, absorbing this batch's own echo from
      the change report; only provably-external residue is returned, for the
-     model to consume per SKILL step 6.
+     model to consume per SKILL step 4.
   5. Box-scoped mbsync per touched account (exactly the touched folders),
      one account per invocation, one automatic retry (the ~25% EOF flake).
 

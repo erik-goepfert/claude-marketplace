@@ -1,7 +1,7 @@
 ---
 name: email-triage
 description: Triage email across iCloud and Gmail accounts — thread-centric review of a local Maildir mirror (synced by mbsync, indexed to SQLite) with flag/reply/archive/trash decisions, approval gates, and a persistent history DB that makes each session smarter than the last. Use when the user asks to triage, clean up, or process their email/inbox.
-allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*) Bash(*indexer.py*) Bash(*threads.py*) Bash(*act.py*) Bash(*batch.py*) Bash(*unsub.py*) Bash(*analytics.py*) Bash(mbsync *)
+allowed-tools: Bash(himalaya *) Bash(*history.py*) Bash(*init_history_db.py*) Bash(*indexer.py*) Bash(*threads.py*) Bash(*act.py*) Bash(*batch.py*) Bash(*unsub.py*) Bash(*session.py*) Bash(*analytics.py*) Bash(mbsync *)
 ---
 
 # Email Triage
@@ -37,7 +37,14 @@ ACT="${CLAUDE_SKILL_DIR}/scripts/act.py"
 HIST="${CLAUDE_SKILL_DIR}/scripts/history.py"
 UNSUB="${CLAUDE_SKILL_DIR}/scripts/unsub.py"
 BATCH="${CLAUDE_SKILL_DIR}/scripts/batch.py"
+SES="${CLAUDE_SKILL_DIR}/scripts/session.py"
 ```
+
+**Standard session steps live in scripts, never in ad-hoc shell** (user
+rule, 2026-07-19): raw `cat`/`mkdir`/`date`/`nohup` glue falls outside
+allowed-tools and interrupts the user with permission prompts. If a new
+every-session step appears, add it to a script (session.py is the home
+for lifecycle glue) rather than typing shell for it.
 
 - `config.yaml` (in `$DATA`) — schema v2: per-account `tiers:` map
   realizing each canonical tier CONCEPT as this account's folder name,
@@ -123,42 +130,35 @@ BATCH="${CLAUDE_SKILL_DIR}/scripts/batch.py"
 
 ## Session flow
 
-1. **Read `config.yaml`.** Never improvise account/folder names.
-2. **Check the lockfile.** `mkdir "$LOCK"` (atomic). If it already exists,
-   a session may be live elsewhere or was abandoned — ask before removing
-   (`rmdir "$LOCK"`) and proceeding.
-3. **Stamp the session.** `session_started_at` = current UTC time, ISO
-   8601, taken once. Every event and note this session carries it
-   verbatim.
-4. **Read history context:** `$HIST context [--senders ...]` — recent
-   session notes, active rules, sender stats, contacts.
-5. **Two-stage sync.** Stage 1 — priority sync, foreground (the live
+1. **Open the session:** `$SES start` — one call reads `config.yaml`
+   (never improvise account/folder names), atomically acquires the
+   session lock, clears the stale fullsync marker, and returns
+   `session_started_at` (every event and note this session carries it
+   verbatim) plus each account's priority-folder fast set. If it exits 1
+   with `lock: held`, a session may be live elsewhere or was abandoned —
+   ask the user before `$SES unlock`, then `start` again.
+2. **Read history context:** `$HIST context [--senders ...]` — recent
+   session notes, active rules, sender stats (incl. `declined_unsubs`),
+   contacts.
+3. **Two-stage sync.** Stage 1 — priority sync, foreground (the live
    working set + Sent + Drafts; Sent is required or `waiting` derivation
-   lies):
-   ```sh
-   rm -f "$DATA/.fullsync-done"
-   $IDX priority-folders     # per account: fast list + mbsync_fast string
-   ```
-   Pass each account's `mbsync_fast` value verbatim as ONE argument:
-   `mbsync -c "$MBSYNCRC" '<mbsync_fast>'` (~60–90 s total). Never
-   hand-assemble or hardcode folder names. **Run Stage-1 invocations
-   SEQUENTIALLY, one account at a time.**
-   Stage 2 — full sync, background, one account per invocation (combined
-   invocations flake ~25%; one retry recovers), completion marker at the
-   end:
-   ```sh
-   nohup sh -c "mbsync -c '$MBSYNCRC' gmail; mbsync -c '$MBSYNCRC' icloud \
-     && touch '$DATA/.fullsync-done'" > "$DATA/fullsync.log" 2>&1 &
-   ```
-   (Double-quote the `sh -c` payload so the vars expand in THIS shell.)
+   lies): pass each account's `mbsync_fast` value from `start`'s output
+   verbatim as ONE argument — `mbsync -c "$MBSYNCRC" '<mbsync_fast>'`
+   (~60–90 s total). Never hand-assemble or hardcode folder names. **Run
+   Stage-1 invocations SEQUENTIALLY, one account at a time.**
+   Stage 2 — full sync, background: `$SES sync-background` (one mbsync
+   invocation per account with one automatic retry each — the ~25% flake
+   — marker touched only if ALL succeed; log `fullsync.log`).
    Classification proceeds on Stage 1's data immediately; **acting gates
-   on Stage 2** (step 8) — never rename files while mbsync may be walking
+   on Stage 2** (step 6) — never rename files while mbsync may be walking
    the same folders.
-6. **Index and consume the change report.**
+4. **Index and consume the change report.**
    `$IDX index --maildir "$MAILDIR" --db "$IDXDB"` → JSON change report
    (shape: reference §JSON). Detected changes are provably external —
    everything non-priority still reflects last session's final state.
-   **Consume EVERY index run's report this way.** Rules, in order:
+   **Consume EVERY index run's report this way** — the pre-act re-index
+   (step 6) surfaces the rest of the mailbox once Stage 2 lands. Rules,
+   in order:
    - **Self-echo exclusion FIRST.** Drop every entry matching an action
      you executed and logged this session — logging your own echo as
      `manual` double-counts decisions and corrupts sender stats.
@@ -178,15 +178,16 @@ BATCH="${CLAUDE_SKILL_DIR}/scripts/batch.py"
    - `parse_errors` > 0 → surface, don't drop.
    - `unrecognized_folders` → surface as audit debt + session note; don't
      infer.
-7. **Assemble threads.** `$THR list --db "$IDXDB"` — default tiers
+5. **Assemble threads.** `$THR list --db "$IDXDB"` — default tiers
    `untriaged`+`active`; full member list always returned (this is what
    makes reconciliation detectable). Each thread carries `state` and
    `drafted` (object shape: reference §JSON).
-8. **Priority scan → breakdown → classify-first, easiest-first** (see
+6. **Priority scan → breakdown → classify-first, easiest-first** (see
    Triage). **Before the FIRST act batch: verify Stage 2 is done** —
-   `[ -f "$DATA/.fullsync-done" ]`; if not, tell the user and wait for
-   the marker. Once present: re-index and consume that report (step 6),
-   then act.
+   `$SES check-fullsync` (exit 0 = marker present; exit 1 includes the
+   log tail — if the sync died, rerun `$SES sync-background`). If not
+   done yet, tell the user and wait. Once present: re-index and consume
+   that report (step 4), then act.
    **Acting: for move/remove batches — the dominant case — one
    `$BATCH run` call is the whole unit** (act + auto-derived events +
    echo-absorbed re-index + box-scoped sync; see Acting). Flags stay on
@@ -198,24 +199,21 @@ BATCH="${CLAUDE_SKILL_DIR}/scripts/batch.py"
    Never begin the next batch — or report one done — while its changes
    exist only in the local mirror. `$BATCH run` IS the unit in one call;
    check its `sync[].ok` and re-run the push on failure.
-9. **Session end — residue check first.** `$THR residue --db "$IDXDB"` —
+7. **Session end — residue check first.** `$THR residue --db "$IDXDB"` —
    every thread still holding untriaged messages. Empty = clean close.
    Anything listed must be either deliberate (waiting thread, explicit
    "leave it" — say so in one line) or unfinished work (surface it; put
    resume state in the session note). Never close with unexplained
-   residue. Then the background chain — the user is done immediately:
-   ```sh
-   nohup sh -c "mbsync -c '$MBSYNCRC' gmail; mbsync -c '$MBSYNCRC' icloud \
-     && rmdir '$LOCK'" > "$DATA/endsync.log" 2>&1 &
-   ```
-   Write the session note BEFORE launching the chain. **Deliberately no
-   `$IDX index` in the chain** — whatever this sync pulls is external and
-   must surface in the NEXT session's change report; indexing here would
-   silently absorb it. If the chain fails the lock stays behind and step
-   2 catches it (check `endsync.log`). History backup is NOT a session
-   step (scheduled launchd task; plan 2.9).
+   residue. Write the session note, THEN `$SES end` — a detached final
+   sync chain (per-account, one retry each) that releases the lock only
+   if every account syncs; the user is done immediately. **Deliberately
+   no `$IDX index` in the chain** — whatever this sync pulls is external
+   and must surface in the NEXT session's change report; indexing here
+   would silently absorb it. If the chain fails the lock stays behind
+   and step 1 catches it (check `endsync.log`). History backup is NOT a
+   session step (scheduled launchd task; plan 2.9).
 
-Mid-session syncs may pull new arrivals; the triage set from step 7 is not
+Mid-session syncs may pull new arrivals; the triage set from step 5 is not
 re-assembled mid-session — new mail waits for the next session.
 
 ## Triage (classify-first discipline)
@@ -354,7 +352,7 @@ graph plus a guarded subject fallback, and derives state directly.
   is X" directly; never dump-and-refilter with ad-hoc python.
 - `$THR show --db "$IDXDB" --account <acct> --message-id <id>` — the full
   thread containing a message, any tier.
-- `$THR residue --db "$IDXDB"` — end-of-session leftovers check (step 9).
+- `$THR residue --db "$IDXDB"` — end-of-session leftovers check (step 7).
 - A thread's messages live in one tier location at a time (system folders
   excepted — Sent copies never move). **Threads never move to Inbox.**
   When a decision changes a thread's location, **every non-system member
@@ -395,7 +393,7 @@ Message-ids are the index's bare form (no angle brackets). `final_action`
 derives from the destination tier; sender/subject from the index; per-item
 overrides win over batch flags (full schema: reference §JSON). Pre-flight
 validates every item before anything acts. Consume `change_report.
-external` per step 6; check `sync[].ok`. Hand-written `$HIST log-events`
+external` per step 4; check `sync[].ok`. Hand-written `$HIST log-events`
 JSON remains only for events with no move attached (skips, flags, replies,
 drafts).
 
@@ -486,7 +484,7 @@ $HIST log-note --session "$SESSION" "resume state / watch item"
 `override` (user changed the outcome — always log the original
 `proposed_action`; **the richest learning signal** — "leave it" after a
 proposal is `final_action=skip, decided_by=override`), `manual` (change
-report, step 6).
+report, step 4).
 
 **Action vocabulary:** `flag | reply | archive | trash | skip | activate
 | draft`. `activate` = moved to the active tier — triaged, stays open; a

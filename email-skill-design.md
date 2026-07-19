@@ -1004,6 +1004,24 @@ and made hand-written event JSON the norm rather than the exception.
 Hand-written events remain only for decisions with no move attached
 (skips, flags, replies, drafts).
 
+**Amendment (2026-07-19, user rule): standard session steps live in
+scripts, never in ad-hoc shell.** The first post-Phase-5 session opened
+with a Claude Code permission prompt for the session-start bundle
+(`cat config.yaml; mkdir session.lock; date -u`) — plain-shell glue
+falls outside the skill's allowed-tools whitelist, as would the nohup
+sync chains and marker checks. `session.py` now owns the lifecycle:
+`start` (config + atomic lock + session stamp + marker clear + priority
+fast sets, one JSON; exit 1 touching nothing when the lock is held),
+`unlock` (stale lock, user-approved), `sync-background` (detached
+Stage-2 chain: per-account mbsync, one retry each, marker only if ALL
+succeed — stricter than the old hand-typed `a; b && touch` chain, which
+could mark success with the first account failed), `check-fullsync`
+(the acting gate), and `end` (detached final chain releasing the lock
+only on success; still deliberately no indexing, preserving next-session
+manual-event detection). The whole session flow now runs inside
+whitelisted scripts; a new every-session step goes into a script, not
+into typed shell.
+
 ---
 
 ## 13. Pre-build verification suite

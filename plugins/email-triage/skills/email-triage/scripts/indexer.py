@@ -782,8 +782,9 @@ def cmd_index(args: argparse.Namespace) -> None:
 PRIORITY_FAST_TIER_KEYS = ("untriaged", "active", "sent", "drafts")
 
 
-def cmd_priority_folders(args: argparse.Namespace) -> None:
-    config_path = args.config or default_config_path()
+def priority_fast_map(config_path: Path) -> dict:
+    """Per-account Stage-1 fast set. Also imported by session.py so `start`
+    can hand the model everything it needs in one call."""
     parsed = parse_config_tiers(config_path)
     account_names = sorted(parsed.keys()) if parsed else sorted(DEFAULT_TIER_MAPS.keys())
 
@@ -800,7 +801,11 @@ def cmd_priority_folders(args: argparse.Namespace) -> None:
             "mbsync_fast": f"{account}:{','.join(fast)}",
             "slow_hint": "full channel",
         }
-    print(json.dumps(result, indent=2, sort_keys=True))
+    return result
+
+
+def cmd_priority_folders(args: argparse.Namespace) -> None:
+    print(json.dumps(priority_fast_map(args.config or default_config_path()), indent=2, sort_keys=True))
 
 
 def main() -> None:

@@ -106,6 +106,15 @@ pass `mbsync_fast` verbatim as ONE mbsync argument.
 `parse_errors` + `unrecognized_folders`), `sync[]` (`account`, `boxes`,
 `attempts`, `ok`).
 
+**`$SES` (session.py):** `start` → `{session_started_at, lock:
+"acquired"|"held", config (raw yaml text), config_path, priority_folders
+(same map as $IDX priority-folders), fullsync_marker_cleared}` — exit 1
+and touches nothing when the lock is held. `sync-background` / `end` →
+`{pid, accounts, log}` (detached chain: per-account mbsync with one
+retry each; marker touch / lock rmdir only if ALL succeed).
+`check-fullsync` → `{fullsync_done, log_tail?}`, exit 1 until done.
+`unlock` removes a stale lock (user-approved only).
+
 **`$UNSUB links`:** `List-Unsubscribe`/`List-Unsubscribe-Post` headers +
 body anchors (including image-button links by alt text) with a ranked
 recommendation. `exec` default is the RFC 8058 one-click POST; `--url`
@@ -154,14 +163,14 @@ Project graduation runs on a slower loop than per-session triage.
 
 ## Incident history (why the spine's rules exist)
 
-- **Unsynced batches (step 8's hard invariant):** six approved trash
+- **Unsynced batches (step 6's hard invariant):** six approved trash
   batches sat local-only for 35 minutes until the user asked "have you
   pushed our changes to the server?" — a crash in that window would have
   left everything live in the mailbox.
-- **\Seen churn (step 6's \Flagged-only rule):** one external
+- **\Seen churn (step 4's \Flagged-only rule):** one external
   mark-all-read produced 460 would-be `flag` events that would have
   poisoned sender_stats.
-- **Premature victory (Triage's never-close-from-memory + step 9's
+- **Premature victory (Triage's never-close-from-memory + step 7's
   residue check):** the first live session reported "all 18 handled"
   twice while a thread still sat in Inbox.
 - **Ad-hoc refiltering (`$THR list` filters):** the first live session
@@ -178,3 +187,8 @@ Project graduation runs on a slower loop than per-session triage.
 - **TCC (backups):** the first live session hit macOS TCC denials writing
   `~/Documents` from this shell; history backup is a scheduled launchd
   task (plan 2.9), never a session step.
+- **Permission prompts (session.py):** the first post-Phase-5 session
+  opened with a prompt for the raw `cat config; mkdir lock; date -u`
+  bundle — plain-shell glue falls outside allowed-tools, and the nohup
+  sync chains would have prompted too. Hence the rule: every standard
+  session step lives inside a whitelisted script.

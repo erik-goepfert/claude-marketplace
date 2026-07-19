@@ -866,6 +866,17 @@ Plugin cache refreshed after the final commit.
       verified format from the 2026-07-18 session, requested live:
       "repeat that initial message minus the ones we've dealt with until
       we've cleared them all.")
+- [x] **5.9 Session lifecycle script (added + done 2026-07-19, from
+      first-session friction).** The session opened with a permission
+      prompt for the raw `cat config; mkdir lock; date -u` bundle —
+      plain shell falls outside allowed-tools. User rule: standard
+      session steps live in scripts. New `session.py`
+      (start/unlock/sync-background/check-fullsync/end) absorbs all
+      lifecycle glue: one-JSON session open (config + lock + stamp +
+      marker clear + priority fast sets), detached sync chains with
+      per-account retry and success-gated marker/lock-release, acting
+      gate check. SKILL session flow collapsed 9 steps → 7, all inside
+      whitelisted scripts; 7 tests.
 
 ---
 
