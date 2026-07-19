@@ -791,7 +791,15 @@ def cmd_priority_folders(args: argparse.Namespace) -> None:
     for account in account_names:
         tier_map = parsed.get(account) or DEFAULT_TIER_MAPS.get(account, {})
         fast = [tier_map[k] for k in PRIORITY_FAST_TIER_KEYS if tier_map.get(k)]
-        result[account] = {"fast": fast, "slow_hint": "full channel"}
+        result[account] = {
+            "fast": fast,
+            # Ready-made Stage-1 argument (5.7): pass verbatim as ONE
+            # argument -- mbsync -c "$MBSYNCRC" '<mbsync_fast>' -- instead
+            # of hand-assembling the box list (a quoting slip in a live
+            # session cost a retry cycle).
+            "mbsync_fast": f"{account}:{','.join(fast)}",
+            "slow_hint": "full channel",
+        }
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

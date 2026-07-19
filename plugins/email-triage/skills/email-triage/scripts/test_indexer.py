@@ -573,9 +573,12 @@ class PriorityFoldersTest(unittest.TestCase):
         result = json.loads(buf.getvalue())
         self.assertEqual(result["icloud"], {
             "fast": ["INBOX", "Active", "Sent Messages", "Drafts"],
+            "mbsync_fast": "icloud:INBOX,Active,Sent Messages,Drafts",
             "slow_hint": "full channel",
         })
         self.assertEqual(result["gmail"]["fast"], ["INBOX", "Active", "[Gmail]/Sent Mail", "[Gmail]/Drafts"])
+        self.assertEqual(result["gmail"]["mbsync_fast"],
+                         "gmail:INBOX,Active,[Gmail]/Sent Mail,[Gmail]/Drafts")
 
     def test_cmd_priority_folders_no_config_degrades_to_defaults(self):
         import argparse

@@ -675,6 +675,46 @@ def cmd_list(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def cmd_residue(args: argparse.Namespace) -> None:
+    """End-of-session residue check (5.7): everything still sitting in the
+    untriaged tier, compact -- one entry per thread, not full member dumps.
+    An empty list is the definition of a clean close; anything listed must
+    be either deliberate (waiting thread, user said leave it) or unfinished
+    work for the session note."""
+    conn = connect_db(args.db)
+    try:
+        accounts = args.account or all_accounts(conn)
+        tiers = set(args.tier) if args.tier else {"untriaged"}
+        residue = []
+        total = 0
+        for account in accounts:
+            members = load_account_members(conn, account)
+            for group in assemble_account_threads(members):
+                mlist = [members[mid] for mid in group]
+                hits = [m for m in mlist if m["tier"] in tiers]
+                if not hits:
+                    continue
+                state, _inactive = compute_state(mlist)
+                newest = latest_dated(hits) or hits[0]
+                total += len(hits)
+                residue.append({
+                    "account": account,
+                    "root_message_id": thread_root_id(mlist),
+                    "state": state,
+                    "drafted": compute_drafted(mlist),
+                    "subject": normalize_subject(newest["subject"]),
+                    "from_addr": newest["from_addr"],
+                    "date_utc": newest["date_utc"],
+                    "residual_count": len(hits),
+                    "folders": sorted({m["folder"] for m in hits}),
+                })
+        residue.sort(key=lambda r: (r["account"], r["date_utc"] or ""), reverse=False)
+        print(json.dumps({"residue": residue, "threads": len(residue),
+                          "messages": total}, indent=2, sort_keys=True))
+    finally:
+        conn.close()
+
+
 def cmd_show(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
@@ -754,6 +794,19 @@ def build_parser() -> argparse.ArgumentParser:
              "(case-insensitive substring)",
     )
     list_p.set_defaults(func=cmd_list)
+
+    res_p = sub.add_parser(
+        "residue",
+        help="end-of-session check: compact list of threads still holding "
+             "untriaged-tier messages (empty = clean close)",
+    )
+    res_p.add_argument("--db", required=True, type=Path)
+    res_p.add_argument("--account", action="append", help="limit to this account (repeatable); default: all accounts")
+    res_p.add_argument(
+        "--tier", action="append",
+        help="count residue in this tier (repeatable); default: untriaged only",
+    )
+    res_p.set_defaults(func=cmd_residue)
 
     show_p = sub.add_parser("show", help="show the full thread containing a message-id")
     show_p.add_argument("--db", required=True, type=Path)

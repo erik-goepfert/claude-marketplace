@@ -130,6 +130,11 @@ improvising it here.
    - Only mark a message read by explicitly setting it —
      `himalaya flag add -a <acct>-local -f <folder> <id> seen` — at the
      moment you actually present its content or summary to the user.
+   - Exception, en route to trash (5.7): a message the user has just
+     approved for trashing needs no seen-marking even if you summarized
+     it — `\Seen` bookkeeping on mail headed for the Trash folder is
+     wasted calls and wasted sync churn. Marking read is for mail that
+     STAYS.
    - Exception: `himalaya template reply` / `message reply` (run against the
      **IMAP** account, since sending is IMAP-only) have no preview
      equivalent and do mark `\Seen`. Accepted, since a reply draft quotes
@@ -169,11 +174,15 @@ improvising it here.
    $IDX priority-folders     # config-driven fast set per account:
                              # tiers untriaged + active + sent + drafts
    ```
-   Build one box-scoped mbsync invocation per account from its `fast`
-   list, e.g. `mbsync -c "$MBSYNCRC" 'gmail:INBOX,Active,[Gmail]/Sent
-   Mail,[Gmail]/Drafts'` (~60–90 s total; gmail's per-invocation overhead
-   dominates). Never hardcode the folder names — accounts differ and the
-   config is the single source of truth.
+   Each account's `mbsync_fast` value is the ready-made argument — pass it
+   verbatim as ONE argument: `mbsync -c "$MBSYNCRC" 'gmail:INBOX,Active,
+   [Gmail]/Sent Mail,[Gmail]/Drafts'` (~60–90 s total; gmail's
+   per-invocation overhead dominates). Never hand-assemble or hardcode the
+   folder names — accounts differ and the config is the single source of
+   truth. **Run the Stage-1 invocations SEQUENTIALLY, one account at a
+   time** — parallel mbsync processes against the same Maildir tree are
+   exactly the flake/race class this design exists to avoid, and Stage 1
+   is foreground anyway.
    **Stage 2 — full sync, background**, one account per invocation
    (combined multi-channel invocations flake ~25% with
    `read: unexpected EOF`; per-account + one routine retry always
@@ -262,7 +271,16 @@ improvising it here.
    Act → log → re-index → **push** is one unit — `$BATCH run` IS that unit
    in one call; check its `sync` result and re-run the push on a reported
    failure.
-9. **Session end — background chain, user is done immediately.** Every
+9. **Session end — residue check first, then the background chain.**
+   Before anything else, run the residue check:
+   `$THR residue --db "$IDXDB"` — a compact list of every thread still
+   holding untriaged-tier messages. Empty is the definition of a clean
+   close. Anything listed must be one of: deliberate (a `waiting` thread,
+   an explicit "leave it") — say so in one line; or unfinished work —
+   surface it to the user and put resume state in the session note. Never
+   close a session with unexplained residue (the first live session
+   declared victory twice with mail still in Inbox).
+   Then the **background chain — user is done immediately.** Every
    batch was already box-pushed (step 8's invariant), so the final full
    sync mostly *pulls*; run it detached, releasing the lock only on
    success:
@@ -325,7 +343,11 @@ reads during classification**. Two axes per thread:
 - **Reconciliation check.** If a listed thread's members span **both**
   `untriaged` and a resolved tier (`ongoing`/`cold`), it's a new arrival on
   an already-filed thread — handle per Reconciliation below, not as a fresh
-  thread.
+  thread. **Trash/junk siblings never count as "resolved" for this check
+  (5.7)** — a new arrival whose only siblings sit in trash/junk is a fresh
+  thread getting a fresh decision, not a reconciliation case (previously-
+  trashed noise from the same sender must not gravitationally pull new
+  mail into Trash without a decision).
 
 **Priority scan — before the breakdown, before anything else.** Security and
 time-sensitive signals are surfaced first, regardless of content category.
@@ -354,9 +376,24 @@ Present these **individually, immediately**, before the category breakdown —
 "2 security alerts first: a new SSH key on your GitHub account and a GitLab
 sign-in from a new location, both from today. Recognize these?" The proposed
 action is usually "confirm it was you" (skip) or "you don't recognize this —
-here's the link to review/revoke" (surfaced, never followed, rule 4); log as
-`category=actionable` with a `notes` value noting the priority-scan hit. Only
+here's the link to review/revoke" (surfaced; executed never — rule 4). Only
 once these are resolved does the regular flow proceed.
+
+Scan modulation and logging (5.7):
+- **Sender history deflates, it doesn't gate.** If sender stats/rules show
+  this sender's "urgent" framing is routine noise (marketing deadlines,
+  recurring "action required" that's always been trash), don't interrupt —
+  fold it into its category with a deflating aside ("Acme's usual
+  'expires soon', trashed the last 6"). The interrupt slot is for signals
+  history can't vouch for.
+- **Log the TRUE category**, not a blanket `actionable`: a marketing blast
+  that tripped the scan logs `category=marketing`, with the scan hit
+  recorded in `notes` ("priority-scan: expiry framing") — otherwise scan
+  hits corrupt the category mix that rule proposals feed on.
+- **`waiting` threads can still interrupt here** — an unseen security
+  alert on a thread where you replied last still deserves its interrupt —
+  but the waiting rule holds: interrupt only, no proposal, no logged
+  event.
 
 Then, for everything else:
 
@@ -489,7 +526,10 @@ Message-ID/In-Reply-To/References graph plus a guarded subject fallback
 - A thread's messages live in one tier location at a time (system folders
   excepted — Sent copies never move). **Threads never move to Inbox** —
   Inbox is delivery, not a destination. When a triage decision changes a
-  thread's location, **every non-system member moves as a unit**.
+  thread's location, **every non-system member moves as a unit** — and
+  **trash/junk members are never part of that unit (5.7)**: a thread-wide
+  move never resurrects a member the user already discarded (mega-threads
+  accumulate trashed noise; moving the thread must not drag it back out).
 
 ## Acting
 

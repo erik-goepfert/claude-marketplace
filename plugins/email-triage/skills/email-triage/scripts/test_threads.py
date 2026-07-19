@@ -84,6 +84,14 @@ class ThreadsTestCase(unittest.TestCase):
             threads.cmd_list(args)
         return json.loads(buf.getvalue())
 
+    def run_residue(self, *argv_extra):
+        parser = threads.build_parser()
+        args = parser.parse_args(["residue", "--db", str(self.db_path), *argv_extra])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            threads.cmd_residue(args)
+        return json.loads(buf.getvalue())
+
     def run_show(self, account, message_id):
         parser = threads.build_parser()
         args = parser.parse_args(["show", "--db", str(self.db_path), "--account", account, "--message-id", message_id])
@@ -319,6 +327,37 @@ class ThreadsTestCase(unittest.TestCase):
         result = self.run_list(tier=["untriaged"])
         self.assertEqual(len(result), 1)
         self.assertFalse(result[0]["drafted"])
+
+    # residue (5.7): compact end-of-session leftovers check.
+    def test_residue_lists_only_untriaged_leftovers(self):
+        # One thread fully filed, one with an Inbox straggler, one clean
+        # Inbox singleton -- residue must name exactly the last two.
+        self.insert(message_id="A", folder="Archive/Trip", folder_tier="cold", account="ic",
+                    subject="Filed", from_addr="a@x.com", date_utc=days_ago(9))
+        self.insert(message_id="B", folder="Archive/Trip", folder_tier="cold", account="ic",
+                    in_reply_to="A", subject="Re: Filed", from_addr="b@x.com",
+                    date_utc=days_ago(8))
+        self.insert(message_id="C", folder="Archive/Trip", folder_tier="cold", account="ic",
+                    subject="Other filed", from_addr="c@x.com", date_utc=days_ago(7))
+        self.insert(message_id="D", folder="INBOX", folder_tier="untriaged", account="ic",
+                    in_reply_to="C", subject="Re: Other filed", from_addr="d@x.com",
+                    date_utc=days_ago(1))
+        self.insert(message_id="E", folder="INBOX", folder_tier="untriaged", account="ic",
+                    subject="Straggler", from_addr="e@x.com", date_utc=days_ago(2))
+        out = self.run_residue()
+        self.assertEqual(out["threads"], 2)
+        self.assertEqual(out["messages"], 2)
+        subjects = {r["subject"] for r in out["residue"]}
+        self.assertEqual(subjects, {"Other filed", "Straggler"})
+        for r in out["residue"]:
+            self.assertEqual(r["folders"], ["INBOX"])
+            self.assertEqual(r["residual_count"], 1)
+
+    def test_residue_empty_is_clean_close(self):
+        self.insert(message_id="A", folder="Active", folder_tier="active", account="ic",
+                    subject="Live but triaged", from_addr="a@x.com", date_utc=days_ago(1))
+        out = self.run_residue()
+        self.assertEqual(out, {"residue": [], "threads": 0, "messages": 0})
 
 
 def make_maildir_folder(root, folder):
