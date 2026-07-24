@@ -203,6 +203,34 @@ declared by the producer. The **body** additionally gets the full envelope
 because it's long free text where an injection has room to work and where
 recency-bias framing matters most.
 
+**Construction — default-deny, same polarity as §6 (decision 2026-07-23).**
+The output names the *untrusted* fields (a "distrust these" signal is more
+legible to the model, and reads the same direction as the risk), but that
+list is **derived, never hand-authored** — otherwise it would fail *open*
+(a new sender field someone forgot to add goes out unmarked). The authored
+artifact in each emitter is a small **`TRUSTED_FIELDS` allowlist** of
+pipeline-generated field names; the emitter escapes every *string-valued*
+field NOT on that list and adds its name to `_untrusted.fields` by
+subtraction. A forgotten field therefore defaults to escaped-and-marked,
+matching the column allowlist exactly. Only string values are candidates
+(numbers, booleans, enums are structurally safe and never listed); nested
+objects (`latest.*`, `headers.*`) are walked recursively and marked by
+dotted path.
+
+The test for the `TRUSTED_FIELDS` allowlist is **"can this value contain
+sender bytes,"** NOT "did our code emit this field." The canonical trap is
+`threads.py`'s `root_message_id`: our code *computes* it (`thread_root_id`
+selects the root member), but its value is a sender-chosen Message-ID —
+**untrusted**. Default-deny is what protects against exactly this
+intuition slip: the safe classification is the automatic one.
+
+Illustrative allowlist for `threads.py list --compact` (pipeline-generated
+only): `account, state, drafted, inactive_days, member_count,
+tiers_present, folder, folder_tier, flags, is_flagged, date_utc`.
+Everything else it emits (`subject, from_addr, message_id, in_reply_to,
+references_chain, root_message_id`, and the same under `latest.*`) is
+escaped and derived into the manifest.
+
 `wrap_untrusted()` and the manifest emitter live in the shared
 `untrusted.py`; every emitting script imports them so the framing is
 produced by trusted code and cannot be assembled without it (envelope
@@ -349,8 +377,12 @@ imply elevated trust:
 2. The message **body** is additionally wrapped in a fresh-nonce envelope;
    the bracketed inner tag appears exactly twice per envelope, framing
    names it by bare name only.
-3. Sender-set scalar fields are declared in the JSON `_untrusted.fields`
-   manifest by the producing script.
+3. Sender-set scalar fields are named in the JSON `_untrusted.fields`
+   manifest, but that list is **derived** — each emitter authors a
+   `TRUSTED_FIELDS` allowlist and escapes+lists every string field not on
+   it (default-deny; the untrusted list is never hand-maintained). The
+   allowlist test is "can the value contain sender bytes," not "did our
+   code emit the field" (see `root_message_id`).
 4. Nonces are `uuid4`-fresh per script invocation and never written to
    disk.
 5. Trust is a column property (§6 allowlist), decided at write time;

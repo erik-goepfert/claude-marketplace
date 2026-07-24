@@ -947,17 +947,24 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       no-double-escape, no literal `<` survives escape, inner tag appears
       exactly twice, nonce fresh per call. (design §§4–5; invariants
       1–4)
-- [ ] **6.2 Escape + manifest at every scalar emitter.** Route
-      sender-set scalar fields through `escape()` and emit the
-      `_untrusted.fields` manifest once per JSON payload in `threads.py`
-      (list/compact/show/residue/flag), `indexer.py` (index change
-      report), `unsub.py` (links: anchor text/url + header values),
-      `batch.py` (`change_report.external`). Untrusted fields: `subject`,
-      `from_addr`, `to_addr`, `message_id`, `in_reply_to`,
-      `references_chain`, anchor `text`/`url`, `sender_addr`. Structural
-      test: grep each script's JSON for a sender field absent from its
-      manifest — the mechanical enforcement of invariant 5. (design §5b,
-      inventory §3)
+- [ ] **6.2 Escape + manifest at every scalar emitter.** Each emitter
+      (`threads.py` list/compact/show/residue/flag, `indexer.py` index
+      change report, `unsub.py` links, `batch.py`
+      `change_report.external`) authors a **`TRUSTED_FIELDS` allowlist**
+      of pipeline-generated field names, escapes every *string-valued*
+      field NOT on it, and **derives** `_untrusted.fields` by subtraction
+      — default-deny, so a forgotten field fails safe (escaped + listed),
+      never open (decision 2026-07-23). The output names the untrusted
+      fields (legible "distrust these" signal) but is computed, not
+      hand-kept. Test the allowlist by *value origin*, not who emitted the
+      field: `root_message_id` is computed by us but sender-valued →
+      untrusted. Only strings are candidates; nested objects (`latest.*`,
+      `headers.*`) walked recursively, marked by dotted path. Compact
+      output becomes an object (`{"_untrusted": …, "threads": […]}`) — was
+      a bare array; SKILL + consumers updated. Structural test: for each
+      script's JSON, assert every string field outside `TRUSTED_FIELDS`
+      appears in `_untrusted.fields` — mechanical enforcement of invariant
+      5/3. (design §5b, inventory §3)
 - [ ] **6.3 Full body envelope on the read path.** `threads.py read`
       wraps `body` in the nonce envelope (the highest-risk surface — full
       sender body in context); the header sender values are escaped +
