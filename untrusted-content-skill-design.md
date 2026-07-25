@@ -1,10 +1,11 @@
 # Untrusted Content Handling — applied to the email-triage skill
 
-**Status:** Design v1 (2026-07-20). No implementation phases yet — this
-document maps the general design in `untrusted-content-design.md` onto the
-concrete architecture of this skill (scripts, columns, functions), records
-where our reality diverges from that document's assumptions, and names the
-specific surfaces and controls. Sequencing into the plan comes later.
+**Status:** Design v1, **sequenced as Phase 6** (tasks 6.1–6.8) in
+`implementation-plan.md` (2026-07-23; Phase 6 tasks cite this doc's
+sections and invariants). This document maps the general design in
+`untrusted-content-design.md` onto the concrete architecture of this skill
+(scripts, columns, functions), records where our reality diverges from
+that document's assumptions, and names the specific surfaces and controls.
 
 Companion docs: `untrusted-content-design.md` (the general design, written
 without access to our code), `email-skill-design.md` (state model, data
@@ -306,6 +307,16 @@ allowlist names **our** columns. At rest, columns hold clean escaped text
 (no envelope syntax; DuckDB analytics and greps see content). Wrapping is
 minted fresh per read.
 
+This is **the same default-deny allowlist as §5, viewed from the input
+side.** §5's `TRUSTED_FIELDS` is over each emitter's *output* fields;
+`TRUSTED_COLUMNS` here is over the DB *columns* a reader pulls. They
+coincide for `history.py context` (its output fields ARE its columns) and
+diverge only for emitters that also emit *computed* fields not backed by a
+column (`threads.py`'s `state`, `tiers_present`, and the sender-valued
+`root_message_id`) — which is exactly why the emitter allowlist is over
+output fields, not input columns. One principle, two read surfaces; a
+value is trusted only if it can't carry sender bytes at either.
+
 **Trusted columns (pipeline-generated only — the allowlist):**
 
 ```
@@ -504,27 +515,22 @@ imply elevated trust:
 
 ## 11. Open questions
 
-- **List-scale wrapping cost.** Per-field escaping plus one manifest per
-  call is cheap; do compact list contexts (dozens of `subject`/`from_addr`
-  at once) need anything beyond escape + manifest, or is the full body
-  envelope reserved for `read` sufficient? (Leaning: manifest + escape for
-  lists, full envelope only for `read` — encoded in §5.)
-- **Hidden-text policy.** Flatten-and-read the CSS-hidden text after
-  neutralizing it, or drop it entirely and only flag presence? Dropping
-  loses legitimate-but-hidden content (rare); flagging + reading keeps it
-  visible-as-suspicious. (Leaning: skip-and-flag, §4 option (a)+(b).)
-- **`untrusted.py` seam.** Confirm every current emitter
-  (`threads.py`, `indexer.py`, `unsub.py`, `batch.py`, `history.py`)
-  routes its sender-derived output through the shared helper, and add a
-  test that greps script JSON for an un-manifested sender field — the
-  structural enforcement of invariant 5.
-- **Capability split vs. approval gate.** Whether to introduce a genuine
-  read-only classification phase (strongest blast-radius control) or keep
-  the single flow and lean on the approval gate plus enum-constrained
-  logging. A cost/ergonomics call to make when sequencing.
-- **`TRUSTED_COLUMNS` re-review cadence.** A schema change adds columns;
-  the allowlist must be revisited or new columns silently default to
+Most have since been decided; status noted so the trail stays honest.
+
+- **List-scale wrapping cost.** *(Decided → §5, Phase 6.2/6.3.)*
+  Manifest + escape for lists, full nonce envelope only for `read`.
+- **Hidden-text policy.** *(Decided → §4, Phase 6.4.)* Skip-and-flag:
+  drop CSS-hidden content AND set `hidden_text_present`.
+- **`untrusted.py` seam.** *(Assigned → Phase 6.2.)* Every emitter routes
+  through the shared helper; the structural test greps each script's JSON
+  for a string field absent from `_trust.untrusted_fields`.
+- **Capability split vs. approval gate.** *(Open → Phase 6.8 decision.)*
+  Read-only classification phase (strongest) vs. the single flow behind a
+  tightened approval gate. Cost/ergonomics call.
+- **`TRUSTED_COLUMNS` re-review cadence.** *(Open.)* A schema change adds
+  columns; the allowlist must be revisited or new columns default to
   wrapped (safe) but possibly over-wrapped. Candidate check whenever
   `init_history_db.py` / the `envelopes` DDL changes.
-- **Nonce collision / reuse across concurrent scripts.** Fresh per process
-  makes this negligible, but confirm nothing caches a nonce across calls.
+- **Nonce collision / reuse.** *(Decided.)* Fresh per process makes it
+  negligible; Phase 6.1's "nonce fresh per call" test confirms nothing
+  caches one.

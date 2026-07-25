@@ -381,7 +381,7 @@ Notes:
 - Reads history context (recent session notes, rules, sender stats) at session
   start; logs every decision and noteworthy observation as it goes (§9).
 
-**Amendment (2026-07-19, Phase 9 decision): the skill session is one of
+**Amendment (2026-07-19, Phase 10 decision): the skill session is one of
 two planned frontends over the same engine.** The user decided on both
 interaction models: (a) the freeform Claude Code session (this section) —
 conversational, fastest to iterate; and (b) a TUI app with a Claude Agent
@@ -393,9 +393,9 @@ below the frontend — config/tier model, scripts, both DBs, sync
 invariants, logging — is shared and must stay frontend-agnostic; rules
 that exist only to survive the Claude Code harness (e.g. the
 final-message discipline) are frontend rules, not engine rules. Sequenced
-after Phase 8, whose winning board format (as a `threads.py board`
+after Phase 9, whose winning board format (as a `threads.py board`
 renderer) is the artifact both frontends share. Details:
-implementation-plan.md Phase 9.
+implementation-plan.md Phase 10.
 
 ### 7.7 Packaging & installation
 
