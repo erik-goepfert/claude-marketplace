@@ -916,9 +916,9 @@ Plugin cache refreshed after the final commit.
 
 Implements `untrusted-content-skill-design.md` (which grounds the general
 `untrusted-content-design.md` in our real scripts, columns, and
-functions). **Security comes before presentation (Phase 7) and the TUI
-(Phase 8) deliberately:** both front-end phases *add* surface area — a TUI
-renders the same sender bytes, and the Phase 8 SDK system prompt inherits
+functions). **Security comes before presentation (Phase 8) and the TUI
+(Phase 9) deliberately:** both front-end phases *add* surface area — a TUI
+renders the same sender bytes, and the Phase 9 SDK system prompt inherits
 the same skill rules — so the containment/provenance layer should exist
 and be inherited, not retrofitted onto two frontends later. Where a task
 below and the design doc disagree on a mechanism, **the design doc
@@ -1044,23 +1044,91 @@ our `strip_html` does NOT neutralize CSS-hidden text.
 
 ---
 
-## Phase 7 — Batch presentation design (added 2026-07-18, user request)
+## Phase 7 — Phase out himalaya (engine simplification + portability; added 2026-07-24, user request)
+
+himalaya has been progressively hollowed out — reads moved to
+`threads.py read` (5.1), moves never used it (act.py, because himalaya's
+Maildir moves strand mail on the `,U=` token), flags are wrapped by
+`$THR flag` (5-R2). What remains is either **trivially replaceable local
+Maildir file ops** (flag, draft-save, folder-create, plus the
+`envelope list` id-resolution that exists ONLY to feed himalaya's own
+flag command) or **SMTP send**. himalaya's Maildir id-mapper is now a net
+liability: the unstable id-space, the resolve-fresh-by-`from_addr`+date
+dance, and the `,U=` stranding that forced `act.py` all trace to it —
+removing it from local ops *removes* code. This phase does (b) then (c):
+strip himalaya from every local op (definite), then replace send and drop
+himalaya entirely.
+
+**Send-tool decision (2026-07-24).** For send-only, himalaya (a Rust
+binary + a 4-account `config.toml`) is overkill. Ranked:
+- **stdlib `smtplib` + `email.message` (target).** Zero new dependency
+  (Python is already required), no new config (SMTP password from the
+  same keychain/`PassCmd` mbsync uses), we already assemble the reply
+  message ourselves, full control of the per-account Sent-copy quirk
+  (Gmail SMTP auto-saves; iCloud needs an explicit save). App-password
+  basic auth works for `smtp.mail.me.com:587` and `smtp.gmail.com:587` —
+  no OAuth. ~50-line `send.py`.
+- **`msmtp` (fallback).** Tiny purpose-built send-only CLI, trivial
+  `~/.msmtprc`; still a dependency + config, no MIME/Sent-copy (we
+  assemble). Only if smtplib auth misbehaves.
+- **Keep himalaya for send (last resort).** The literal (b) end state;
+  leaves the dependency + config, forfeits the 1.5 portability win.
+
+Reaching stdlib send lets himalaya leave entirely, which is the real
+1.5 (publish/second-machine) payoff: one fewer binary to install, one
+fewer config file, only `mbsync` + `python3` left as external tools.
+Largely independent of Phase 6 (that phase wraps emit/read *output*;
+this changes act/send *paths*), but should land before Phase 9 so the
+TUI is built on the final engine.
+
+- [ ] **7.1 Flags as direct Maildir renames.** Replace `$THR flag`'s
+      himalaya path (`resolve_himalaya_id` + `envelope list` +
+      `himalaya flag`) with a direct suffix rename on the message's file
+      — reuse `act.resolve_current_file` (message-id → file), recompute
+      the `:2,` suffix with/without `F`/`S`, `,U=`-aware. Deletes
+      `resolve_himalaya_id` and the whole envelope-list-for-ids path; the
+      flag test drops its himalaya stub. Net code reduction.
+- [ ] **7.2 Draft-save as a direct Maildir write.** Replace
+      `himalaya message save` with writing the RFC822 into the Drafts
+      folder's `new/` (fresh file, no `,U=` — mbsync-safe, the property
+      act.py relies on). Drops the stdin-only footgun.
+- [ ] **7.3 Folder-create as `mkdir`.** Replace `himalaya folder create`
+      with `os.makedirs(folder/{cur,new,tmp})`; syncs like any folder.
+- [ ] **7.4 Reply-template assembly from the index.** Replace
+      `himalaya template reply` with building From/To/Subject/In-Reply-To
+      /References directly from the index (References already computed by
+      us). Produces the same RFC822 shown to the user and sent.
+- [ ] **7.5 Send via stdlib `smtplib` (`send.py`).** Per the decision
+      above: SMTP + STARTTLS + app-password login, `email.message` MIME,
+      per-account Sent-copy (Gmail auto-saves; iCloud APPEND / local Sent
+      write). Creds from mbsync's existing source — no new secret store.
+      msmtp / keep-himalaya as fallbacks only if auth misbehaves.
+- [ ] **7.6 Remove himalaya + docs/portability.** Drop `himalaya` from
+      `allowed-tools`, delete the himalaya `config.toml` from setup, and
+      retire the himalaya-specific gotchas from reference §Quirks (they no
+      longer apply). Update the bootstrap/dependency list to `mbsync` +
+      `python3` only; cross-link 1.5 (one fewer install + config). SKILL
+      reply/flag/draft recipes updated to the new paths.
+
+---
+
+## Phase 8 — Batch presentation design (added 2026-07-18, user request)
 
 5.8 defines the batch-board LOOP (board stays active until empty); this
 phase designs the LOOK — expected to take live iteration, not one pass.
 
-- [ ] **7.1 Survey CLI mail clients for borrowable idioms.** himalaya's
+- [ ] **8.1 Survey CLI mail clients for borrowable idioms.** himalaya's
       own table output (baseline — user suggested emulating with tweaks);
       mutt/neomutt `index_format` (a %-format DSL purpose-built for
       dense one-line-per-message displays — likely the richest source);
       aerc's column config; notmuch/alot; mu4e headers view. Deliverable:
       a short comparison with 2–3 concrete board-format candidates.
-- [ ] **7.2 Live iteration.** Present the candidates in a real triage
+- [ ] **8.2 Live iteration.** Present the candidates in a real triage
       session; the user picks/tweaks in place; repeat until it stops
       changing. Surfaces to cover beyond the batch board: category
       breakdown summary, priority-scan interrupt, thread detail view,
       session-close summary.
-- [ ] **7.3 Encode the winner as exact templates** (in the skill, or
+- [ ] **8.3 Encode the winner as exact templates** (in the skill, or
       reference.md once 5.6 lands). Open design question to resolve
       during iteration: freehand-from-template vs. script-rendered —
       a `threads.py board`/`render` subcommand would make boards
@@ -1068,19 +1136,19 @@ phase designs the LOOK — expected to take live iteration, not one pass.
       only the judgment annotations (recidivist / borderline / new
       sender); pure prose allows more adaptation but drifts. Likely
       hybrid; decide from what the iteration reveals.
-      **Phase 8 note (2026-07-19):** whatever wins, build the renderer as
+      **Phase 9 note (2026-07-19):** whatever wins, build the renderer as
       a real `threads.py board` subcommand taking structured input — it
-      is the pivot artifact both frontends share (see Phase 8): Claude
+      is the pivot artifact both frontends share (see Phase 9): Claude
       Code sessions call it for deterministic boards; the TUI later
       embeds the same logic as its list widget.
 
 ---
 
-## Phase 8 — TUI frontend via the Claude Agent SDK (designed 2026-07-19, user request; sequenced AFTER Phase 7 settles)
+## Phase 9 — TUI frontend via the Claude Agent SDK (designed 2026-07-19, user request; sequenced AFTER Phase 8 settles)
 
 **Decision (user, 2026-07-19): both interaction models, same engine.**
-Phase 7 keeps the freeform Claude Code session as-is — it stays the
-fast-iteration, conversational way to run triage. Phase 8 adds a second
+Phase 8 keeps the freeform Claude Code session as-is — it stays the
+fast-iteration, conversational way to run triage. Phase 9 adds a second
 frontend: a dedicated TUI app with an Agent SDK session as the triage
 engine behind it. Nothing in the engine forks: config.yaml, the tier
 model, indexer/threads/batch/unsub/history scripts, history.db, and the
@@ -1120,35 +1188,35 @@ What the TUI dissolves (and what stays CC-only): SKILL rule 6
 has no such failure mode; board re-presentation cost (5.8's re-printed
 boards are re-tokenized every sub-batch; the TUI sends deltas); stable
 item numbering (free in a list widget). The costs, eyes-open: it's a
-real application with app code where Phases 0–7 have none; it gives up
+real application with app code where Phases 0–8 have none; it gives up
 Claude Code's free conversation UI, transcripts, compaction, and plugin
 distribution; iteration is a code cycle, not a SKILL.md edit.
 
-Tasks (draft — firm up after Phase 7):
+Tasks (draft — firm up after Phase 8):
 
-- [ ] **8.1 Engine/frontend boundary audit.** Read the post-Phase-7
+- [ ] **9.1 Engine/frontend boundary audit.** Read the post-Phase-8
       SKILL and mark each rule ENGINE (holds in both frontends: tier
       model, sync invariants, logging, \Seen discipline) or FRONTEND
       (presentation/consent mechanics that the TUI implements in code:
       rule 6, board re-presentation, approval phrasing). Deliverable: the
       system prompt for the SDK session, derived from the spine with
       frontend-only rules stripped.
-- [ ] **8.2 Walking skeleton.** Textual app + SDK streaming session +
+- [ ] **9.2 Walking skeleton.** Textual app + SDK streaming session +
       ONE custom tool (`present_board`) + the free-text lane. Success:
       a real session start (two-stage sync, index, threads, priority
       scan) ending in a rendered board the user can scroll.
-- [ ] **8.3 Approval + acting loop.** `request_approval` tool +
+- [ ] **9.3 Approval + acting loop.** `request_approval` tool +
       `canUseTool` gate wired to `$BATCH run`; resolved items leave the
       board; sync status line. The 5.8 loop as UI state.
-- [ ] **8.4 Thread detail + reply flow.** `show_thread` pane ($THR
+- [ ] **9.4 Thread detail + reply flow.** `show_thread` pane ($THR
       read-backed), reply drafting in an editor pane, the three exits
       (send / save-for-later / discard) as keybindings over the same
       himalaya recipes.
-- [ ] **8.5 Session lifecycle.** Lock, session stamp, residue check,
+- [ ] **9.5 Session lifecycle.** Lock, session stamp, residue check,
       session-end chain, history/notes — app-managed, engine-logged.
       Then a real A/B week: same mailbox, alternating frontends; fold
       what the TUI teaches back into the shared engine.
-- [ ] **8.6 Packaging consideration (noted 2026-07-19, from the
+- [ ] **9.6 Packaging consideration (noted 2026-07-19, from the
       PATH/exec-bit discussion).** In-skill sessions stay on
       `$VAR`s/`${CLAUDE_SKILL_DIR}` — version-correct, self-contained,
       no PATH pollution (script names like session.py/batch.py are far
