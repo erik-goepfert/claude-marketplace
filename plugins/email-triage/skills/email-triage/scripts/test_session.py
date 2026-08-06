@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import session  # noqa: E402
+import untrusted  # noqa: E402
 
 CONFIG_TEXT = """\
 accounts:
@@ -153,6 +154,57 @@ class SessionTests(unittest.TestCase):
         code, out = self.run_ses("start")
         self.assertEqual(code, 1)
         self.assertEqual(out["lock"], "held")
+
+    # -- Phase 6.2: escape + `_trust` manifest, applied centrally in emit() --
+
+    def test_start_manifest_is_complete_and_config_stays_bare(self):
+        code, out = self.run_ses("start")
+        self.assertEqual(code, 0)
+        undeclared = (untrusted.string_paths(out)
+                      - {p for p in untrusted.string_paths(out)
+                         if p.startswith("_trust")}
+                      - set(session.TRUSTED_FIELDS)
+                      - {p for p in untrusted.string_paths(out)
+                         if any(p == t or p.startswith(t + ".")
+                                for t in session.TRUSTED_SUBTREES)}
+                      - set(out["_trust"]["untrusted_fields"]))
+        self.assertEqual(undeclared, set())
+        # config.yaml is the USER's text, not a sender's -- escaping it would
+        # corrupt the one field the model reads to learn the tier names.
+        self.assertEqual(out["_trust"]["untrusted_fields"], [])
+
+    def test_priority_folders_subtree_is_trusted_despite_dynamic_keys(self):
+        # Keyed by account name, so no exact allowlist can name the paths. The
+        # subtree escape is legitimate here precisely because the keys come
+        # from config, never from a sender.
+        _code, out = self.run_ses("start")
+        self.assertTrue(out["priority_folders"])
+        for path in untrusted.string_paths(out):
+            if path.startswith("priority_folders"):
+                self.assertNotIn(path, out["_trust"]["untrusted_fields"])
+
+    def test_log_tail_is_escaped_and_declared(self):
+        """mbsync's own output is the one untrusted thing this script emits: an
+        external process's text, reporting on data senders produced, in no
+        vocabulary we control."""
+        (self.tmp / "fullsync.log").write_text(
+            "Reading configuration file /dev/null\n"
+            "far side box <script>alert(1)</script> cannot be opened\n"
+            "C: 1/1 B: 0/23 M: 0/0 S: 0/0\n")
+        code, out = self.run_ses("check-fullsync")
+        self.assertEqual(code, 1)  # marker absent
+        self.assertFalse(out["fullsync_done"])
+        self.assertIn("log_tail", out["_trust"]["untrusted_fields"])
+        joined = " ".join(out["log_tail"])
+        self.assertNotIn("<script>", joined)
+        self.assertIn("&lt;script&gt;", joined)
+
+    def test_log_tail_absent_once_the_marker_lands(self):
+        (self.tmp / ".fullsync-done").touch()
+        code, out = self.run_ses("check-fullsync")
+        self.assertEqual(code, 0)
+        self.assertNotIn("log_tail", out)
+        self.assertEqual(out["_trust"]["untrusted_fields"], [])
 
 
 if __name__ == "__main__":

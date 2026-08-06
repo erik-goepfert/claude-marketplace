@@ -37,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import indexer  # noqa: E402
+import untrusted  # noqa: E402
 
 DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
 DEFAULT_MBSYNCRC = os.path.expanduser("~/.config/isync/mbsyncrc")
@@ -46,8 +47,31 @@ def utc_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Trust classification (Phase 6.2; untrusted-content-skill-design.md §5).
+# Applied centrally in emit() rather than per subcommand, so a field added to
+# any future subcommand's output is classified by default-deny automatically
+# instead of depending on someone remembering a second edit.
+#
+# Everything this script emits is its own bookkeeping, config the USER wrote, or
+# our environment -- with exactly one exception, `log_tail`.
+TRUSTED_FIELDS = {
+    "session_started_at", "lock", "hint", "warning", "config", "config_path",
+    "unlock", "stage2", "end_chain", "log", "marker", "note", "accounts",
+}
+# priority_folders is keyed by account name and env by variable name: dynamic
+# key spaces, but OURS (config and os.environ), never a sender's. That is the
+# only condition under which a subtree may be trusted wholesale.
+TRUSTED_SUBTREES = {"priority_folders", "env"}
+# `log_tail` is absent on purpose. It is mbsync's own output -- an external
+# process whose text is not a vocabulary we control, reporting on data senders
+# produced. Default-deny escapes and declares it; nothing feeds it back, so
+# escaping is free.
+
+
 def emit(obj: dict) -> None:
-    print(json.dumps(obj, indent=2, sort_keys=True))
+    print(json.dumps(untrusted.apply_trust(obj, TRUSTED_FIELDS,
+                                           trusted_subtrees=TRUSTED_SUBTREES),
+                     indent=2, sort_keys=True))
 
 
 def config_path_for(args) -> Path:

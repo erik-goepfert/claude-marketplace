@@ -14,6 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import act  # noqa: E402
 import indexer  # noqa: E402
+import untrusted  # noqa: E402
 
 
 def make_folder(root, folder):
@@ -130,6 +131,65 @@ class ActTests(unittest.TestCase):
         self.assertIn("ONLY copy", out["failed"][0]["error"])
         self.assertTrue(os.listdir(
             os.path.join(self.root, "Areas/Receipts", "cur")))
+
+    # -- Phase 6.2: escape + `_trust` manifest --
+
+    def test_manifest_is_complete(self):
+        put_file(self.root, "INBOX", "k9:2,")
+        make_folder(self.root, "Archive")
+        self.index_row("INBOX", "k9", "<m9>", "k9:2,")
+        code, out = self.run_cli(
+            "move", "--db", self.db, "--maildir", self.root,
+            "--account", "acct", "--from", "INBOX", "--to", "Archive",
+            "<m9>", "<never-indexed>")
+        self.assertEqual(code, 1)  # one moved, one failed
+        undeclared = (untrusted.string_paths(out)
+                      - {p for p in untrusted.string_paths(out)
+                         if p.startswith("_trust")}
+                      - set(act.TRUSTED_FIELDS)
+                      - set(out["_trust"]["untrusted_fields"]))
+        self.assertEqual(undeclared, set())
+
+    def test_error_prose_is_untrusted_because_it_quotes_the_sender(self):
+        """The finding this classification exists for: `failed.error` reads like
+        our own prose and is -- but every message interpolates `message_id!r`,
+        so a sender picks part of the string. "We wrote the field" is not the
+        test; "can a sender reach the value" is."""
+        make_folder(self.root, "INBOX")  # main() needs the maildir root to exist
+        code, out = self.run_cli(
+            "move", "--db", self.db, "--maildir", self.root,
+            "--account", "acct", "--from", "INBOX", "--to", "Archive",
+            "<a&b<script>@x>")
+        self.assertEqual(code, 1)
+        self.assertIn("failed.error", out["_trust"]["untrusted_fields"])
+        err = out["failed"][0]["error"]
+        self.assertNotIn("<script>", err)
+        self.assertIn("&lt;script&gt;", err)
+
+    def test_message_id_handle_survives_unaltered(self):
+        # act.py itself is the consumer: the model pastes this id straight back
+        # in, and the lookup is exact string equality.
+        hostile = "<a&b@x.com>"
+        put_file(self.root, "INBOX", "k8:2,")
+        make_folder(self.root, "Archive")
+        self.index_row("INBOX", "k8", hostile, "k8:2,")
+        code, out = self.run_cli(
+            "move", "--db", self.db, "--maildir", self.root,
+            "--account", "acct", "--from", "INBOX", "--to", "Archive", hostile)
+        self.assertEqual(code, 0)
+        self.assertEqual(out["moved"][0]["message_id"], hostile)
+        self.assertIn("moved.message_id", out["_trust"]["untrusted_fields"])
+
+    def test_folder_names_stay_bare(self):
+        put_file(self.root, "INBOX", "k7:2,")
+        make_folder(self.root, "Archive")
+        self.index_row("INBOX", "k7", "<m7>", "k7:2,")
+        _code, out = self.run_cli(
+            "move", "--db", self.db, "--maildir", self.root,
+            "--account", "acct", "--from", "INBOX", "--to", "Archive", "<m7>")
+        declared = set(out["_trust"]["untrusted_fields"])
+        for path in ("moved.from_folder", "moved.to_folder", "moved.file"):
+            self.assertNotIn(path, declared)
 
 
 if __name__ == "__main__":

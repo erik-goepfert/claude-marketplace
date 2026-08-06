@@ -25,6 +25,8 @@ import re
 import sqlite3
 import sys
 
+import untrusted
+
 UID_TOKEN = re.compile(r",U=\d+")
 
 ROW_SQL = """SELECT folder, maildir_key, maildir_file FROM envelopes
@@ -33,6 +35,20 @@ ROW_SQL = """SELECT folder, maildir_key, maildir_file FROM envelopes
 
 class FatalError(Exception):
     pass
+
+
+# Trust classification (Phase 6.2; untrusted-content-skill-design.md §5).
+# Folder names are ours, and `file` is the Maildir filename mbsync generated.
+TRUSTED_FIELDS = {"moved.from_folder", "moved.to_folder", "moved.file",
+                  "removed.removed_from"}
+# message_id is sender-valued but must not be escaped -- the model feeds it
+# straight back to this same script, which matches it by exact value.
+HANDLE_FIELDS = {"moved.message_id", "removed.message_id", "failed.message_id"}
+# `failed.error` is deliberately absent from both, so default-deny escapes and
+# declares it. It reads like our own prose, and it is -- but every one of these
+# messages interpolates `message_id!r` into that prose, so a sender chooses part
+# of the string. Same intuition slip as `root_message_id`, wearing a different
+# hat: "we wrote this field" is not the test, "can a sender reach the value" is.
 
 
 def resolve_current_file(maildir_root: str, folder: str, maildir_key: str) -> str:
@@ -171,8 +187,9 @@ def main(argv=None) -> int:
         conn.close()
 
     key = "moved" if args.cmd == "move" else "removed"
-    json.dump({key: done, "failed": failed}, sys.stdout,
-              indent=2, sort_keys=True)
+    json.dump(untrusted.apply_trust({key: done, "failed": failed},
+                                    TRUSTED_FIELDS, handle_fields=HANDLE_FIELDS),
+              sys.stdout, indent=2, sort_keys=True)
     print()
     return 0 if not failed else 1
 

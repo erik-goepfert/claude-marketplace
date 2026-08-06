@@ -215,8 +215,12 @@ _MANIFEST_NOTE = (
 )
 
 
+def _in_subtree(path, subtrees):
+    return any(path == s or path.startswith(s + ".") for s in subtrees)
+
+
 def apply_trust(payload, trusted_fields, handle_fields=(), envelope_fields=None,
-                nonce=None):
+                trusted_subtrees=(), nonce=None):
     """Return `payload` with sender-valued strings contained and declared.
 
     Default-deny (UC §5, decision 2026-07-23). The caller authors
@@ -255,8 +259,19 @@ def apply_trust(payload, trusted_fields, handle_fields=(), envelope_fields=None,
                          practice just `body`. Built here so the envelope and
                          the manifest share one nonce and so a caller cannot
                          wrap the same value twice.
+        trusted_subtrees paths whose ENTIRE subtree is trusted, for maps with a
+                         dynamic key space that an exact allowlist cannot name
+                         — `session.py`'s `priority_folders` is keyed by
+                         account. Use it only where the keys AND the values are
+                         both ours or the user's: it is the one escape from
+                         default-deny, so it is a separate argument rather than
+                         a syntax inside `trusted_fields`, and it must never be
+                         pointed at `headers` (there the dynamic keys are the
+                         SENDER's, which is the whole reason for dotted-path
+                         matching).
     """
     trusted = set(trusted_fields)
+    subtrees = set(trusted_subtrees)
     handles = set(handle_fields)
     envelopes = dict(envelope_fields or {})
     nonce = nonce or new_nonce()
@@ -282,7 +297,7 @@ def apply_trust(payload, trusted_fields, handle_fields=(), envelope_fields=None,
             # Numbers, booleans and null are structurally safe and never
             # listed — an injection needs somewhere to put text.
             return value
-        if path in trusted:
+        if path in trusted or _in_subtree(path, subtrees):
             return value
         untrusted.add(shown)
         if path in envelopes:

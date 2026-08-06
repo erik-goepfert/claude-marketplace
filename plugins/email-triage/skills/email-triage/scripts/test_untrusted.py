@@ -235,6 +235,37 @@ class ManifestTests(unittest.TestCase):
         self.assertNotIn("&amp;lt;", out["body"])
         self.assertEqual(out["_trust"]["untrusted_fields"], ["body", "subject"])
 
+    def test_trusted_subtree_covers_a_dynamic_key_space(self):
+        # session.py's priority_folders is keyed by account name, so no exact
+        # allowlist can name the paths. Legitimate only because the keys come
+        # from config, never from a sender.
+        out = untrusted.apply_trust(
+            {"priority_folders": {"gmail": {"fast": ["INBOX", "Active"]},
+                                  "icloud": {"fast": ["INBOX"]}},
+             "subject": "<b>"},
+            [], trusted_subtrees=["priority_folders"])
+        self.assertEqual(out["_trust"]["untrusted_fields"], ["subject"])
+        self.assertEqual(out["priority_folders"]["gmail"]["fast"],
+                         ["INBOX", "Active"])
+
+    def test_a_subtree_does_not_leak_to_a_sibling_with_a_shared_prefix(self):
+        # "priority" must not be covered by a subtree named "prior".
+        out = untrusted.apply_trust(
+            {"prior": {"a": "x"}, "prior_notes": "<b>"},
+            [], trusted_subtrees=["prior"])
+        self.assertEqual(out["_trust"]["untrusted_fields"], ["prior_notes"])
+
+    def test_subtrees_are_a_separate_argument_from_the_allowlist(self):
+        # Kept separate on purpose: it is the one escape from default-deny, so
+        # using it has to be a visible decision rather than a syntax buried in
+        # a field list. Pointed at `headers` it would undo the dotted-path
+        # defence entirely — this test documents that it CAN, so nobody
+        # discovers it by accident.
+        out = untrusted.apply_trust(
+            {"headers": {"account": "<b>evil"}}, [], trusted_subtrees=["headers"])
+        self.assertEqual(out["_trust"]["untrusted_fields"], [])
+        self.assertEqual(out["headers"]["account"], "<b>evil")
+
     def test_manifest_note_declares_itself_trusted(self):
         note = untrusted.apply_trust({}, [])["_trust"]["note"]
         self.assertTrue(note.startswith("TRUSTED pipeline control block."))
