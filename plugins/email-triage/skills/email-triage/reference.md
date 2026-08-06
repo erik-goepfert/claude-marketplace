@@ -90,6 +90,16 @@ untrusted (our prose quotes the sender's id; the sender field IS sender data),
 while `$SES`'s `config` is trusted (you wrote it). `$SES check-fullsync`'s
 `log_tail` and `$BATCH`'s `sync[].stderr` are mbsync's words, not ours.
 
+**`injection_signals` (6.7).** On `$THR list`/`show` thread objects it is
+present **only when non-empty** (a field that is almost always `[]` stops being
+read) and comes from the subject — the only prose the priority scan has before
+any body read. On `$THR read` it is always present and covers the visible body.
+Values are pipeline-authored labels (`instruction-override phrasing`, `claimed
+system or developer authority`, `addresses an AI assistant directly`, `claims to
+speak for the user`, `urges concealment from the user`) — never the matched text,
+so reporting a signal can't smuggle the sender's words. A hit is rare: 0 of
+16,981 live subjects match.
+
 **`$THR read` hidden-text fields (6.4).** `hidden_text_present` means
 CSS-hidden text was dropped from `body`. It is a **diagnostic, not a signal**:
 78% of HTML mail in this mailbox hides text, nearly all of it legitimate

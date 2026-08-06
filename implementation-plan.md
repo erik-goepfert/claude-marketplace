@@ -1391,7 +1391,7 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       `F`-prefixed frontend tail stays last) and as §4.6 in the design doc —
       the two stay numbered 1:1. (UC §§5, 7–8; invariants 9 and 11 —
       11 is confinement, the rule this task actually carries.)
-- [ ] **6.7 Priority-scan injection trigger + spoofing caveat.** Extend
+- [x] **6.7 Priority-scan injection trigger + spoofing caveat.** Extend
       the priority scan (which already interrupts on security/financial
       signals) to surface injection-shaped content as a *signal, not
       silent spam*: a body addressing the assistant directly,
@@ -1402,6 +1402,38 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       claiming a known contact still gets full scrutiny (money/creds/
       urgency especially); identity matches on the real address;
       `display_name` is untrusted. (UC §9; invariant 10)
+      **DONE 2026-08-06**, and cheaper than budgeted because 6.4 already built
+      the detector: `untrusted.injection_signals()` was put in the shared module
+      precisely so this task could reuse it, and it did.
+
+      Where the check runs matters. The priority scan reads
+      `list --compact`, which carries **no body** — so the subject is the only
+      prose available before anyone opens a message, and checking it there warns
+      the model *before* the read rather than after. `$THR read` additionally
+      runs it over the visible body ("a body addressing the assistant
+      directly"), kept separate from `hidden_text_reasons` because *where* the
+      text was hidden is itself part of the signal.
+
+      Two presentation decisions, both about keeping the signal readable:
+      - **Emitted only when non-empty** on list/show. A field that is `[]` on
+        199 of 200 threads stops being read, which would waste the one place
+        the signal is cheap. `read` always emits it (single message, no noise).
+      - **Labels only, never the matched span.** The detector returns
+        pipeline-authored strings by construction, so reporting a signal cannot
+        smuggle the sender's words along with it — which would have quietly
+        reintroduced the untrusted text into a field the model treats as ours.
+        A test asserts it.
+
+      **Base rate measured before shipping: 0 of 16,981 live subjects and 0 of
+      17,061 `from_addr` values match.** That is the number that makes this a
+      usable interrupt, and the contrast with `hidden_text_present` (78%) is why
+      6.4's flag was demoted to a diagnostic and this one was not.
+
+      SKILL gains both halves: the injection trigger ("surface it, don't
+      silently bin it" — spam usually, but the one category where silently
+      trashing hides an attempted attack) and the spoofing caveat (elevated
+      surfacing is attention, never trust; identity matches on the real address;
+      `display_name` is sender-chosen and listed untrusted for that reason).
 - [ ] **6.8 Capability-posture decision (design fork).**
       **⚠ Sequencing exception — decide this BEFORE writing 6.6.** It keeps
       its `6.8` label because `UC §11` cites it by number, but it is the one
