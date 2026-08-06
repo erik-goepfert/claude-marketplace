@@ -307,48 +307,270 @@ def decode_text_part(part) -> str:
     return payload.decode(charset, errors="replace")
 
 
+# --------------------------------------------------------------------------
+# Hidden-text detection (Phase 6.4; untrusted-content-skill-design.md §4 step 3)
+# --------------------------------------------------------------------------
+# Declarations that hide an element's text from a human while leaving it in the
+# bytes a model reads. `opacity:0` needs the lookahead so it doesn't match
+# `opacity:0.5`; `mso-hide` is Outlook's preheader mechanism, the single most
+# common place real mail hides text.
+_HIDDEN_DECL_RE = re.compile(
+    r"display\s*:\s*none"
+    r"|visibility\s*:\s*hidden"
+    r"|opacity\s*:\s*0(?![.\d])"
+    r"|mso-hide\s*:\s*all",
+    re.I,
+)
+_FONT_SIZE_RE = re.compile(r"font-size\s*:\s*([0-9]*\.?[0-9]+)\s*(px|pt|em|rem|%)?", re.I)
+# Unit-aware, because "zero or near-zero" is a different number in each unit
+# and a flat threshold would either miss `0.05em` or flag legible `10pt`.
+_TINY_FONT_LIMITS = {"px": 1.0, "pt": 1.0, "em": 0.1, "rem": 0.1, "%": 10.0}
+
+# A tiny font-size on its own is NOT concealment, and treating it as such was
+# the worst false positive found when this was measured against live mail:
+# `font-size:0px` on a container <td> is standard table-layout practice (MJML
+# emits it on every wrapper cell to kill inline-block whitespace) and the
+# children set their own size, so the text renders normally. Believing it
+# dropped 100% of the body of every Amazon and Sweetgreen message.
+#
+# Modelling that properly means modelling inheritance -- font-size hides an
+# element's own text nodes but not a descendant's that overrides it. Instead we
+# require a corroborating concealment property in the same declaration, which
+# is what real preheaders carry (Amazon's is `display:none;font-size:1px;
+# color:#ffffff;line-height:1px;max-height:0px;opacity:0;overflow:hidden`) and
+# what a layout wrapper does not.
+_TINY_FONT_CORROBORATION = re.compile(
+    r"max-height\s*:\s*0|max-width\s*:\s*0|height\s*:\s*0"
+    r"|line-height\s*:\s*0|overflow\s*:\s*hidden"
+    r"|color\s*:\s*(?:#f{3}\b|#f{6}\b|white|transparent)",
+    re.I,
+)
+_SELECTOR_TOKEN_RE = re.compile(r"[.#][A-Za-z0-9_-]+")
+_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
+# A real hiding rule is tiny (`.preheader{display:none}`). Anything sprawling
+# is a sign the brace walk lost sync on malformed CSS, so it is not trusted to
+# hide content.
+_MAX_SELECTOR_CHARS = 120
+_MAX_SELECTOR_TOKENS = 4
+
+
+def _top_level_rules(css: str):
+    """Yield (selectors, declarations) for rules at brace depth 0 only.
+
+    Depth is the whole point: `@media (max-width:480px) { .m-hide {
+    display:none } }` is RESPONSIVE design, not concealment -- that content is
+    visible on desktop and hiding it would delete real text. Measured before
+    this guard existed, treating nested rules as hiding dropped 100% of the
+    body of every Amazon and Sweetgreen message in the mailbox. Any at-rule
+    block (@media, @supports) therefore contributes nothing.
+
+    Comments are stripped first: a stray `{` inside `/* ... */` shifts the
+    depth permanently, after which real top-level rules look nested and a
+    nested one's closing brace ends a bogus rule whose "selector" spans
+    unrelated text. That is how `#body` was once harvested from an Audible
+    message, hiding the whole document."""
+    css = _CSS_COMMENT_RE.sub(" ", css)
+    depth, start, selector = 0, 0, None
+    for i, ch in enumerate(css):
+        if ch == "{":
+            if depth == 0:
+                selector, start = css[start:i], i + 1
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                if selector is not None and not selector.lstrip().startswith("@"):
+                    yield selector, css[start:i]
+                selector, start = None, i + 1
+
+
+def _declares_hidden(decl: str) -> bool:
+    if not decl:
+        return False
+    if _HIDDEN_DECL_RE.search(decl):
+        return True
+    m = _FONT_SIZE_RE.search(decl)
+    if m:
+        unit = (m.group(2) or "px").lower()
+        if float(m.group(1)) <= _TINY_FONT_LIMITS.get(unit, 1.0):
+            return bool(_TINY_FONT_CORROBORATION.search(decl))
+    return False
+
+
+def hidden_selectors(css: str) -> set:
+    """`.class`/`#id` tokens whose rules hide their content. Best effort.
+
+    Deliberately not a CSS engine: no cascade, no specificity, no descendant
+    reasoning, and nothing inside an at-rule (see _top_level_rules). It catches
+    the common shape -- one unconditional rule, one class, `display:none` --
+    which is also the cheapest place to plant text."""
+    hidden = set()
+    for selectors, decl in _top_level_rules(css):
+        if not _declares_hidden(decl) or len(selectors) > _MAX_SELECTOR_CHARS:
+            continue
+        tokens = _SELECTOR_TOKEN_RE.findall(selectors)
+        if 0 < len(tokens) <= _MAX_SELECTOR_TOKENS:
+            hidden.update(t.lower() for t in tokens)
+    return hidden
+
+
 class _HTMLTextExtractor(HTMLParser):
     """Tag-stripped plain text from an HTML body: drops <script>/<style>
     content entirely, inserts a line break at block-level tags so the
-    result isn't one giant run-on line, and collapses interior whitespace."""
+    result isn't one giant run-on line, and collapses interior whitespace.
+
+    It also drops CSS-hidden text and records that it did (Phase 6.4). The
+    general untrusted-content design assumed an HTML→text pass neutralized
+    planted text; ours did not. Hidden text is a prompt-injection vector
+    precisely because the human and the model see different messages -- the
+    user skims a rendered newsletter while the model reads a `display:none`
+    div instructing it to archive everything from some address.
+
+    Detected: inline `style` declaring display:none / visibility:hidden /
+    opacity:0 / mso-hide:all / a zero-or-near-zero font-size; the `hidden` and
+    `aria-hidden="true"` attributes; `<template>`; and, best-effort, a class
+    or id hidden by a rule in an EARLIER `<style>` block.
+
+    NOT detected, which is why `hidden_text_present` is a signal rather than a
+    guarantee: offscreen positioning (`left:-9999px` -- needs multi-property
+    reasoning), same-colour-on-same-background text (needs the cascade), a
+    `<style>` block placed after the content it hides, and external CSS. 6.7
+    treats the flag as one injection signal among several for that reason.
+    """
 
     _BLOCK_TAGS = {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6"}
     _SKIPPED_TAGS = {"script", "style"}
+    _ALWAYS_HIDDEN_TAGS = {"template"}
+    _STRUCTURAL_TAGS = {"html", "body"}
+    # Void elements hold no text, so a hidden one has nothing to suppress --
+    # and pushing one would leave it on the stack forever, silently swallowing
+    # the rest of the document.
+    _VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input",
+                  "link", "meta", "source", "track", "wbr"}
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self._chunks = []
         self._skip_depth = 0
+        self._in_style = False
+        self._css = []
+        self._hidden_selectors = set()
+        self._hidden_stack = []
+        self._dropped = []
+        self.hidden_text_present = False
+
+    def _is_hidden(self, tag, attrs) -> bool:
+        if tag in self._ALWAYS_HIDDEN_TAGS:
+            return True
+        attrs = {k.lower(): (v or "") for k, v in attrs}
+        if "hidden" in attrs or attrs.get("aria-hidden", "").strip().lower() == "true":
+            return True
+        if _declares_hidden(attrs.get("style", "")):
+            return True
+        # Selector matching never applies to the document root. Hiding <body>
+        # would suppress everything, and a message with nothing visible is not
+        # a human/model asymmetry -- it is a bug in our own CSS reading. An
+        # Audible message did exactly this via a harvested `#body`.
+        if self._hidden_selectors and tag not in self._STRUCTURAL_TAGS:
+            tokens = {f".{c.lower()}" for c in attrs.get("class", "").split()}
+            if attrs.get("id"):
+                tokens.add("#" + attrs["id"].lower())
+            if tokens & self._hidden_selectors:
+                return True
+        return False
 
     def handle_starttag(self, tag, attrs):
         if tag in self._SKIPPED_TAGS:
             self._skip_depth += 1
-        elif tag in self._BLOCK_TAGS:
+            if tag == "style":
+                self._in_style = True
+            return
+        if tag in self._VOID_TAGS:
+            # No text content to hide and no end tag to balance.
+            if not self._hidden_stack and tag in self._BLOCK_TAGS:
+                self._chunks.append("\n")
+            return
+        if self._hidden_stack or self._is_hidden(tag, attrs):
+            # Inside a hidden subtree, EVERY open element is tracked -- an
+            # untracked inner <div> would have its </div> pop the hidden
+            # wrapper instead, un-hiding the rest of it.
+            self._hidden_stack.append(tag)
+            return
+        if tag in self._BLOCK_TAGS:
             self._chunks.append("\n")
 
     def handle_endtag(self, tag):
-        if tag in self._SKIPPED_TAGS and self._skip_depth:
-            self._skip_depth -= 1
+        if tag in self._SKIPPED_TAGS:
+            if self._skip_depth:
+                self._skip_depth -= 1
+            if tag == "style":
+                self._in_style = False
+                self._hidden_selectors |= hidden_selectors("".join(self._css))
+                self._css = []
+            return
+        # Pop back through the LAST matching open tag, tolerating unclosed
+        # inner elements: email HTML is routinely malformed, and a strict match
+        # would leave the whole remainder of the document suppressed.
+        for i in range(len(self._hidden_stack) - 1, -1, -1):
+            if self._hidden_stack[i] == tag:
+                del self._hidden_stack[i:]
+                break
 
     def handle_data(self, data):
-        if not self._skip_depth:
-            self._chunks.append(data)
+        if self._in_style:
+            self._css.append(data)
+            return
+        if self._skip_depth:
+            return
+        if self._hidden_stack:
+            # Only non-whitespace counts: indentation inside a hidden wrapper
+            # is not planted text, and flagging it would make the signal
+            # useless by firing on almost every HTML message.
+            if data.strip():
+                self.hidden_text_present = True
+                self._dropped.append(data.strip())
+            return
+        self._chunks.append(data)
 
     def text(self) -> str:
         raw = "".join(self._chunks)
         lines = (re.sub(r"[ \t]+", " ", ln).strip() for ln in raw.splitlines())
         return "\n".join(ln for ln in lines if ln)
 
+    def hidden_report(self) -> dict:
+        """What was dropped, as a classification rather than as content.
 
-def strip_html(html_text: str) -> str:
+        The dropped text stays in Python and NEVER reaches a model context:
+        it was hidden from the user, so handing it to the model would undo the
+        containment we just achieved. What crosses the boundary is our own
+        judgement about it.
+
+        `present` is a diagnostic, not a signal. Measured over the 400 most
+        recent messages in the live mailbox (2026-08-06): 224 had an HTML part
+        and 183 of those -- 82% -- hid text, essentially all of it legitimate
+        preheader copy padded with U+034F runs. A trigger with an 82% base rate
+        is an alarm that gets ignored, so 6.7 keys off `suspicious`, which
+        requires injection-SHAPED content and not merely concealed content.
+        """
+        reasons = untrusted.injection_signals(" ".join(self._dropped))
+        return {"present": self.hidden_text_present,
+                "suspicious": bool(reasons),
+                "reasons": reasons}
+
+
+NO_HIDDEN_TEXT = {"present": False, "suspicious": False, "reasons": []}
+
+
+def strip_html(html_text: str):
+    """Returns (text, hidden_report) -- see _HTMLTextExtractor.hidden_report."""
     parser = _HTMLTextExtractor()
     parser.feed(html_text)
     parser.close()
-    return parser.text()
+    return parser.text(), parser.hidden_report()
 
 
 def extract_body(msg, force_html: bool):
-    """Returns (body, source_part). Default is the message's text/plain
+    """Returns (body, source_part, hidden_report). Default is the text/plain
     part; falls back to tag-stripped text/html when there is no text/plain
     part OR --html-text was given -- design review §4's two trigger
     conditions ("when no text/plain, or flag given") are ORed, not
@@ -359,16 +581,17 @@ def extract_body(msg, force_html: bool):
     perfectly readable plain part exists would be a worse default)."""
     plain_part = find_part(msg, "plain")
     if plain_part is not None and not force_html:
-        return decode_text_part(plain_part), "text/plain"
+        return decode_text_part(plain_part), "text/plain", NO_HIDDEN_TEXT
 
     html_part = find_part(msg, "html")
     if html_part is not None:
-        return strip_html(decode_text_part(html_part)), "text/html-stripped"
+        text, hidden = strip_html(decode_text_part(html_part))
+        return text, "text/html-stripped", hidden
 
     if plain_part is not None:
-        return decode_text_part(plain_part), "text/plain"
+        return decode_text_part(plain_part), "text/plain", NO_HIDDEN_TEXT
 
-    return None, None
+    return None, None, NO_HIDDEN_TEXT
 
 
 def load_account_members(conn: sqlite3.Connection, account: str) -> dict:
@@ -684,7 +907,9 @@ FLAG_HANDLES = untrusted.under("actions", {"message_id"})
 # References chain, and `&lt;id@host&gt;` is a corrupt References value.
 # `source_part` is our own content-type label; `file` is the Maildir filename,
 # generated by mbsync rather than by any sender.
-READ_TRUSTED = {"source_part", "file"}
+# hidden_text_reasons is a list of OUR OWN labels, not sender text -- the one
+# place in this script where a string array is genuinely pipeline-generated.
+READ_TRUSTED = {"source_part", "file", "hidden_text_reasons"}
 READ_HANDLES = {"headers.Message-ID", "headers.In-Reply-To"}
 # The one full nonce envelope in this script: the body is long free text with
 # room for an injection to work, and it is where recency-bias framing earns
@@ -980,14 +1205,25 @@ def cmd_read(args: argparse.Namespace) -> None:
             "headers": full_message_headers(msg),
             "body": None,
             "source_part": None,
+            "hidden_text_present": False,
+            "hidden_text_suspicious": False,
+            "hidden_text_reasons": [],
             "file": rel_file,
         }
     else:
-        body, source_part = extract_body(msg, force_html=args.html_text)
+        body, source_part, hidden = extract_body(msg, force_html=args.html_text)
         result = {
             "headers": selected_message_headers(msg),
             "body": body,
             "source_part": source_part,
+            # 6.4. `present` is a diagnostic: 82% of HTML mail in this
+            # mailbox hides text, nearly all of it legitimate preheader copy.
+            # `suspicious` is the signal 6.7 acts on -- it means the dropped
+            # text was injection-SHAPED. The dropped text itself is never
+            # emitted; only our classification of it crosses into context.
+            "hidden_text_present": hidden["present"],
+            "hidden_text_suspicious": hidden["suspicious"],
+            "hidden_text_reasons": hidden["reasons"],
             "file": rel_file,
         }
     # 6.3: the body gets the full nonce envelope, built inside apply_trust so

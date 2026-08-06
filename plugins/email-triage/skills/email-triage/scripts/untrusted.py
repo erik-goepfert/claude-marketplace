@@ -21,6 +21,7 @@ believe (pipeline-authored framing), `untrusted` names the layer you
 quarantine (sender bytes).
 """
 
+import re
 import uuid
 from collections.abc import Mapping
 
@@ -40,11 +41,38 @@ _ENTITIES = {ord("&"): "&amp;", ord("<"): "&lt;", ord(">"): "&gt;"}
 _CONTROLS = {c: None for c in range(0x20) if c not in (0x09, 0x0A)}
 _CONTROLS[0x7F] = None
 
-_ESCAPE_TABLE = {**_ENTITIES, **_CONTROLS}
+# Unicode invisibles, stripped from PROSE only (decision 2026-08-06, from
+# measuring live mail: newsletters pad their preheaders with runs of U+034F and
+# soft hyphens). Two reasons to drop them. They carry no reading meaning in
+# extracted text, and they are an obfuscation vector -- "ig​nore prev\xadious
+# instructions" reads normally to a model while defeating any pattern match,
+# so stripping them is what makes injection_signals() below worth running.
+#
+# Enumerated as explicit ranges rather than by asking unicodedata for category
+# Cf, because that means a million calls at import time in a CLI that runs many
+# times per session -- and because a reviewer can audit a list. Deliberately
+# NOT applied to handles: see strip_controls().
+_INVISIBLE_RANGES = (
+    (0x00AD, 0x00AD),    # soft hyphen -- the other half of newsletter padding
+    (0x034F, 0x034F),    # combining grapheme joiner (the U+034F runs above)
+    (0x061C, 0x061C),    # Arabic letter mark
+    (0x180E, 0x180E),    # Mongolian vowel separator
+    (0x200B, 0x200F),    # zero-width space/non-joiner/joiner, LRM, RLM
+    (0x202A, 0x202E),    # bidi embedding and override
+    (0x2060, 0x2064),    # word joiner, invisible times/separator/plus
+    (0x2066, 0x206F),    # bidi isolates, deprecated format characters
+    (0xFEFF, 0xFEFF),    # BOM / zero-width no-break space
+    (0xFFF9, 0xFFFB),    # interlinear annotation
+    (0x1D173, 0x1D17A),  # musical notation format characters
+    (0xE0000, 0xE007F),  # tag characters -- the Unicode-tag smuggling block
+)
+_INVISIBLES = {c: None for lo, hi in _INVISIBLE_RANGES for c in range(lo, hi + 1)}
+
+_ESCAPE_TABLE = {**_ENTITIES, **_CONTROLS, **_INVISIBLES}
 
 
 def escape(text):
-    """Entity-encode `&`, `<`, `>` and drop control chars (except tab/newline).
+    """Entity-encode `&`, `<`, `>`, drop control chars and Unicode invisibles.
 
     This step is what makes "no literal `<` from a sender" true in our JSON:
     json.dumps escapes quotes and control characters but passes `<`/`>`
@@ -65,9 +93,15 @@ def strip_controls(text):
     matches them against the raw source: `&amp;` never equals `&`, so
     escaping a handle silently breaks the round-trip — and a silent break
     reads as "that link is dead," not as a bug in our wrapping layer (UC §5,
-    "Handles vs. prose"). Control characters are never legitimate in a handle
-    and stripping them cannot break a lookup that would otherwise have
-    worked.
+    "Handles vs. prose").
+
+    This strips ASCII controls only — NOT the Unicode invisibles that escape()
+    removes. The asymmetry is deliberate: a soft hyphen inside a real
+    Message-ID is unlikely but legal, and if the index stored one, silently
+    dropping it here would break every lookup for that message with no visible
+    cause. Keeping markup and invisibles out of handles belongs at index time
+    (reject on write), where a rejection is loud, rather than at emit time,
+    where a mutation is silent.
     """
     return text.translate(_CONTROLS)
 
@@ -278,6 +312,71 @@ def apply_trust(payload, trusted_fields, handle_fields=(), envelope_fields=None,
         "untrusted_fields": sorted(untrusted),
     }
     return {"_trust": manifest, **result}
+
+
+# ---------------------------------------------------------------------------
+# Injection-shape detection (Phase 6.4/6.7)
+# ---------------------------------------------------------------------------
+# Lives here rather than in threads.py because two callers need the same
+# judgement: 6.4 runs it over text it dropped as hidden (where the dropped text
+# stays in Python and only our classification crosses into a model context),
+# and 6.7 runs it over visible body text for the priority scan.
+#
+# This is a SIGNAL, not a filter. Containment does not depend on it: hidden
+# text is dropped whether or not it matches, and visible text is escaped and
+# enveloped whether or not it matches. A miss therefore costs a warning, not a
+# breach — which is the only reason a regex list is an acceptable tool here.
+_INJECTION_PATTERNS = (
+    ("instruction-override phrasing", re.compile(
+        r"\b(?:ignore|disregard|forget|override)\b[^.!?\n]{0,40}?"
+        r"\b(?:previous|prior|above|preceding|earlier|all|any|system)\b"
+        r"[^.!?\n]{0,20}?\b(?:instruction|prompt|rule|direction|command)s?\b", re.I)),
+    ("claimed system or developer authority", re.compile(
+        r"^\s*(?:system|assistant|developer|admin(?:istrator)?)\s*:"
+        r"|\b(?:system|developer)\s+(?:prompt|message|instruction|override)\b"
+        r"|<\|[a-z_]+\|>|\[/?INST\]|###\s*instruction", re.I | re.M)),
+    # Second person is load-bearing in every branch here. A bare "as an AI" or
+    # "AI assistant" fires on ordinary mail -- "As an AI enthusiast, I thought
+    # you'd enjoy this" and "Meet our new AI assistant" are marketing copy, not
+    # injections. The shape that matters is a message TALKING TO the model.
+    ("addresses an AI assistant directly", re.compile(
+        r"\bif\s+you(?:'re|\s+are)\s+an?\s+(?:ai|assistant|language model|llm)\b"
+        r"|\b(?:dear|hey|hello|attention)\s+(?:ai|assistant|claude|chatgpt|copilot)\b"
+        r"|\byou\s+are\s+(?:an?\s+)?(?:ai|assistant|language model|llm)\b"
+        r"|\byour\s+ai\s+assistant\s+(?:should|must|will|needs?|ought)\b", re.I)),
+    ("claims to speak for the user", re.compile(
+        r"\bthe\s+user\s+(?:has\s+)?(?:approved|authorized|authorised|confirmed|"
+        r"agreed|asked|wants|requested)\b|\bon\s+behalf\s+of\s+the\s+user\b"
+        r"|\bno\s+(?:further\s+)?(?:approval|confirmation)\s+(?:is\s+)?"
+        r"(?:needed|required)\b", re.I)),
+    # Must name the user explicitly. "Don't tell anyone, the sale starts
+    # tomorrow!" and "keep this confidential" are everyday copy; what marks an
+    # injection is instructing the assistant to hide something from its
+    # principal, and that requires naming the principal.
+    ("urges concealment from the user", re.compile(
+        r"\b(?:do\s*n[o']?t|never|without)\s+(?:tell|telling|inform|informing|"
+        r"mention|mentioning|show|showing|ask|asking|notify|notifying)\b"
+        r"[^.!?\n]{0,30}?\bthe\s+(?:user|recipient|human|owner|account\s+holder)\b"
+        r"|\b(?:hide|conceal)\s+[^.!?\n]{0,25}?\bfrom\s+the\s+"
+        r"(?:user|recipient|human|owner)\b", re.I)),
+)
+
+
+def injection_signals(text):
+    """Reason labels for injection-shaped content in `text`; empty if none.
+
+    Matched against a normalized copy — Unicode invisibles removed and
+    whitespace collapsed — so padding cannot break a phrase up ("ig​nore
+    prev­ious instructions" matches). The labels are pipeline-authored
+    strings safe to put in output; the matched text is never returned, so a
+    caller cannot accidentally quote sender bytes into a model context by
+    reporting a signal.
+    """
+    if not text:
+        return []
+    normalized = re.sub(r"\s+", " ", text.translate(_INVISIBLES))
+    return [label for label, pattern in _INJECTION_PATTERNS
+            if pattern.search(normalized)]
 
 
 def under(base, fields):

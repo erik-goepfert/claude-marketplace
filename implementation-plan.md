@@ -1160,7 +1160,7 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       `account` to prove the dotted-path match holds where the key space is
       sender-chosen. Containment is not redaction — the injected text is
       preserved verbatim inside the envelope, because 6.7 needs to see it.
-- [ ] **6.4 Neutralize HTML hidden-text.** Extend `_HTMLTextExtractor`:
+- [x] **6.4 Neutralize HTML hidden-text.** Extend `_HTMLTextExtractor`:
       skip content inside elements whose inline `style` carries
       `display:none` / `visibility:hidden` / zero-or-near-zero font-size,
       plus `aria-hidden` and `<template>`; set `hidden_text_present: true`
@@ -1168,6 +1168,69 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       the CSS-hidden gap the general doc wrongly assumed html2text
       covered. Tests: hidden div dropped + flag set; visible text kept.
       (UC §4 step 3, UC §2)
+      **DONE 2026-08-06 — and the live verification (exit criterion 2) changed
+      the design twice.** That criterion exists because a fixture cannot tell
+      you what real mail looks like; it earned its keep here.
+
+      **(a) The flag as specified was not a signal.** Measured over the 583
+      HTML messages among the 1,200 most recent: **454 (78%) hide text**,
+      essentially all of it legitimate preheader copy padded with U+034F and
+      soft-hyphen runs. Wiring a 78%-base-rate boolean to 6.7's interrupt would
+      have produced an alarm trained away within one session. **Resolution
+      (user decision):** the dropped text stays in Python and never enters a
+      model context — putting it back would undo the containment — and the
+      extractor instead runs a script-side injection-shape check over it.
+      Output is `hidden_text_present` (diagnostic), `hidden_text_suspicious`
+      (what 6.7 acts on), `hidden_text_reasons` (our own labels, so reporting
+      a signal can never leak sender bytes). Measured: 454 `present`, **0
+      `suspicious`** — which validates the false-positive rate, not the
+      detection rate, since nothing has actually attacked this mailbox. The
+      detector is `untrusted.injection_signals()`, placed there rather than in
+      `threads.py` because **6.7 needs the same judgement over the visible
+      body** — so 6.7's detection work is partly pre-built. Its
+      false-positive tests are the load-bearing ones and caught two over-broad
+      patterns before commit ("As an AI enthusiast…", "Don't tell anyone, but
+      the sale…"); both now require second person or an explicit reference to
+      the user.
+
+      **(b) Three real bugs, each visible only on live mail, each now a named
+      regression test.** All three dropped *legitimate* content — the failure
+      mode that silently degrades classification instead of announcing itself:
+      1. **`font-size:0` alone is layout, not concealment.** MJML emits it on
+         every wrapper `<td>` to kill inline-block whitespace, and children set
+         their own size. Believing it dropped **100% of the body** of every
+         Amazon and Sweetgreen message. Tiny font now requires a corroborating
+         property (`max-height:0`, `line-height:0`, `overflow:hidden`,
+         `color:#fff`…) — which is what real preheaders carry and layout
+         wrappers do not.
+      2. **`@media` rules are responsive design.** `@media(max-width:480px)
+         {.m-hide{display:none}}` hides on phones only. Selector harvesting now
+         tracks brace depth and ignores anything inside an at-rule.
+      3. **A `{` inside a CSS comment desynced the brace walk**, harvesting
+         `#body` from an Audible message and hiding the entire document.
+         Comments are stripped first; selector blobs over 120 chars or 4 tokens
+         are distrusted; and selector-based hiding never applies to
+         `html`/`body` — a message with nothing visible is a bug in our CSS
+         reading, not a human/model asymmetry, so it fails toward showing.
+
+      **Net effect on ergonomics (exit criterion 4's concern):** word retention
+      against the pre-6.4 extractor went median 0.45 → **0.99** (p25 0.95,
+      p10 0.82); messages losing >40% of their words went 15.1% → **7.3%**, and
+      that remainder is mostly spam senders, which genuinely do stuff hidden
+      text. The character-based metric that first showed "50% of text lost" was
+      misleading — it counted the invisible padding we correctly drop. Word
+      retention is the honest measure.
+
+      **Also landed here (user decision):** `escape()` now strips Unicode
+      invisibles (the Cf ranges, U+034F, the U+E0000 tag block), not only ASCII
+      controls. They are the padding above, and they are an obfuscation vector
+      — zero-width and soft-hyphen characters can break up "ignore previous
+      instructions" so it reads normally to a model while defeating any pattern
+      match, so stripping them is what makes the detector worth running.
+      Deliberately NOT applied to handles (`strip_controls`): silently dropping
+      a character from a lookup key breaks every lookup for that message with
+      no visible cause, so keeping handles clean belongs at index time, where a
+      rejection is loud.
 - [ ] **6.5 Trusted-column allowlist on the DB read path.** A
       default-deny `TRUSTED_COLUMNS` allowlist (UC §6, named against
       our real `envelopes`/`events`/`session_notes`/`contacts`/`rules`/
