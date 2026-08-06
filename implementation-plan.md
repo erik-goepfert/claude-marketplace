@@ -1054,7 +1054,7 @@ couldn't know and this phase must handle: our threading headers
 (`message_id`/`in_reply_to`/`references_chain`) DO reach the model, and
 our `strip_html` does NOT neutralize CSS-hidden text.
 
-- [ ] **6.1 `untrusted.py` — the shared containment helper.** The choke
+- [x] **6.1 `untrusted.py` — the shared containment helper.** The choke
       point our architecture puts in the *scripts*, not a data-access
       layer (UC §2). Three functions every emitter imports:
       `escape()` (entity-encode `&`/`<`/`>` in one translate pass so `&`
@@ -1075,6 +1075,32 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       persistence layer reuses the same helper). Tests: no-double-escape,
       no literal `<` survives escape, `untrusted-content` tag appears
       exactly twice, nonce fresh per call. (UC §§4–5; invariants 1–4)
+      **DONE 2026-08-06** — `untrusted.py` (~290 lines) + `test_untrusted.py`
+      (33 tests, stdlib only). Five API/implementation decisions the task
+      text didn't settle, all of which 6.2 depends on:
+      (a) **`escape()` vs `strip_controls()`** are separate functions, not a
+      flag — escaping is for prose, control-stripping is the handle
+      treatment, and a boolean would let a caller pick the wrong one silently;
+      (b) **path convention:** a value's path is the dot-join of the dict keys
+      above it, with **list indices omitted**, so `threads[7].latest.subject`
+      is `threads.latest.subject` and a 200-thread output still has one
+      manifest entry per field. Allowlists are therefore path-absolute
+      (`latest.folder`, not `folder`) — verbose on purpose, since UC §5's
+      `headers.account` hole is exactly what a leaf-name shortcut reopens;
+      (c) **dict keys are escaped unconditionally.** A no-op for every field
+      name we author, and it neutralizes sender-chosen header names under
+      `--headers-only`. Matching uses the raw key, the manifest reports the
+      escaped path (the path the model actually sees);
+      (d) **`apply_trust` builds the envelope itself** via
+      `envelope_fields={"body": "email body"}` rather than accepting a
+      pre-wrapped value. Removes the double-escape trap (wrap-then-manifest
+      would re-escape the envelope's own tags) and makes the manifest and
+      envelope share one nonce by construction;
+      (e) **two guards raise:** a bare array at the top level (nowhere to put
+      `_trust`), and a top-level `_trust` already present — the latter makes
+      UC §5's "don't flatten header dicts" rule mechanical rather than
+      advisory. Also added `string_paths()`, the helper 6.2's structural
+      tests and exit criterion 1 hang off.
 - [ ] **6.2 Escape + manifest at every scalar emitter.** Each emitter
       (`threads.py` list/compact/show/residue/flag, `indexer.py` index
       change report, `unsub.py` links, `batch.py`
