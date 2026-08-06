@@ -59,13 +59,9 @@ import untrusted  # noqa: E402
 # Destination tier -> logged action. Anything absent is not a triage
 # destination and fails pre-flight (untriaged, sent, drafts, all_mail,
 # container, unrecognized).
-TIER_TO_ACTION = {
-    "trash": "trash",
-    "junk": "trash",
-    "active": "activate",
-    "ongoing": "archive",
-    "cold": "archive",
-}
+# Shared with indexer's --suggest-events (6.9): one copy, so the batch executor
+# and the change-report deriver cannot disagree about what an archive is.
+TIER_TO_ACTION = indexer.TIER_TO_ACTION
 
 ENVELOPE_SQL = """SELECT from_addr, subject FROM envelopes
                   WHERE account = ? AND message_id = ? AND folder = ?"""
@@ -280,7 +276,10 @@ def log_events(data_dir: Path, done: list) -> int:
 EVENT_TRUSTED = {"session_started_at", "account", "thread_state", "category",
                  "proposed_action", "final_action", "from_folder", "to_folder",
                  "decided_by"}
-EVENT_HANDLES = {"message_id", "thread_root_id"}
+# sender_addr joins the handles here to match history.py's column
+# classification (6.5): it is the key `--senders` and rule predicates match
+# on, so an escaped copy in a dry-run preview is one the model must not reuse.
+EVENT_HANDLES = {"message_id", "thread_root_id", "sender_addr"}
 
 BATCH_TRUSTED = (
     {"dry_run", "sync"}

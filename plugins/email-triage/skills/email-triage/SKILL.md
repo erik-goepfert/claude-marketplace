@@ -233,28 +233,30 @@ frontend rules stay a contiguous tail that can be stripped wholesale.
    on Stage 2** (step 6) — never rename files while mbsync may be walking
    the same folders.
 4. **Index and consume the change report.**
-   `$IDX index` → JSON change report
-   (shape: reference §JSON). Detected changes are provably external —
-   everything non-priority still reflects last session's final state.
-   **Consume EVERY index run's report this way** — the pre-act re-index
-   (step 6) surfaces the rest of the mailbox once Stage 2 lands. Rules,
-   in order:
-   - **Self-echo exclusion FIRST.** Drop every entry matching an action
-     you executed and logged this session — logging your own echo as
-     `manual` double-counts decisions and corrupts sender stats.
-   - `moved` → one manual event by destination tier: `trash` →
-     `final_action=trash`; `cold`/`ongoing` → `archive`; `active` →
-     `activate`. All: `decided_by=manual`,
-     `proposed_action=final_action`, folders from the entry.
-   - `deleted` FROM trash/junk tier → server auto-purge, a non-event (no
-     log, no mention). From ANY other folder → mail vanished without
-     passing through trash: surface to the user; log a manual `trash`
-     only if they confirm intent.
-   - `flag_changed` → compare `old_flags`/`new_flags`: log a manual
-     `flag` event **only when `\Flagged` itself changed**. `\Seen` deltas
-     are read-churn — never log them.
-   - `new` in the account's Sent folder → manual *reply* event; resolve
-     `sender_addr` via `$THR show` (the thread's other participant).
+   ```sh
+   <scripts-dir>/indexer.py index --suggest-events --session <session>
+   ```
+   Detected changes are provably external — everything non-priority still
+   reflects last session's final state. **Run this on EVERY index**,
+   including the pre-act re-index (step 6), which surfaces the rest of the
+   mailbox once Stage 2 lands.
+
+   `--suggest-events` does the derivation that used to be your job here
+   (tier→action mapping, `\Flagged`-vs-`\Seen` deltas, Sent→reply,
+   self-echo subtraction). It **proposes; it never logs.** Four buckets:
+   - `suggested_events` → review them, then log with `$HIST log-events
+     --file <suggestions.log_file>`. **Pass the file; never retype the
+     rows** — the copy shown to you is entity-escaped for display, and
+     `history.db` stores clean text. Delete lines from the file to reject.
+   - `needs_confirmation` → a real user decision, one per entry. Ask; log
+     only what they confirm.
+   - `unresolved` → derivation failed with a reason attached (ambiguous
+     counterparty, unindexed parent). Never a guessed `sender_addr`.
+   - `self_echo_absorbed` → **read this list.** These are entries dropped
+     because you already logged them this session. `decided_by=manual` is
+     a factual claim that the *user* acted outside a session, so if
+     something you did appears here wrongly — or something you did NOT do
+     is missing from it — the stats are about to be wrong.
    - `parse_errors` > 0 → surface, don't drop.
    - `unrecognized_folders` → surface as audit debt + session note; don't
      infer.

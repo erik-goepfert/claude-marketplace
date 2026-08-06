@@ -55,7 +55,7 @@ import sqlite3
 import sys
 from collections import defaultdict
 from email.parser import BytesHeaderParser
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from pathlib import Path
 
 import untrusted
@@ -604,9 +604,47 @@ def change_report_handles(prefix: str = "") -> set:
                          for kind in CHANGE_REPORT_KINDS))
 
 
+# Destination tier -> logged action. Lives here rather than in batch.py so the
+# batch executor and `--suggest-events` derive an action the SAME way (6.9's
+# "extract that map so both share one copy, not two"): two copies of a
+# tier->action mapping is two chances to disagree about what an archive is.
+TIER_TO_ACTION = {
+    "trash": "trash",
+    "junk": "trash",
+    "active": "activate",
+    "ongoing": "archive",
+    "cold": "archive",
+}
+
 # unrecognized_folders holds folder names, which no sender can choose.
 INDEX_TRUSTED = change_report_trusted() | {"unrecognized_folders"}
 INDEX_HANDLES = change_report_handles()
+
+# 6.9's suggestion layer. sender_addr is a HANDLE, matching history.py's column
+# classification -- it is the key `--senders` and rule predicates match on, so
+# an escaped copy in a preview is a copy the model must not reuse.
+SUGGEST_EVENT_TRUSTED = {
+    "session_started_at", "account", "proposed_action", "final_action",
+    "decided_by", "from_folder", "to_folder", "thread_state", "category",
+}
+SUGGEST_EVENT_HANDLES = {"message_id", "thread_root_id", "sender_addr"}
+_SUG = "suggestions"
+SUGGEST_TRUSTED = (
+    {f"{_SUG}.log_file", f"{_SUG}.note"}
+    | untrusted.under(f"{_SUG}.suggested_events", SUGGEST_EVENT_TRUSTED)
+    | untrusted.under(f"{_SUG}.needs_confirmation",
+                      {"account", "folder", "reason", "folder_tier", "date_utc"})
+    | untrusted.under(f"{_SUG}.unresolved",
+                      {"account", "folder", "reason", "date_utc"})
+    | untrusted.under(f"{_SUG}.self_echo_absorbed",
+                      {"account", "logged_action", "date_utc"})
+)
+SUGGEST_HANDLES = (
+    untrusted.under(f"{_SUG}.suggested_events", SUGGEST_EVENT_HANDLES)
+    | untrusted.under(f"{_SUG}.needs_confirmation", {"message_id"})
+    | untrusted.under(f"{_SUG}.unresolved", {"message_id"})
+    | untrusted.under(f"{_SUG}.self_echo_absorbed", {"message_id"})
+)
 
 
 def envelope_report_entry(account, folder, fields: dict) -> dict:
@@ -761,6 +799,224 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list, tier
 
 
 # --------------------------------------------------------------------------
+# Suggested events (Phase 6.9): the change report, mechanized into proposed
+# event rows. PROPOSES, NEVER LOGS -- see suggest_events().
+# --------------------------------------------------------------------------
+
+
+def parse_config_emails_text(text: str) -> dict:
+    """{account: own email address} from config.yaml's accounts.<name>.email.
+
+    Needed to subtract the user's own address from a sent message's recipients:
+    a reply-all includes them, and they are not their own counterparty."""
+    emails: dict = {}
+    in_accounts = False
+    accounts_indent = None
+    current = None
+    current_indent = None
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        content = raw.strip()
+        if indent == 0 and content == "accounts:":
+            in_accounts, accounts_indent = True, 0
+            continue
+        if not in_accounts:
+            continue
+        if indent == 0 and content != "accounts:":
+            break
+        if current_indent is not None and indent <= current_indent and content.endswith(":"):
+            current = None
+        if content.endswith(":") and (accounts_indent is None or indent > accounts_indent):
+            if current is None or indent <= current_indent:
+                current, current_indent = content[:-1].strip(), indent
+                continue
+        if current and content.startswith("email:"):
+            emails[current] = content.split(":", 1)[1].strip().strip("'\"")
+    return emails
+
+
+def parse_config_emails(config_path) -> dict:
+    path = Path(config_path)
+    return parse_config_emails_text(path.read_text()) if path.is_file() else {}
+
+
+def logged_this_session(data_dir, session: str) -> dict:
+    """{(account, message_id): final_action} already logged for `session`.
+
+    The authoritative self-echo record, and the actual reason 6.9 is worth
+    building. The prose rule it replaces ("drop entries matching what you
+    executed and logged this session") depends on model recall across a long,
+    possibly compacted session; this is a SELECT and cannot forget. batch.py
+    already absorbs its own echo in-memory, but hand-done flags and replies --
+    and anything past a compaction boundary -- were model memory alone."""
+    db = Path(data_dir) / "history.db"
+    if not session or not db.is_file():
+        return {}
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return {
+            (account, message_id): action
+            for account, message_id, action in conn.execute(
+                "SELECT account, message_id, final_action FROM events "
+                "WHERE session_started_at = ?", (session,))
+        }
+    finally:
+        conn.close()
+
+
+def _recipient_counterparty(conn, entry: dict, own_email: str):
+    """(addr, None) or (None, reason) for a message WE sent.
+
+    The counterparty of a reply is its recipient. The plan reached for thread
+    members' from_addr, but the To header of the sent message is the same answer
+    without pulling thread assembly into the indexer -- and it fails the same
+    way (a group thread has several recipients), which is the case that must
+    land in `unresolved` rather than guess."""
+    row = conn.execute(
+        "SELECT to_addr FROM envelopes WHERE account = ? AND message_id = ? "
+        "AND folder = ?",
+        (entry["account"], entry["message_id"], entry["folder"]),
+    ).fetchone()
+    if row is None or not row[0]:
+        return None, "sent message has no To header to derive a counterparty from"
+    mine = (own_email or "").strip().lower()
+    addrs = sorted({
+        addr.strip().lower()
+        for _name, addr in getaddresses([row[0]])
+        if addr.strip() and addr.strip().lower() != mine
+    })
+    if not addrs:
+        return None, "every recipient is the account's own address"
+    if len(addrs) > 1:
+        return None, f"{len(addrs)} recipients -- counterparty is ambiguous"
+    return addrs[0], None
+
+
+def suggest_events(conn, report: dict, tier_maps: dict, account_emails: dict,
+                   logged: dict, session: str) -> dict:
+    """Turn a change report into PROPOSED event rows. Never logs anything.
+
+    `batch.py` is safe to let act because it acts only on explicit instruction.
+    This infers intent from filesystem deltas -- one step further removed -- so
+    auto-logging would make a derivation bug both invisible and scaled. The
+    output is a proposal a human confirms.
+
+    Four buckets:
+      suggested_events    ready for `$HIST log-events`
+      needs_confirmation  mechanically classified, but the call is the user's
+      unresolved          could not be derived; reason attached, never a guess
+      self_echo_absorbed  a VISIBLE LIST, not a count -- `decided_by=manual` is
+                          a factual claim that the user acted outside a session,
+                          so an echo-subtraction gap would relabel OUR action as
+                          theirs. The list is what makes that mismatch
+                          surfaceable instead of silent.
+
+    Takes the report BEFORE it is trust-wrapped, deliberately: the rows it
+    builds are written to history.db, and 6.5 established that at-rest text is
+    clean. Deriving them from escaped output would store `&lt;b&gt;` as a
+    subject, which then escapes again on the next read.
+    """
+    suggested, needs_confirmation, unresolved, absorbed = [], [], [], []
+
+    def ref(entry, **extra):
+        return {k: entry.get(k) for k in
+                ("account", "message_id", "subject", "from_addr", "date_utc")} | extra
+
+    def absorbed_echo(entry) -> bool:
+        key = (entry.get("account"), entry.get("message_id"))
+        if key in logged:
+            absorbed.append(ref(entry, logged_action=logged[key]))
+            return True
+        return False
+
+    def tier_of(account, folder):
+        return classify_folder_tier(folder, tier_maps.get(account, {}))
+
+    def event(entry, final, *, from_folder, to_folder, decided_by="manual"):
+        return {
+            "session_started_at": session,
+            "account": entry["account"],
+            "message_id": entry["message_id"],
+            "sender_addr": entry.get("from_addr") or "unknown@invalid",
+            "subject": entry.get("subject"),
+            "proposed_action": final,
+            "final_action": final,
+            "from_folder": from_folder,
+            "to_folder": to_folder,
+            "decided_by": decided_by,
+        }
+
+    for entry in report["moved"]:
+        if absorbed_echo(entry):
+            continue
+        tier = tier_of(entry["account"], entry["to_folder"])
+        action = TIER_TO_ACTION.get(tier)
+        if action is None:
+            unresolved.append(ref(entry, folder=entry["to_folder"],
+                                  reason=f"destination tier {tier!r} maps to no "
+                                         "triage action"))
+            continue
+        suggested.append(event(entry, action, from_folder=entry["from_folder"],
+                               to_folder=entry["to_folder"]))
+
+    for entry in report["flag_changed"]:
+        if absorbed_echo(entry):
+            continue
+        old, new = set(entry.get("old_flags") or []), set(entry.get("new_flags") or [])
+        # \Seen churn is never an event: rule 5 makes \Seen the user's own
+        # signal, and it changes constantly for reasons that are not decisions.
+        if ("Flagged" in new) == ("Flagged" in old):
+            continue
+        if "Flagged" in new:
+            suggested.append(event(entry, "flag", from_folder=entry["folder"],
+                                   to_folder=None))
+        else:
+            # Clearing \Flagged retires a reply debt, but not via any verb in
+            # ACTIONS -- they either replied (there would be a sent message) or
+            # decided not to. Genuinely ambiguous, so ask.
+            needs_confirmation.append(ref(
+                entry, folder=entry["folder"],
+                reason="\\Flagged cleared without a move: reply debt retired, "
+                       "but by replying or by deciding not to?"))
+
+    for entry in report["new"]:
+        if tier_of(entry["account"], entry["folder"]) != "sent":
+            # A new arrival is not a decision, and a new file in a filed folder
+            # is covered by `moved` when we can see where it came from.
+            continue
+        if absorbed_echo(entry):
+            continue
+        addr, reason = _recipient_counterparty(
+            conn, entry, account_emails.get(entry["account"], ""))
+        if addr is None:
+            unresolved.append(ref(entry, folder=entry["folder"], reason=reason))
+            continue
+        row = event(entry, "reply", from_folder=None, to_folder=entry["folder"])
+        row["sender_addr"] = addr
+        suggested.append(row)
+
+    for entry in report["deleted"]:
+        if absorbed_echo(entry):
+            continue
+        tier = tier_of(entry["account"], entry["folder"])
+        needs_confirmation.append(ref(
+            entry, folder=entry["folder"], folder_tier=tier,
+            reason=("expunged from trash/junk -- cleanup, probably not a triage "
+                    "decision" if tier in ("trash", "junk") else
+                    f"file vanished from a {tier!r} folder without reappearing "
+                    "elsewhere -- confirm this was intended")))
+
+    return {
+        "suggested_events": suggested,
+        "needs_confirmation": needs_confirmation,
+        "unresolved": unresolved,
+        "self_echo_absorbed": absorbed,
+    }
+
+
+# --------------------------------------------------------------------------
 # DB setup / CLI
 # --------------------------------------------------------------------------
 
@@ -815,8 +1071,41 @@ def cmd_index(args: argparse.Namespace) -> None:
         conn.commit()
     finally:
         conn.close()
-    print(json.dumps(untrusted.apply_trust(report, INDEX_TRUSTED,
-                                           handle_fields=INDEX_HANDLES),
+    trusted, handles = INDEX_TRUSTED, INDEX_HANDLES
+    if args.suggest_events:
+        if not args.session:
+            raise FatalError("--suggest-events requires --session "
+                             "(the echo query and every event row need it)")
+        conn = sqlite3.connect(args.db)
+        try:
+            suggestions = suggest_events(
+                conn, report, tier_maps,
+                parse_config_emails(config_path),
+                logged_this_session(args.data_dir, args.session),
+                args.session)
+        finally:
+            conn.close()
+        # The CLEAN rows go to a file for `$HIST log-events --file`; only an
+        # ESCAPED copy goes to the model. That split is not ceremony: 6.5
+        # established that at-rest text in history.db is clean, so a row the
+        # model retyped out of escaped output would store `&lt;b&gt;` as a
+        # subject and escape again on the next read. This way no sender text has
+        # to survive a trip through the model at all -- the same move as
+        # `$UNSUB exec --link N`.
+        log_file = Path(args.data_dir) / "suggested-events.json"
+        log_file.write_text(json.dumps(suggestions["suggested_events"], indent=2))
+        report["suggestions"] = suggestions | {
+            "log_file": str(log_file),
+            "note": ("PROPOSALS, nothing was logged. Review these, then log the "
+                     "ones you accept with `$HIST log-events --file "
+                     f"{log_file}` -- pass the FILE, do not retype the rows "
+                     "(the copy shown here is entity-escaped for display). "
+                     "Edit the file to drop any you reject."),
+        }
+        trusted = trusted | SUGGEST_TRUSTED
+        handles = handles | SUGGEST_HANDLES
+    print(json.dumps(untrusted.apply_trust(report, trusted,
+                                           handle_fields=handles),
                      indent=2, sort_keys=True))
 
 
@@ -886,6 +1175,19 @@ def main() -> None:
         help="config.yaml path; default: <data-dir>/config.yaml via $EMAIL_TRIAGE_DATA_DIR "
              "(falls back to built-in tier-name defaults if absent)",
     )
+    idx_p.add_argument(
+        "--suggest-events", action="store_true", dest="suggest_events",
+        help="also derive PROPOSED event rows from the change report (6.9). A "
+             "flag on `index`, not its own subcommand, because the report is "
+             "ephemeral -- a second index run reports nothing, so the "
+             "suggestions have to be produced in the same pass that consumed "
+             "the deltas.",
+    )
+    idx_p.add_argument("--session", default=None,
+                       help="session_started_at; required with --suggest-events")
+    idx_p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
+                       help="holds history.db (for self-echo) and receives "
+                            "suggested-events.json")
     idx_p.set_defaults(func=cmd_index)
 
     pf_p = sub.add_parser(

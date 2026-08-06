@@ -187,6 +187,28 @@ index → re-index/sync; ambiguous → act manually).
 `moved` entries have `from_folder`/`to_folder` instead of `folder`;
 `flag_changed` entries add `old_flags`/`new_flags` (5.2).
 
+**`$IDX index --suggest-events --session <ts>` (6.9)** adds a `suggestions`
+object: `suggested_events[]` (ready for `$HIST log-events`),
+`needs_confirmation[]`, `unresolved[]` (each with a `reason`),
+`self_echo_absorbed[]` (each with the `logged_action` it matched), `log_file`,
+`note`.
+
+It is a **flag on `index`, not its own subcommand**, because the change report
+is ephemeral — a second index run reports nothing, so suggestions must come
+from the pass that consumed the deltas.
+
+**Two properties worth knowing.** It *proposes, never logs*: `batch.py` is safe
+to act because it acts on explicit instruction, while this infers intent from
+filesystem deltas, one step further removed, so a derivation bug must not be
+able to scale silently. And the rows in `log_file` are **clean text** while the
+copy in the JSON is **escaped for display** — pass the file to `log-events`,
+never retype the rows, or you store `&lt;b&gt;` as a subject and it escapes
+again on the next read.
+
+Self-echo comes from `SELECT ... FROM events WHERE session_started_at = ?`,
+which is authoritative and cannot forget across a compaction the way recall
+can. `--session` is required for exactly that query.
+
 **`$IDX priority-folders`:** `{"priority_folders": {<account>: {"fast":
 [names], "mbsync_fast": "<acct>:<f1>,<f2>,...", "slow_hint": "full
 channel"}}}` — pass `mbsync_fast` verbatim as ONE mbsync argument. (Wrapped

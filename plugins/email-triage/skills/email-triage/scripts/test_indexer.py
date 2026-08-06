@@ -23,6 +23,7 @@ import importlib.util
 import json
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -581,7 +582,8 @@ class ChangeReportTrustTests(unittest.TestCase):
         import io
         args = argparse.Namespace(
             db=self.db_path, maildir=self.maildir_root, account=None,
-            config=self.tmp / "no-such-config.yaml")
+            config=self.tmp / "no-such-config.yaml",
+            suggest_events=False, session=None, data_dir=self.tmp)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             indexer.cmd_index(args)
@@ -629,6 +631,283 @@ class ChangeReportTrustTests(unittest.TestCase):
             self.assertIn(f"{kind}.message_id", indexer.INDEX_HANDLES)
         nested = indexer.change_report_trusted("change_report.external")
         self.assertIn("change_report.external.moved.from_folder", nested)
+
+
+class SuggestEventsTests(unittest.TestCase):
+    """Phase 6.9: the change report mechanized into PROPOSED event rows."""
+
+    CONFIG = """accounts:
+  icloud:
+    email: me@icloud.example
+    tiers:
+      untriaged: INBOX
+      active: Active
+      ongoing: Areas
+      cold: Archive
+      sent: Sent Messages
+      drafts: Drafts
+      trash: Deleted Messages
+      junk: Junk
+"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="email-triage-sug-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.maildir_root = self.tmp / "mail"
+        self.db_path = self.tmp / "index.db"
+        self.config = self.tmp / "config.yaml"
+        self.config.write_text(self.CONFIG)
+        for folder in ("INBOX", "Active", "Archive", "Deleted Messages",
+                       "Sent Messages"):
+            for sub in ("cur", "new", "tmp"):
+                (self.maildir_root / "icloud" / folder / sub).mkdir(parents=True,
+                                                                   exist_ok=True)
+        subprocess.run([sys.executable, str(_INDEXER_PATH.parent / "init_history_db.py"),
+                        "--data-dir", str(self.tmp)], check=True, capture_output=True)
+
+    SESSION = "2026-08-06T00:00:00Z"
+
+    def run_index(self, suggest=True):
+        import argparse
+        import contextlib
+        import io
+        args = argparse.Namespace(
+            db=self.db_path, maildir=self.maildir_root, account=None,
+            config=self.config, suggest_events=suggest,
+            session=self.SESSION if suggest else None, data_dir=self.tmp)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            indexer.cmd_index(args)
+        payload = json.loads(buf.getvalue())
+        return payload, payload.pop("_trust")
+
+    def put(self, folder, key, mid, subject="Hi", frm="them@x.example",
+            to="me@icloud.example", flags=""):
+        write_message(self.maildir_root / "icloud" / folder, key, flags, {
+            "Message-ID": f"<{mid}>",
+            "Date": "Mon, 01 Jun 2026 10:00:00 -0700",
+            "From": frm, "To": to, "Subject": subject,
+        })
+
+    def move_file(self, src, dst, key):
+        s = next((self.maildir_root / "icloud" / src / "cur").glob(f"{key}*"))
+        s.rename(self.maildir_root / "icloud" / dst / "cur" / s.name)
+
+    # -- the tier->action mapping --
+
+    def test_tier_to_action_map_is_shared_with_batch(self):
+        # 6.9's "extract that map so both share one copy, not two".
+        self.assertEqual(indexer.TIER_TO_ACTION["trash"], "trash")
+        self.assertEqual(indexer.TIER_TO_ACTION["active"], "activate")
+        self.assertEqual(indexer.TIER_TO_ACTION["cold"], "archive")
+        self.assertEqual(indexer.TIER_TO_ACTION["ongoing"], "archive")
+
+    def test_move_to_each_tier_maps_to_its_action(self):
+        for i, (dst, action) in enumerate((("Deleted Messages", "trash"),
+                                           ("Archive", "archive"),
+                                           ("Active", "activate"))):
+            with self.subTest(dst=dst):
+                key, mid = f"k{i}", f"m{i}@x"
+                self.put("INBOX", key, mid)
+                self.run_index(suggest=False)
+                self.move_file("INBOX", dst, key)
+                _p, _t = None, None
+                payload, _trust = self.run_index()
+                rows = payload["suggestions"]["suggested_events"]
+                self.assertEqual(len(rows), 1, rows)
+                self.assertEqual(rows[0]["final_action"], action)
+                self.assertEqual(rows[0]["decided_by"], "manual")
+                self.assertEqual(rows[0]["session_started_at"], self.SESSION)
+
+    # -- flags --
+
+    def test_flagged_delta_emits_one_event_seen_churn_emits_none(self):
+        self.put("INBOX", "kf", "mf@x", flags="")
+        self.run_index(suggest=False)
+        # \Seen only: not a decision, rule 5 makes it the user's own signal.
+        f = next((self.maildir_root / "icloud" / "INBOX" / "cur").glob("kf*"))
+        f.rename(f.with_name(f.name.split(":2,")[0] + ":2,S"))
+        payload, _t = self.run_index()
+        self.assertEqual(payload["suggestions"]["suggested_events"], [])
+        self.assertEqual(payload["suggestions"]["needs_confirmation"], [])
+        # Now add \Flagged: one flag event.
+        f = next((self.maildir_root / "icloud" / "INBOX" / "cur").glob("kf*"))
+        f.rename(f.with_name(f.name.split(":2,")[0] + ":2,FS"))
+        payload, _t = self.run_index()
+        rows = payload["suggestions"]["suggested_events"]
+        self.assertEqual([r["final_action"] for r in rows], ["flag"])
+
+    def test_clearing_flagged_asks_rather_than_guessing(self):
+        self.put("INBOX", "kc", "mc@x", flags="F")
+        self.run_index(suggest=False)
+        f = next((self.maildir_root / "icloud" / "INBOX" / "cur").glob("kc*"))
+        f.rename(f.with_name(f.name.split(":2,")[0] + ":2,S"))
+        payload, _t = self.run_index()
+        self.assertEqual(payload["suggestions"]["suggested_events"], [])
+        reasons = [e["reason"] for e in payload["suggestions"]["needs_confirmation"]]
+        self.assertTrue(any("reply debt" in r for r in reasons), reasons)
+
+    # -- sent / replies --
+
+    def test_new_sent_message_becomes_a_manual_reply_event(self):
+        self.put("Sent Messages", "ks", "ms@x", frm="me@icloud.example",
+                 to="pete@x.example")
+        payload, _t = self.run_index()
+        rows = payload["suggestions"]["suggested_events"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["final_action"], "reply")
+        # Counterparty is the recipient, not us.
+        self.assertEqual(rows[0]["sender_addr"], "pete@x.example")
+
+    def test_own_address_is_subtracted_from_recipients(self):
+        self.put("Sent Messages", "kr", "mr@x", frm="me@icloud.example",
+                 to="pete@x.example, me@icloud.example")
+        payload, _t = self.run_index()
+        rows = payload["suggestions"]["suggested_events"]
+        self.assertEqual(rows[0]["sender_addr"], "pete@x.example")
+
+    def test_ambiguous_counterparty_lands_in_unresolved_not_guessed(self):
+        self.put("Sent Messages", "ka", "ma@x", frm="me@icloud.example",
+                 to="pete@x.example, dana@y.example")
+        payload, _t = self.run_index()
+        self.assertEqual(payload["suggestions"]["suggested_events"], [])
+        un = payload["suggestions"]["unresolved"]
+        self.assertEqual(len(un), 1)
+        self.assertIn("ambiguous", un[0]["reason"])
+        # Never a guessed sender_addr.
+        self.assertNotIn("sender_addr", un[0])
+
+    def test_new_inbox_arrival_is_not_a_decision(self):
+        self.put("INBOX", "kn", "mn@x")
+        payload, _t = self.run_index()
+        self.assertEqual(payload["suggestions"]["suggested_events"], [])
+        self.assertEqual(payload["suggestions"]["needs_confirmation"], [])
+
+    # -- deletions --
+
+    def test_deleted_routes_by_tier_and_never_emits_an_event(self):
+        self.put("INBOX", "kd", "md@x")
+        self.put("Deleted Messages", "kt", "mt@x")
+        self.run_index(suggest=False)
+        for folder, key in (("INBOX", "kd"), ("Deleted Messages", "kt")):
+            next((self.maildir_root / "icloud" / folder / "cur").glob(f"{key}*")).unlink()
+        payload, _t = self.run_index()
+        self.assertEqual(payload["suggestions"]["suggested_events"], [])
+        by_tier = {e["folder_tier"]: e["reason"]
+                   for e in payload["suggestions"]["needs_confirmation"]}
+        self.assertIn("cleanup", by_tier["trash"])
+        self.assertIn("confirm this was intended", by_tier["untriaged"])
+
+    # -- self-echo --
+
+    def test_events_logged_this_session_are_absorbed_and_LISTED(self):
+        """A visible list, not a count: decided_by=manual is a factual claim
+        that the USER acted outside a session, so an echo-subtraction gap would
+        relabel our own action as theirs."""
+        self.put("INBOX", "ke", "me1@x")
+        self.run_index(suggest=False)
+        self.move_file("INBOX", "Archive", "ke")
+        subprocess.run(
+            [sys.executable, str(_INDEXER_PATH.parent / "history.py"),
+             "--data-dir", str(self.tmp), "log-event",
+             "--session", self.SESSION, "--sender", "them@x.example",
+             "--account", "icloud", "--message-id", "me1@x",
+             "--proposed", "archive", "--final", "archive",
+             "--decided-by", "approved"],
+            check=True, capture_output=True)
+        payload, _t = self.run_index()
+        self.assertEqual(payload["suggestions"]["suggested_events"], [])
+        absorbed = payload["suggestions"]["self_echo_absorbed"]
+        self.assertEqual(len(absorbed), 1)
+        self.assertEqual(absorbed[0]["message_id"], "me1@x")
+        self.assertEqual(absorbed[0]["logged_action"], "archive")
+
+    def test_echo_absorption_is_scoped_to_the_named_session(self):
+        self.put("INBOX", "kz", "mz@x")
+        self.run_index(suggest=False)
+        self.move_file("INBOX", "Archive", "kz")
+        subprocess.run(
+            [sys.executable, str(_INDEXER_PATH.parent / "history.py"),
+             "--data-dir", str(self.tmp), "log-event",
+             "--session", "2026-01-01T00:00:00Z", "--sender", "them@x.example",
+             "--account", "icloud", "--message-id", "mz@x",
+             "--proposed", "archive", "--final", "archive",
+             "--decided-by", "approved"],
+            check=True, capture_output=True)
+        payload, _t = self.run_index()
+        # Logged in a DIFFERENT session, so it is external to this one.
+        self.assertEqual(len(payload["suggestions"]["suggested_events"]), 1)
+        self.assertEqual(payload["suggestions"]["self_echo_absorbed"], [])
+
+    # -- the propose/never-log boundary, and the clean/escaped split --
+
+    def test_nothing_is_logged(self):
+        self.put("INBOX", "kp", "mp@x")
+        self.run_index(suggest=False)
+        self.move_file("INBOX", "Archive", "kp")
+        self.run_index()
+        conn = sqlite3.connect(self.tmp / "history.db")
+        try:
+            (n,) = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(n, 0, "suggest-events must propose, never log")
+
+    def test_clean_rows_go_to_a_file_escaped_copy_to_the_model(self):
+        """The 6.2/6.5 interaction that shaped this design: at-rest history text
+        is clean, so a row retyped out of escaped output would store `&lt;b&gt;`
+        as a subject and escape again on the next read. The file carries the
+        clean rows; the model sees an escaped copy for review only."""
+        self.put("INBOX", "kx", "mx@x", subject="Deal <b>now</b> & more")
+        self.run_index(suggest=False)
+        self.move_file("INBOX", "Archive", "kx")
+        payload, trust = self.run_index()
+        shown = payload["suggestions"]["suggested_events"][0]["subject"]
+        self.assertEqual(shown, "Deal &lt;b&gt;now&lt;/b&gt; &amp; more")
+        self.assertIn("suggestions.suggested_events.subject",
+                      trust["untrusted_fields"])
+        on_disk = json.loads(Path(payload["suggestions"]["log_file"]).read_text())
+        self.assertEqual(on_disk[0]["subject"], "Deal <b>now</b> & more")
+        # And the note tells the model to pass the FILE, not retype the rows.
+        self.assertIn("--file", payload["suggestions"]["note"])
+
+    def test_the_file_is_valid_log_events_input(self):
+        self.put("INBOX", "kv", "mv@x")
+        self.run_index(suggest=False)
+        self.move_file("INBOX", "Deleted Messages", "kv")
+        payload, _t = self.run_index()
+        subprocess.run(
+            [sys.executable, str(_INDEXER_PATH.parent / "history.py"),
+             "--data-dir", str(self.tmp), "log-events",
+             "--file", payload["suggestions"]["log_file"]],
+            check=True, capture_output=True)
+        conn = sqlite3.connect(self.tmp / "history.db")
+        try:
+            rows = conn.execute(
+                "SELECT message_id, final_action, decided_by, subject FROM events"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(rows, [("mv@x", "trash", "manual", "Hi")])
+
+    def test_manifest_covers_the_suggestion_subtree(self):
+        self.put("INBOX", "km", "mm@x", subject="<script>x</script>")
+        self.run_index(suggest=False)
+        self.move_file("INBOX", "Archive", "km")
+        payload, trust = self.run_index()
+        classified = (set(indexer.INDEX_TRUSTED) | set(indexer.SUGGEST_TRUSTED)
+                      | set(trust["untrusted_fields"]))
+        undeclared = untrusted.string_paths(payload) - classified
+        self.assertEqual(undeclared, set())
+
+    def test_suggest_events_requires_a_session(self):
+        import argparse
+        args = argparse.Namespace(
+            db=self.db_path, maildir=self.maildir_root, account=None,
+            config=self.config, suggest_events=True, session=None,
+            data_dir=self.tmp)
+        with self.assertRaises(indexer.FatalError):
+            indexer.cmd_index(args)
 
 
 class PriorityFoldersTest(unittest.TestCase):

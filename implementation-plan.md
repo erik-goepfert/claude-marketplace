@@ -1532,7 +1532,7 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       option 3's read-only/act split remains the only posture that holds if the
       model is steered mid-turn, and is better sequenced as its own phase beside
       Phase 9 than retrofitted here.
-- [ ] **6.9 `suggest-events` — absorb change-report consumption into the
+- [x] **6.9 `suggest-events` — absorb change-report consumption into the
       indexer** (added 2026-08-06). **Not security work.** It lives in
       Phase 6 for two concrete reasons and is the one task here that can
       slip without weakening the security posture: (a) it MUST come after
@@ -1599,6 +1599,49 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       absorbed and listed; `deleted` from trash vs. elsewhere routes
       differently; ambiguous Sent counterparty lands in `unresolved`
       rather than guessing. ~100–150 lines plus tests.
+      **DONE 2026-08-06.** Two design departures from the text above, both
+      forced by things the earlier tasks established:
+
+      1. **It is a FLAG on `index`, not its own subcommand.** The change report
+         is ephemeral — `run_index` consumes the deltas and commits, so a second
+         run reports nothing. Suggestions therefore have to be produced in the
+         pass that consumed them. (A `$IDX index | $IDX suggest-events` pipe was
+         the appealing alternative and is *wrong* for a second reason: see
+         below.)
+      2. **The clean rows go to a FILE; only an escaped copy goes to the
+         model.** This is the 6.2/6.5 interaction, and it is the most useful
+         thing this task turned up. 6.5 established that at-rest text in
+         `history.db` is clean, and 6.2 escapes everything model-bound. A design
+         where the model reads suggested rows and pipes them to `log-events`
+         would therefore store `&lt;b&gt;` as a subject — and escape it *again*
+         on the next `context` read. So `suggestions.log_file` holds clean rows
+         for `log-events --file`, the JSON shows an escaped copy for review, and
+         the `note` field tells the model to pass the file and never retype the
+         rows. Same structural move as `$UNSUB exec --link N`: no sender text
+         has to survive a trip through the model.
+
+      `TIER_TO_ACTION` moved to `indexer.py` and `batch.py` now references it,
+      so there is one copy as the task required.
+
+      Third departure, smaller: the **Sent counterparty comes from the sent
+      message's own `To` header**, not from thread members' `from_addr`. Same
+      answer without pulling thread assembly into the indexer, and it fails the
+      same way — a group thread has several recipients, which lands in
+      `unresolved` rather than guessing, exactly as specified. Verified the
+      config parser against the real `config.yaml` (`{'icloud': …, 'gmail': …}`)
+      since subtracting the user's own address is what makes reply-all work.
+
+      One judgement call worth recording: **clearing `\Flagged` without a move
+      goes to `needs_confirmation`, not to an event.** No verb in `ACTIONS` fits
+      — the user either replied (there would be a sent message) or decided not
+      to — so it asks instead of inventing a disposition. And `new` in a
+      non-Sent tier emits nothing: a new arrival is not a decision.
+
+      17 tests, including that **nothing is logged** (the boundary this task
+      lives or dies on), that echo absorption is scoped to the named session,
+      and that `log_file` is valid `log-events` input end to end. SKILL step 4
+      went from ~25 lines of derivation rules to ~20 lines that are mostly about
+      reviewing four buckets — the derivation itself is gone from the prose.
 - [ ] **6.10 Doc alignment** (the 4.6-equivalent; added 2026-08-06 after a
       review found ~10 drift items that accumulated because Phases 5–8 had
       no such task). **Runs last — it documents whatever actually landed.**
