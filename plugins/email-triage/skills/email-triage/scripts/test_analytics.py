@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["duckdb"]
+# ///
 """Self-test for analytics.py (design ref: email-skill-design.md §9
 "Analytics access"; implementation-plan.md Phase 3).
+
+**Run this with `uv run test_analytics.py`** — the PEP 723 block above
+self-provisions duckdb, mirroring analytics.py itself. Added 2026-08-06:
+without it, `uv run test_analytics.py` reported "OK (skipped=8)" because the
+block lived only in analytics.py, so the whole suite silently passed by
+skipping and analytics.py was effectively untested. Plain
+`python3 test_analytics.py` still skips cleanly on a duckdb-less
+interpreter, which is the intended behavior for the optional dependency —
+but a green run there means nothing was exercised. Check for "skipped=8".
 
 DuckDB is an optional dependency (analytics.py's whole reason for existing
 is that it isn't required by core triage), so every test here is skipped
@@ -11,7 +24,7 @@ a minimal index.db (schema via indexer.py's init_db) in a tempfile data
 dir, never touching the real ~/.local/share/email-triage files. The
 synthetic data covers:
   - 2 categories (marketing, passive-update), 4 senders, 2 sessions
-  - a deliberate-deferral skip (decided_by=override, final=skip) and an
+  - a deliberate hold (decided_by=override, final=hold) and an
     override that changed the outcome (proposed=archive, final=reply)
   - an `activate` action (2.7 vocabulary)
   - a confirmed unsubscribe (events.unsubscribed=1)
@@ -117,7 +130,7 @@ class AnalyticsTest(unittest.TestCase):
         hconn.executescript(init_history_db.SCHEMA)
 
         # trashy@spam.com (marketing): 5 decisive trash events + 1 deferred
-        # skip. Will be the `candidates` hit (recent envelope arrival).
+        # hold. Will be the `candidates` hit (recent envelope arrival).
         insert_event(hconn, session_started_at=self.S1, occurred_at="2026-01-01T00:05:00Z",
                      sender_addr="trashy@spam.com", category="marketing",
                      proposed_action="trash", final_action="trash", decided_by="approved")
@@ -136,7 +149,7 @@ class AnalyticsTest(unittest.TestCase):
                      proposed_action="trash", final_action="trash", decided_by="approved")
         insert_event(hconn, session_started_at=self.S2, occurred_at="2026-01-08T00:12:00Z",
                      sender_addr="trashy@spam.com", category="marketing",
-                     proposed_action="trash", final_action="skip", decided_by="override")
+                     proposed_action="trash", final_action="hold", decided_by="override")
 
         # nearmiss@spam.com (marketing): same chronic-trash shape as trashy,
         # but its only envelope arrival is far outside the recency window --
@@ -147,7 +160,7 @@ class AnalyticsTest(unittest.TestCase):
                          proposed_action="trash", final_action="trash", decided_by="approved")
 
         # friend@example.com (passive-update): override that changed the
-        # outcome, an `activate`, and a deliberate-deferral skip.
+        # outcome, an `activate`, and a deliberate hold.
         f1 = insert_event(hconn, session_started_at=self.S2, occurred_at="2026-01-08T00:00:00Z",
                           sender_addr="friend@example.com", category="passive-update",
                           proposed_action="archive", final_action="archive", decided_by="approved")
@@ -159,7 +172,7 @@ class AnalyticsTest(unittest.TestCase):
                      proposed_action="archive", final_action="activate", decided_by="approved")
         insert_event(hconn, session_started_at=self.S2, occurred_at="2026-01-08T02:00:00Z",
                      sender_addr="friend@example.com", category="passive-update",
-                     proposed_action="reply", final_action="skip", decided_by="override")
+                     proposed_action="reply", final_action="hold", decided_by="override")
 
         # rare@rareonce.com: a single event, only used to prove the
         # `domains --min-events` filter actually excludes low-volume domains.
@@ -208,12 +221,12 @@ class AnalyticsTest(unittest.TestCase):
             (self.S2, self.S2, "S2 note 2"),
         )
 
-        # spam-noise: every event skipped, zero decisive -- proves
+        # spam-noise: every event held, zero decisive -- proves
         # categories rates come back null (no div-by-zero) rather than
         # erroring, since this category never has a decisive action.
         insert_event(hconn, session_started_at=self.S1, occurred_at=self.S1,
                      sender_addr="x@x.com", category="spam-noise",
-                     proposed_action="trash", final_action="skip", decided_by="override")
+                     proposed_action="trash", final_action="hold", decided_by="override")
 
         hconn.commit()
         hconn.close()
@@ -247,7 +260,7 @@ class AnalyticsTest(unittest.TestCase):
         result = analytics.cmd_categories(self.con, self.ns())
         marketing = self.by_key(result["categories"], "category", "marketing")
         self.assertEqual(marketing["events"], 16)  # 6 trashy + 5 nearmiss + 5 ruletest
-        self.assertEqual(marketing["decisive"], 15)  # the trashy skip excluded
+        self.assertEqual(marketing["decisive"], 15)  # the trashy hold excluded
         self.assertAlmostEqual(marketing["action_mix"]["trash_rate"], 1.0)
         self.assertAlmostEqual(marketing["unsubscribed"]["rate"], 1 / 15)
         self.assertEqual(marketing["unsubscribed"]["count"], 1)
@@ -275,6 +288,34 @@ class AnalyticsTest(unittest.TestCase):
         self.assertEqual(spam["events"], 11)
         self.assertEqual(spam["decisive"], 10)
         self.assertAlmostEqual(spam["trash_rate"], 1.0)
+
+    def test_domain_rates_use_terminal_not_decisive_denominator(self):
+        # 2026-08-06: rates answer "of the threads you FINISHED with this
+        # domain, what did you do?", so the denominator is terminal actions
+        # (reply/archive/trash) -- NOT every non-hold action. example.com has
+        # 4 events: 3 decisive but only 2 terminal (one is a non-terminal
+        # `activate`). Under the old `decisive` denominator these read 1/3 =
+        # 0.333 each; the non-terminal action was silently diluting them.
+        out = analytics.cmd_domains(self.con, self.ns(min_events=1, category=None))
+        ex = self.by_key(out["domains"], "domain", "example.com")
+        self.assertEqual(ex["decisive"], 3)
+        self.assertEqual(ex["terminal"], 2, "fixture must keep a non-terminal action here "
+                                            "or this test stops discriminating")
+        self.assertAlmostEqual(ex["reply_rate"], 0.5)
+        self.assertAlmostEqual(ex["archive_rate"], 0.5)
+        # And the rates must sum to 1.0 over terminal actions -- the property
+        # a non-hold denominator broke.
+        self.assertAlmostEqual(
+            ex["reply_rate"] + ex["archive_rate"] + ex["trash_rate"], 1.0)
+
+    def test_domain_with_no_terminal_actions_reports_null_rates(self):
+        # x.com's only event is a hold: no evidence of how anything finished,
+        # so rates are null rather than a fabricated 0.0.
+        out = analytics.cmd_domains(self.con, self.ns(min_events=1, category=None))
+        x = self.by_key(out["domains"], "domain", "x.com")
+        self.assertEqual(x["terminal"], 0)
+        self.assertIsNone(x["reply_rate"])
+        self.assertIsNone(x["trash_rate"])
 
     def test_domains_category_filter(self):
         result = analytics.cmd_domains(self.con, self.ns(min_events=1, category="passive-update"))
@@ -331,12 +372,12 @@ class AnalyticsTest(unittest.TestCase):
         self.assertEqual(s2["spread_minutes"], 120)  # 00:00 (friend) to 02:00 (friend)
         self.assertEqual(s2["notes"], 2)
         self.assertEqual(s2["action_counts"]["activate"], 1)
-        self.assertEqual(s2["action_counts"]["skip"], 2)  # trashy's deferred skip + friend's deferred skip
+        self.assertEqual(s2["action_counts"]["hold"], 2)  # trashy's hold + friend's hold
 
     # -- empty/small-data handling: no div-by-zero --------------------------
 
     def test_empty_category_has_null_rates(self):
-        # spam-noise (inserted in setUp with its one event skipped) has
+        # spam-noise (inserted in setUp with its one event held) has
         # zero decisive events -- rates must be null, not a div-by-zero
         # error.
         result = analytics.cmd_categories(self.con, self.ns())

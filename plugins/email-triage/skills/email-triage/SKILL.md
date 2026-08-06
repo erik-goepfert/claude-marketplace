@@ -249,7 +249,7 @@ Classify from thread data + history (`sender_stats`, `contacts`, `rules`)
 
 - **Lifecycle state** (`state`, precomputed): `needs-reply` / `waiting` /
   `holding`; `inactive_days` likewise. **A `waiting` thread gets no
-  proposal and no log entry, ever — not even a skip.** State and category
+  proposal and no log entry, ever — not even a hold.** State and category
   are independent axes; a waiting thread still appears in its category's
   list but is never a decision point.
 - **Drafted status** (`drafted: true` — independent axis; a response is in
@@ -283,7 +283,7 @@ security notifications (new sign-in/device/key/password/MFA changes,
 suspicious activity); financial/time-boxed items (suspicious charge,
 payment method change, expiration); urgent/deadline-bound framing.
 Present these **individually, immediately**, before the breakdown. The
-proposal is usually "confirm it was you" (skip) or "here's the link to
+proposal is usually "confirm it was you" (hold) or "here's the link to
 review" (surfaced; executed never — rule 4).
 - **Sender history deflates, it doesn't gate:** if history shows this
   sender's urgency is routine noise, fold it into its category with a
@@ -477,10 +477,14 @@ rerun `$IDX index` and retry.
        Resolve the draft's local id FRESH, then
        `himalaya flag add -a <acct>-local -f "<tiers.drafts>" <id> draft seen`.
        The batch-boundary sync (must include drafts) pushes it as a
-       standard IMAP draft the phone can open, edit, send. Log
-       `final_action=draft` (decisive); thread keeps its flag. Sent from
-       the phone later → the Sent detection logs the manual reply; the
-       draft's disappearance is expected report noise, no event.
+       standard IMAP draft the phone can open, edit, send. Thread keeps
+       its flag. **Log the THREAD's disposition, not the draft** — there
+       is no `draft` action: `activate` if this moved an untriaged thread
+       into the live tier, nothing at all if it was already live. The
+       `\Draft` flag and the derived `drafted` status are what carry the
+       draft forward, and they resurface it every session until resolved.
+       Sent from the phone later → Sent detection logs the manual `reply`;
+       the draft's disappearance is expected report noise, no event.
      - **Discard**: delete the temp file; log per the thread's actual
        disposition.
 
@@ -500,7 +504,7 @@ stays-resolved"` / `"reopens"` / `"refiles"` in the event's `notes`.
 ## Logging (every decision, at act time)
 
 `$BATCH run` logs its own move/remove events. Everything with no move
-attached — skips, flags, replies, drafts — is logged by hand:
+attached — holds, flags, replies — is logged by hand:
 
 ```sh
 $HIST log-event --session "<session_started_at>" --account gmail \
@@ -517,18 +521,46 @@ form, and the full field list: reference §Logging.
 `decided_by`: `auto` (autonomous — flags only), `approved` (as-is),
 `override` (user changed the outcome — always log the original
 `proposed_action`; **the richest learning signal** — "leave it" after a
-proposal is `final_action=skip, decided_by=override`), `manual` (change
+proposal is `final_action=hold, decided_by=override`), `manual` (change
 report, step 4).
 
-**Action vocabulary:** `flag | reply | archive | trash | skip | activate
-| draft`. `activate` = moved to the active tier — triaged, stays open; a
-real decision, decisive in `sender_stats`, which is exactly why it is NOT
-`skip`. `draft` = composed but saved to Drafts — decisive likewise.
+**Action vocabulary — every verb names the condition or place it produces:**
 
-Skip rules: a proposed-then-deferred thread logs `skip` **once per thread
-per session** (staying open is `activate`, not skip). `waiting` threads
-are never skip-eligible. Threads never reviewed are not logged — resume
-state goes in a session note.
+| | Verb | Meaning |
+|---|---|---|
+| **Terminal** — you finished with the thread | `reply` | you responded |
+| | `archive` | resolved into `ongoing` or `cold` |
+| | `trash` | discarded |
+| **Non-terminal** — thread stays live | `activate` | moved to the active tier: triaged, stays open |
+| | `flag` | marked as owing your reply |
+| | `hold` | reviewed, left in **whatever state it was already in** |
+
+Only terminal actions count in `sender_stats`' `reply_rate`/`trash_rate` —
+"of the times you finished with this sender, what did you do?" All six
+except `hold` count as `decisions` ("did you act at all?"). `hold` is the
+only no-op verb.
+
+**`hold` rules.** A proposed-then-held thread logs `hold` **once per thread
+per session**. The event's `thread_state` records *which* state was held,
+and that distinction is the useful one: held while `needs-reply` is **reply
+debt** ("is a reply actually coming, or should the flag go?"); held while
+`holding` is **filing debt** ("time to resolve this?"). `waiting` threads
+are never hold-eligible — there is nothing to decide. Threads never
+reviewed are not logged at all; resume state goes in a session note.
+
+**`hold` is not the same as `activate`.** `activate` moves an untriaged
+thread into the live tier — a real disposition. `hold` changes nothing.
+Holding an *untriaged* thread is the anomaly: it stays in the tier that
+means "nothing decided," so next session it is indistinguishable from new
+mail and gets triaged cold. Say so rather than accepting it silently —
+*"that comes back as untriaged next session; want it in Active instead?"*
+Keep the escape hatch, make the cost visible.
+
+**There is no `draft` action.** Saving a draft creates a *different object*;
+it is not a disposition of the thread. Log the thread's own verb (`activate`
+for an untriaged thread, nothing if it was already live) — the `\Draft` flag
+and the derived `drafted` status carry the draft itself, and the send, when
+it comes, logs `reply`.
 
 **Interaction patterns are DB facts, not prose.** When the user states a
 per-sender disposition ("always surface these immediately," "summarize

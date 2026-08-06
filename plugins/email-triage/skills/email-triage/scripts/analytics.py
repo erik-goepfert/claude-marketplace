@@ -29,7 +29,7 @@ triage (history.py, indexer.py, threads.py, act.py) is entirely unaffected.
 
 Subcommands (JSON to stdout, indent=2, sort_keys=True):
   categories  Per content-category action mix and unsubscribe rate, over
-              DECISIVE (non-skip) events -- the "how often do I actually
+              DECISIVE (non-hold) events -- the "how often do I actually
               unsubscribe from marketing" metric that motivated
               events.unsubscribed (§9).
   domains     Per sender-domain (substring after '@', lowercased) action
@@ -67,7 +67,7 @@ except ImportError:
 
 DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
 
-ACTIONS = ("flag", "reply", "archive", "trash", "skip", "activate")
+ACTIONS = ("flag", "reply", "archive", "trash", "hold", "activate")
 
 
 def utc_now() -> str:
@@ -139,7 +139,7 @@ def _sql_quote(path: Path) -> str:
 CATEGORIES_SQL = """
 SELECT category,
        COUNT(*)                                       AS events,
-       SUM((final_action != 'skip')::INT)             AS decisive,
+       SUM((final_action != 'hold')::INT)             AS decisive,
        SUM((final_action = 'trash')::INT)              AS trash_n,
        SUM((final_action = 'archive')::INT)            AS archive_n,
        SUM((final_action = 'activate')::INT)           AS activate_n,
@@ -184,10 +184,19 @@ def cmd_categories(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> 
 # domains
 # --------------------------------------------------------------------------
 
+# NOTE (2026-08-06): the three rates here are over `terminal`, not
+# `decisive`. This query emits only terminal rates (trash/reply/archive) with
+# no activate_rate/flag_rate, so a non-hold denominator left the non-terminal
+# mass silently unaccounted and depressed every rate for a domain whose
+# threads get activated or flagged before being resolved. Contrast
+# `categories`, which deliberately KEEPS the `decisive` denominator because
+# its action_mix does include activate_rate and flag_rate and is a complete
+# distribution -- don't "fix" that one to match this one.
 DOMAINS_SQL = """
 SELECT lower(split_part(sender_addr, '@', 2))           AS domain,
        COUNT(*)                                         AS events,
-       SUM((final_action != 'skip')::INT)                AS decisive,
+       SUM((final_action != 'hold')::INT)                AS decisive,
+       SUM((final_action IN ('reply','archive','trash'))::INT) AS terminal,
        SUM((final_action = 'trash')::INT)                 AS trash_n,
        SUM((final_action = 'reply')::INT)                 AS reply_n,
        SUM((final_action = 'archive')::INT)               AS archive_n,
@@ -211,14 +220,20 @@ def cmd_domains(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> dic
     for row in rows:
         r = dict(zip(cols, row))
         decisive = r["decisive"] or 0
+        terminal = r["terminal"] or 0
         out.append(
             {
                 "domain": r["domain"],
                 "events": r["events"],
                 "decisive": decisive,
-                "trash_rate": safe_div(r["trash_n"], decisive),
-                "reply_rate": safe_div(r["reply_n"], decisive),
-                "archive_rate": safe_div(r["archive_n"], decisive),
+                "terminal": terminal,
+                # Rates divide by `terminal` -- "of the threads you FINISHED
+                # with this domain, what did you do?" safe_div returns None on
+                # a 0 denominator, so a domain with no terminal actions
+                # reports null rather than a fabricated 0.0.
+                "trash_rate": safe_div(r["trash_n"], terminal),
+                "reply_rate": safe_div(r["reply_n"], terminal),
+                "archive_rate": safe_div(r["archive_n"], terminal),
                 "unsubscribed_total": r["unsubscribed_total"] or 0,
                 "override_rate": safe_div(r["override_n"], r["non_manual_n"]),
                 "first_seen": r["first_seen"],
@@ -240,7 +255,7 @@ SELECT strftime(CAST(occurred_at AS TIMESTAMP), '%G-W%V')  AS iso_week,
        SUM((final_action = 'activate')::INT)                AS activate_n,
        SUM((final_action = 'reply')::INT)                   AS reply_n,
        SUM((final_action = 'flag')::INT)                    AS flag_n,
-       SUM((final_action = 'skip')::INT)                    AS skip_n,
+       SUM((final_action = 'hold')::INT)                    AS hold_n,
        COUNT(DISTINCT sender_addr)                          AS distinct_senders,
        COUNT(DISTINCT session_started_at)                   AS distinct_sessions
 FROM h.events
@@ -325,7 +340,7 @@ SELECT session_started_at,
        SUM((final_action = 'activate')::INT)                                AS activate_n,
        SUM((final_action = 'reply')::INT)                                   AS reply_n,
        SUM((final_action = 'flag')::INT)                                    AS flag_n,
-       SUM((final_action = 'skip')::INT)                                    AS skip_n,
+       SUM((final_action = 'hold')::INT)                                    AS hold_n,
        DATEDIFF('minute', MIN(CAST(occurred_at AS TIMESTAMP)),
                           MAX(CAST(occurred_at AS TIMESTAMP)))              AS spread_minutes
 FROM h.events
@@ -365,16 +380,22 @@ def cmd_sessions(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> di
 # --------------------------------------------------------------------------
 
 CANDIDATES_SQL = """
+-- trash_rate is over TERMINAL actions only (allowlist, matching
+-- sender_stats): a sender you activate or hold before eventually trashing
+-- would otherwise look less decisively-trashed than they are, weakening
+-- exactly the rule proposals this query exists to fuel. `decisive` keeps the
+-- broader non-hold sense -- it answers "did you act at all", not "how did
+-- you finish". (2026-08-06)
 WITH sender_agg AS (
     SELECT lower(sender_addr)                                           AS sender,
-           COUNT(*) FILTER (WHERE final_action != 'skip')                AS decisive,
+           COUNT(*) FILTER (WHERE final_action != 'hold')                AS decisive,
            AVG((final_action = 'trash')::INT)
-               FILTER (WHERE final_action != 'skip')                     AS trash_rate
+               FILTER (WHERE final_action IN ('reply','archive','trash')) AS trash_rate
     FROM h.events
     GROUP BY 1
-    HAVING COUNT(*) FILTER (WHERE final_action != 'skip') >= ?
+    HAVING COUNT(*) FILTER (WHERE final_action != 'hold') >= ?
        AND AVG((final_action = 'trash')::INT)
-               FILTER (WHERE final_action != 'skip') >= 0.8
+               FILTER (WHERE final_action IN ('reply','archive','trash')) >= 0.8
 ),
 recent_arrivals AS (
     SELECT lower(from_addr)   AS sender,

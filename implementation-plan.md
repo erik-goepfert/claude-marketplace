@@ -651,7 +651,13 @@ quoting bit once); category closure now requires a re-list, not memory.
       `::INT` casts) get encoded in that helper once, never in SKILL.md.
 - [ ] Richer rule predicates, only when sender-equality proves insufficient
       (§15.4).
-- [ ] Skip-pattern nudges ("deferred five times — archive or long-term hold?").
+- [ ] Hold-pattern nudges. Reworded 2026-08-06: the old phrasing ("deferred
+      five times — archive or long-term hold?") used "hold" to mean *move it
+      out of the live zone*, the opposite of the `hold` verb. And the count
+      alone is the weaker signal — read the held event's `thread_state`:
+      held while `needs-reply` = **reply debt** ("is a reply actually coming,
+      or should the flag go?"); held while `holding` = **filing debt** ("time
+      to resolve this?").
 
 ---
 
@@ -742,6 +748,21 @@ a rebuild, cheapest it will ever be.
       - `draft` added to history.py ACTIONS (decisive, like activate);
         no new events column — lingering-draft analytics derivable from
         draft events without subsequent reply (facts, not aggregates).
+        **REVERSED 2026-08-06 — `draft` removed from ACTIONS before it was
+        ever written (0 rows in both action columns).** Saving a draft
+        creates a *different object*; it is not a disposition of the
+        thread, and every other verb in the enum is one. Concretely: a
+        drafted reply to an untriaged thread already logs `activate` (the
+        thread moved to the live tier), so `draft` was a second event for
+        one decision — and if the draft was later sent, the Sent-detected
+        `reply` made it a third, diluting `reply_rate` for that sender.
+        The stated payoff (lingering-draft analytics) is better served by
+        live state: the draft sitting in Drafts *is* the lingering draft,
+        `drafted: true` resurfaces it every session, and nothing in the
+        behavior consulted history.db for it. This also settles the
+        externally-created draft (Apple Mail, phone) symmetrically —
+        surfaced via `drafted`, never an event — instead of needing a
+        special case.
       - Smoke test at execution: save dummy draft, sync, verify
         server-side, clean up; USER validates phone-side editability
         (the one hop not verifiable from here).
@@ -785,14 +806,21 @@ still pending.
   "activity minus our own filings" collapses to "receives deliveries,"
   which under inbox-only delivery is just the untriaged tier — so
   priority is tier-derived, not activity-derived.
-- *Overloading `skip` instead of adding action verbs.* When a disposition
-  has no verb in the events enum (as "stays open in Active" didn't in
-  2.7, and "saved a draft" didn't in Phase 4), the tempting shortcut is
-  logging it as `final_action=skip` with a distinguishing `to_folder`.
-  Rejected both times: `sender_stats` excludes skips from decisive-action
-  rates, so logging a real decision as a skip silently corrupts the
-  learning signal. Real dispositions get real verbs (`activate`,
-  `draft`), even though that grows the enum.
+- *Overloading the no-op verb instead of adding action verbs.* When a
+  disposition has no verb in the events enum (as "stays open in Active"
+  didn't in 2.7), the tempting shortcut is logging it as
+  `final_action=hold` (then `skip`) with a distinguishing `to_folder`.
+  Rejected: `sender_stats` excludes the no-op verb from decisive-action
+  rates, so logging a real decision as one silently corrupts the learning
+  signal. Real dispositions get real verbs — hence `activate`.
+  **Refined 2026-08-06:** the test is not "does this need a verb" but
+  **"is this a disposition of the thread?"** `activate` passes (the thread
+  moved and stayed live). `draft` failed and was removed — it describes a
+  *different object*, which is why it kept needing special handling
+  (excluded from rate denominators, ambiguous against `activate`,
+  undefined for external arrivals). Same lens renamed `skip` → `hold`:
+  every verb should name the thread's resulting condition, and "skip"
+  named the operator's behavior.
 - *Folder-name string matching below the config boundary.* Names are
   translated to tiers exactly once — at the indexer's classifier, fed by
   config — and every script beneath (threads, act, analytics) reasons in

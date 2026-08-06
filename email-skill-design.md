@@ -608,9 +608,15 @@ CREATE TABLE events (
                                           -- passive-update | ambiguous | actionable
     inactive_days      INTEGER,
     -- the decision (the learning signal)
-    proposed_action    TEXT NOT NULL,     -- flag | reply | archive | trash | skip
-                                          --   | activate (2.7: moved to Active — decisive, unlike skip)
-                                          --   | draft    (4.5: saved a reply for later — decisive)
+    -- Every verb names the condition or place it produces (2026-08-06).
+    -- TERMINAL (finished with the thread):  reply | archive | trash
+    -- NON-TERMINAL (thread stays live):     flag | activate | hold
+    --   activate  2.7: moved to the live tier — triaged, stays open
+    --   hold      reviewed, left in whatever state it was already in;
+    --             thread_state records WHICH (needs-reply = reply debt,
+    --             holding = filing debt). Renamed from 'skip' 2026-08-06:
+    --             'skip' named the operator's behavior, not the thread's.
+    proposed_action    TEXT NOT NULL,
     final_action       TEXT NOT NULL,
     from_folder        TEXT,
     to_folder          TEXT,              -- populated for archive/trash/move
@@ -653,12 +659,21 @@ CREATE TABLE rules (
 CREATE VIEW sender_stats AS
 SELECT sender_addr,
        COUNT(*)                            AS events_total,
-       SUM(final_action != 'skip')         AS decisions,      -- decisive actions only
-       SUM(final_action  = 'skip')         AS skips,
-       -- action rates over DECISIVE actions, so chronic skipping
-       -- can't dilute them into meaninglessness
-       AVG(final_action = 'reply') FILTER (WHERE final_action != 'skip') AS reply_rate,
-       AVG(final_action = 'trash') FILTER (WHERE final_action != 'skip') AS trash_rate,
+       SUM(final_action != 'hold')         AS decisions,      -- "did you act at all?"
+       SUM(final_action  = 'hold')         AS holds,          -- the only no-op verb
+       -- Rates are over TERMINAL actions only, as an ALLOWLIST (2026-08-06):
+       -- "of the times you FINISHED with this sender, what did you do?"
+       -- Non-terminal verbs (flag/activate/hold) leave the thread live, so
+       -- they are not competing dispositions. Counting them diluted the
+       -- rates — one live sender read 0.33 reply_rate when every thread he
+       -- finished was a reply (1 reply / 3 non-hold vs 1 / 1 terminal), and
+       -- senders with ONLY non-terminal events reported a confident 0.0
+       -- instead of NULL, asserting "never replies" from zero evidence.
+       -- Allowlist not denylist, so a future verb can't silently join.
+       AVG(final_action = 'reply')
+           FILTER (WHERE final_action IN ('reply','archive','trash')) AS reply_rate,
+       AVG(final_action = 'trash')
+           FILTER (WHERE final_action IN ('reply','archive','trash')) AS trash_rate,
        AVG(decided_by = 'override') FILTER (WHERE decided_by != 'manual')
                                            AS override_rate,  -- over Claude's proposals only
        SUM(notes LIKE '%declined-unsubscribe%')
@@ -675,24 +690,62 @@ user replied instead" teaches more than a thousand agreements. A high
 `override_rate` on a sender — or on a rule, via `rule_id` — is the signal to
 change behavior or retire the rule.
 
-**Skip semantics.** "Skip" hides three different situations, and only some of
-them are events:
+**`hold` semantics** (renamed from `skip`, 2026-08-06 — see the naming note
+below). "Held" hides three situations, and only some of them are events:
 
-1. **Deliberate deferral** — Claude proposed an action, the user said "leave
-   it." Always logged (`proposed=<action>, final=skip, decided_by=override`);
-   this is the richest override signal in the system.
-2. **Nothing to do** — Claude itself proposed skip on a thread that presented a
-   real decision. Logged, at most once per thread per session: "consciously
-   left in place N sessions running" is distinguishable from "sat in inbox
-   N sessions" only if reviewed-and-deferred is recorded. This enables the
-   nudge: "deferred five times now — archive, or a real long-term hold?"
+1. **Deliberate hold** — Claude proposed an action, the user said "leave it."
+   Always logged (`proposed=<action>, final=hold, decided_by=override`); this
+   is the richest override signal in the system.
+2. **Nothing to do yet** — Claude itself proposed hold on a thread that
+   presented a real decision. Logged at most once per thread per session:
+   "consciously left in place N sessions running" is distinguishable from
+   "sat there N sessions" only if reviewed-and-held is recorded.
 3. **Never reviewed** — session abandoned, or "skip the rest." **Not logged as
    events**; that would be false data. Resume state belongs in
    `session_notes`.
 
-Threads in the `waiting` state are not skip-eligible — there is nothing to
-decide about a thread waiting on someone else, so logging "skip" for them every
-session would be pure noise.
+Threads in the `waiting` state are not hold-eligible — there is nothing to
+decide about a thread waiting on someone else, so logging a hold for them
+every session would be pure noise.
+
+**The nudge reads off `thread_state`, not the count alone.** Because the
+event snapshots the state that was held, "held five times" splits into two
+different conversations: held while `needs-reply` is **reply debt** ("is a
+reply actually coming, or should the flag go?"); held while `holding` is
+**filing debt** ("time to resolve this?"). `skip` could not distinguish them,
+because it named the operator's behavior rather than the thread's condition.
+
+**Why the rename.** Every other verb names the condition or place it produces
+— `flag`→`\Flagged`, `reply`→`\Answered`/waiting, `activate`→the live tier,
+`archive`→`cold`/`ongoing`, `trash`→trash. "Skip" named what the *operator*
+did while walking a list, which is the pre-taxonomy mental model in which the
+inbox *was* the list (§10's MVP state table deliberately conflated
+"new-untriaged" and "replied-and-waiting" as one `holding` state). Once the
+taxonomy split those into `untriaged` and a live tier, `activate` took over
+"decided, keep it live" — leaving `skip` to mean only "reviewed, nothing
+changed." `hold` names that. Note the one imprecision, accepted: holding a
+`needs-reply` thread leaves it `needs-reply`, not `holding`, so the verb
+names a state the thread may not enter — which is why the event's
+`thread_state` is what the nudge actually reads.
+
+**Holding an untriaged thread is the anomaly.** `untriaged` means "delivery
+landed, nothing decided," so a reviewed thread left there is a thread that
+lies about itself: next session it is indistinguishable from new mail and
+gets triaged cold, with the prior decision recoverable only by querying
+history. The taxonomy-correct answer to "still needs attention" is
+`activate` (plus a flag if a reply is owed). Left possible on purpose, but
+the skill names the cost rather than accepting it silently.
+
+**There is no `draft` action** (removed 2026-08-06; it was added in Phase 4.5
+and never written to a real session). Saving a draft creates a *different
+object* — it is not a disposition of the thread, and every other verb in this
+enum is. The thread's own verb carries the decision (`activate`, or nothing
+if it was already live); the `\Draft` flag and the derived `drafted` status
+carry the draft, resurfacing it every session until it is sent or discarded;
+and the send, when it comes, logs `reply`. Logging both a `draft` and a later
+`reply` would have counted one conversational turn twice. This applies
+symmetrically to drafts created outside a session (in Apple Mail, on the
+phone): they are surfaced via `drafted`, never logged as events.
 
 **Unsubscribe tracking is self-reported except where the mechanism is
 self-verifying.** `events` carries an `unsubscribed` boolean (default 0), never
@@ -750,7 +803,7 @@ happens** — never at session close, which may never come. It carries what the
 event log structurally cannot:
 
 - **Resume state.** "Abandoned midway — got through needs-reply, never touched
-  holding." Skipped threads leave a skip event; *abandoned* threads leave
+  holding." Held threads leave a `hold` event; *abandoned* threads leave
   nothing at all. Absence of data is ambiguous; a note isn't.
 - **Stats context.** "Mass cleanup of two-year backlog" explains why one
   session's 300 trash events shouldn't be read as the normal trash rate for
@@ -855,6 +908,19 @@ below are encoded once in its `connect()`, never rewritten in-session.
 `candidates` is the cross-DB payoff: chronic-trash senders still arriving
 (events × envelopes join) — rule-proposal evidence. history.py stays
 stdlib-only; nothing depends on duckdb existing.
+
+**Two kinds of denominator, and they are not interchangeable** (2026-08-06).
+Anything answering *"of the threads you finished with, what did you do?"* —
+`sender_stats.reply_rate`/`trash_rate`, `domains`, `candidates` — divides by
+**terminal** actions only (`reply`/`archive`/`trash`, as an allowlist so a
+future verb cannot silently join). Anything reporting a **distribution** over
+all decisive actions — `categories.action_mix`, which includes
+`activate_rate` and `flag_rate` as members and sums to 1.0 — divides by
+non-`hold`. Using the decisive denominator for a terminal-only rate set is
+the bug this note exists to prevent: the non-terminal mass goes unaccounted,
+every rate is depressed, and a sender with no terminal events at all reports
+a confident `0.0` instead of `null`. Do not "fix" `categories` to match
+`domains`; they are answering different questions.
 
 The attach is `INSTALL sqlite; LOAD sqlite; ATTACH '<file>' AS h (TYPE sqlite,
 READ_ONLY);`. Two gotchas, verified against DuckDB 1.5 over the real
@@ -966,7 +1032,7 @@ sequenceDiagram
     SKILL->>IDX: index
     IDX->>DB: upsert + reconcile moves/deletions
     SKILL->>DB: assemble active-inbox threads + rollups
-    Note over SKILL: triage: per thread, decide<br/>flag / reply / archive / trash / skip<br/>(informed by history context)
+    Note over SKILL: triage: per thread, decide<br/>flag / reply / archive / trash / hold<br/>(informed by history context)
     loop each approved batch
         SKILL->>DB: resolve messages → CURRENT maildir files/ids
         SKILL->>HIM: execute approved actions
@@ -1130,7 +1196,7 @@ model-driven loop the cost unit is the tool call — the same four-step unit
 hand-orchestrated cost 4+ calls per batch (12+ cycles in one live session)
 and made hand-written event JSON the norm rather than the exception.
 Hand-written events remain only for decisions with no move attached
-(skips, flags, replies, drafts).
+(holds, flags, replies).
 
 **Amendment (2026-07-19, user rule): standard session steps live in
 scripts, never in ad-hoc shell.** The first post-Phase-5 session opened
@@ -1349,7 +1415,7 @@ Rationale lives in the body; this is the index of choices.
 - History is self-contained: natural keys + decision-time snapshots; no FKs into the index.
 - Facts, not aggregates: stats are views over events, never stored columns.
 - `proposed_action` / `final_action` / `decided_by` trio captures the override signal.
-- Skips are events only when a real decision was presented (once per thread per session); `waiting` threads aren't skip-eligible; rates computed over decisive actions.
+- Holds (renamed from `skip`, 2026-08-06) are events only when a real decision was presented (once per thread per session); `waiting` threads aren't hold-eligible. Every verb names the condition it produces; `hold` means "left in whatever state it was already in", and the event's `thread_state` says which (needs-reply = reply debt, holding = filing debt). Rate denominators are TERMINAL actions only (reply/archive/trash, allowlisted) — non-terminal verbs leave the thread live and diluted the rates, including manufacturing a confident 0.0 for senders with no terminal events at all.
 - Rules turn history into behavior; user- or Claude-proposed; effectiveness derived via `rule_id`.
 - Syncs are skill-invoked: session start, batch boundaries, session end; abandonment costs at most one batch of delayed propagation.
 - External changes are first-class: the indexer emits a change report; detected external actions (including replies from Sent) become `manual` events.
@@ -1367,7 +1433,7 @@ Rationale lives in the body; this is the index of choices.
 - Unsubscribe outcome is self-reported, with one exception: `events.unsubscribed` is set automatically on a 2xx from an RFC 8058 one-click POST (that endpoint does nothing else, so the response is the confirmation — decided 2026-08-06); every other path still asks in-session, because a header GET or body link can return 200 without unsubscribing. Added after the MVP's first session, prompted by wanting an "unsubscribe rate by category" metric the original schema couldn't answer.
 - Contacts carry `relation` — human framing ('your plumber') over generic categories.
 - Concepts in code, names in config (Phase 4): tier IDs renamed to concept names (untriaged/ongoing/cold); config.yaml schema v2 realizes tiers per account, nullable; containers derived as ancestors of configured folders; priority sync set = tier-derived (untriaged+active+sent+drafts), never activity-derived.
-- Drafts are a third orthogonal axis (Phase 4.5): `\Draft`-tier member ⇒ thread `drafted` status; excluded from state derivation (a draft isn't communication); never silently passed over; save-for-later flow writes real IMAP drafts finishable from any client; `draft` action in the events vocabulary.
+- Drafts are a third orthogonal axis (Phase 4.5): `\Draft`-tier member ⇒ thread `drafted` status; excluded from state derivation (a draft isn't communication); never silently passed over; save-for-later flow writes real IMAP drafts finishable from any client. **No `draft` event** (removed 2026-08-06): a draft is a different object, not a thread disposition — the thread's own verb carries the decision, `drafted` carries the draft, and the eventual send logs `reply`. Applies equally to drafts made outside a session.
 - Packaged as a Claude Code plugin, distributed through the existing personal marketplace; developed locally via `--plugin-dir`.
 - Strict code/state separation: the plugin is read-only code; all state lives in a machine-local data dir (`~/.local/share/email-triage/` by default); nothing personal in the repo.
 - Dependencies checked and bootstrapped on first run, never bundled.

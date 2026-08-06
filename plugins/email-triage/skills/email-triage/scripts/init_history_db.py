@@ -61,13 +61,27 @@ CREATE TABLE IF NOT EXISTS rules (
     origin      TEXT NOT NULL CHECK (origin IN ('user','claude-proposed'))
 );
 
+-- Two different filters on purpose (2026-08-06); one used to do both jobs.
+--   decisions / holds  -- "did you act at all, or leave it unchanged?"
+--                         'hold' is the only no-op verb.
+--   *_rate             -- "of the times you FINISHED with a thread, what did
+--                         you do?" Denominator is TERMINAL actions only
+--                         (reply/archive/trash) as an ALLOWLIST, so a future
+--                         verb cannot silently join it. Non-terminal verbs
+--                         (flag/activate/hold) leave the thread live and are
+--                         not competing dispositions: counting them diluted
+--                         reply_rate for any thread that was activated or
+--                         held before being replied to (a draft-then-send on
+--                         a one-interaction sender read as 0.50, not 1.00).
 CREATE VIEW IF NOT EXISTS sender_stats AS
 SELECT sender_addr,
        COUNT(*)                            AS events_total,
-       SUM(final_action != 'skip')         AS decisions,
-       SUM(final_action  = 'skip')         AS skips,
-       AVG(final_action = 'reply') FILTER (WHERE final_action != 'skip') AS reply_rate,
-       AVG(final_action = 'trash') FILTER (WHERE final_action != 'skip') AS trash_rate,
+       SUM(final_action != 'hold')         AS decisions,
+       SUM(final_action  = 'hold')         AS holds,
+       AVG(final_action = 'reply')
+           FILTER (WHERE final_action IN ('reply','archive','trash')) AS reply_rate,
+       AVG(final_action = 'trash')
+           FILTER (WHERE final_action IN ('reply','archive','trash')) AS trash_rate,
        AVG(decided_by = 'override') FILTER (WHERE decided_by != 'manual')
                                            AS override_rate,
        -- Counted from the 5.5 notes convention. Feeds the assume-unsubscribe
@@ -85,9 +99,20 @@ def migrate(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
     if "unsubscribed" not in cols:
         conn.execute("ALTER TABLE events ADD COLUMN unsubscribed INTEGER NOT NULL DEFAULT 0")
+
+    # 2026-08-06 vocabulary migration: 'skip' -> 'hold' in both action
+    # columns. Value rename only -- no rows added, removed, or otherwise
+    # altered, and idempotent (the WHERE matches nothing on a second run).
+    # 'draft' needs no data migration: it was never written (verified 0 rows
+    # in both columns before removal from ACTIONS).
+    for col in ("proposed_action", "final_action"):
+        conn.execute(f"UPDATE events SET {col} = 'hold' WHERE {col} = 'skip'")
+
     view_cols = {row[1] for row in conn.execute("PRAGMA table_info(sender_stats)")}
-    if view_cols and "declined_unsubs" not in view_cols:
-        # Views can't ALTER; drop and let the SCHEMA block recreate it.
+    # Views can't ALTER; drop and let the SCHEMA block recreate it. `holds`
+    # detects the pre-2026-08-06 view (which had `skips` and used one filter
+    # for both the decisive count and the rate denominators).
+    if view_cols and not {"declined_unsubs", "holds"} <= view_cols:
         conn.execute("DROP VIEW sender_stats")
         conn.executescript(SCHEMA)
 

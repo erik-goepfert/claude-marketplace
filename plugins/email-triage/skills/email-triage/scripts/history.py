@@ -23,14 +23,25 @@ from pathlib import Path
 
 DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
 
-ACTIONS = ("flag", "reply", "archive", "trash", "skip", "activate", "draft")
-# "draft" (added Phase 4.5): composed a reply but saved it to the account's
-# Drafts folder instead of sending (finish-on-phone flow). Decisive, like
-# activate. Lingering-draft analytics derive from draft events without a
-# subsequent reply -- facts, not aggregates; no extra column.
-# "activate" (added Phase 2.7): moved to the Active tier -- triaged, stays
-# open, no flag. A real decision, so it counts as decisive in sender_stats
-# (unlike "skip"). to_folder carries "Active".
+# Thread dispositions. Every verb names the condition or place it produces.
+# TERMINAL (the conversation reached an end state): reply, archive, trash.
+# NON-TERMINAL (thread stays live): flag, activate, hold.
+#   hold  -- reviewed, left in whatever state it was already in; the event's
+#            thread_state records WHICH state was held (needs-reply => reply
+#            debt, holding => filing debt). Renamed from 'skip' 2026-08-06:
+#            'skip' named the operator's behavior, not the thread's condition.
+# 'draft' was removed 2026-08-06: saving a draft creates a DIFFERENT object,
+# it is not a disposition of the thread. The thread's own verb (activate, or
+# none if already live) carries the decision; the \Draft flag and the derived
+# `drafted` status carry the draft itself.
+ACTIONS = ("flag", "reply", "archive", "trash", "hold", "activate")
+TERMINAL_ACTIONS = ("reply", "archive", "trash")
+# "activate" (added Phase 2.7): moved to the live tier -- triaged, stays
+# open, no flag. A real decision, so it counts toward `decisions` in
+# sender_stats (unlike "hold"), but it is NOT terminal, so it stays out of
+# the reply_rate/trash_rate denominators -- a thread activated before being
+# replied to would otherwise halve that sender's reply_rate. to_folder
+# carries the live tier's folder name.
 DECIDED_BY = ("auto", "approved", "override", "manual")
 THREAD_STATES = ("needs-reply", "holding", "waiting")
 CATEGORIES = ("spam-noise", "marketing", "newsletter", "passive-update", "ambiguous", "actionable")
