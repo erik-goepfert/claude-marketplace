@@ -932,6 +932,19 @@ Plugin cache refreshed after the final commit.
       `~/.claude/settings.json` (documented semantics, like the existing
       himalaya rule) — USER adds these; the agent is guardrail-blocked
       from widening its own permissions.
+      **(d) NOT DONE as of 2026-08-06** — `~/.claude/settings.json` still
+      contains only `Bash(himalaya *)`. Nothing is broken: the skill's own
+      `allowed-tools` frontmatter covers the scripts while the skill is
+      active, which is why three sessions have run without noticing. The
+      settings rules were the belt-and-braces half (coverage outside an
+      active skill session), so this is a real but low-severity residue —
+      recorded because the task otherwise reads as complete.
+      Also swept 2026-08-06: `reference.md` still carried pre-5.10
+      variable-style invocations that violated this very contract
+      (`${CLAUDE_SKILL_DIR}/scripts/...` — an unset variable, so the
+      command would have resolved to `/scripts/...`; `ANA="..."; uv run
+      "$ANA"`; `mbsync -c "$MBSYNCRC"`). 5.10 rewrote the spine's
+      convention but never swept the companion file.
 - [x] **5.11 Compact thread listing (2026-07-19, third startup prompt).**
       A full `$THR list` over a busy mailbox overflowed the tool-result
       budget into a saved file, which the session then inspected with

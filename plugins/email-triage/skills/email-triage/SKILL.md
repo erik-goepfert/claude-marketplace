@@ -33,44 +33,33 @@ The scripts live in this skill's `scripts/` directory. In this document,
 `threads.py`, `act.py`, `history.py`, `unsub.py`, `batch.py`,
 `analytics.py` — NOT shell variables to define.
 
-**Invocation rules (learned from live-session permission prompts):**
+**Invocation rules.** Each one was a live permission prompt; the *why* is
+in reference §Incident history.
 
-- **One statement per call, script filename written out literally:**
-  `<scripts-dir>/session.py start`. Claude Code's permission engine
-  matches the LITERAL text of each statement — a call through a shell
-  variable (`SES=...; "$SES" start`) can never auto-approve because the
-  matcher can't see through the variable, and every extra statement in a
-  compound command (`FOO=...`, `echo`, `cd`) is another chance to
-  prompt. No wrappers either (`uv run`, `python3` prefixes) — sole
-  exception: analytics.py REQUIRES `uv run <scripts-dir>/analytics.py`
-  (PEP 723 self-provisioned duckdb).
-- **`<scripts-dir>` is the base directory from the skill launch banner**
-  ("Base directory for this skill: ...") plus `/scripts` — write it
-  literally in every command. `$CLAUDE_SKILL_DIR` is NOT set in live
-  sessions (verified 2026-07-19; `$SES start`'s `env` block confirms it
-  each session) — the banner is the source of truth.
-- **No setup preamble is needed:** every script defaults its paths from
-  `$EMAIL_TRIAGE_DATA_DIR` (falling back to `~/.local/share/...`) —
-  `--db`, `--maildir`, `--maildir-root`, `--data-dir`, `--mbsyncrc` are
-  overrides, not required boilerplate. `threads.py list`,
-  `session.py start`, `batch.py run --session ... <<JSON` are complete
-  commands as-is.
-- **mbsync still needs `-c` spelled out** (never auto-discovered):
-  `mbsync -c ~/.config/isync/mbsyncrc '<boxes>'` — one statement,
-  starts with `mbsync`.
-- **Standard session steps live in scripts, never in ad-hoc shell**
-  (user rule, 2026-07-19): raw `cat`/`mkdir`/`date`/`nohup` glue
-  prompts. A new every-session step goes into a script (session.py is
-  the home for lifecycle glue), not into typed shell.
-- If direct execution fails with permission denied, that's a broken
-  install (missing exec bit) to surface to the user — never route
-  around it with wrappers.
-- **Oversized tool results:** when the harness saves a big output to a
-  `tool-results` file, inspect it with the **Read tool** — never
-  `python3 -c`/`jq`/ad-hoc shell (arbitrary code is unwhitelistable and
-  prompts, 5.11). Better: don't produce the dump — `$THR list
-  --compact` for assembly, `--sender`/`--subject-contains` for lookups,
-  `$THR show` for one thread.
+- **One statement per call, script filename written literally:**
+  `<scripts-dir>/session.py start`. No shell variable, no assignment, no
+  `echo`/`cd` preamble, no `python3`/`uv run` wrapper — the permission
+  engine matches literal statement text, so anything it can't read
+  through prompts. (`analytics.py` is the one exception; reference
+  §Analytics.)
+- **`<scripts-dir>`** = the skill launch banner's "Base directory for this
+  skill" + `/scripts`, written out in every command. `$CLAUDE_SKILL_DIR`
+  is NOT set in live sessions — the banner is the source of truth.
+- **No path flags needed:** every script defaults from
+  `$EMAIL_TRIAGE_DATA_DIR`. `--db`/`--maildir`/`--maildir-root`/
+  `--data-dir`/`--mbsyncrc` are overrides — `threads.py list` and
+  `session.py start` are complete commands as-is.
+- **mbsync needs `-c` spelled out** (never auto-discovered):
+  `mbsync -c ~/.config/isync/mbsyncrc '<boxes>'`.
+- **Every standard session step lives in a script, never ad-hoc shell**
+  (user rule): `cat`/`mkdir`/`date`/`nohup` glue prompts. A new
+  every-session step goes into a script — session.py owns lifecycle glue.
+  Permission denied on direct execution means a broken install (missing
+  exec bit): surface it, never route around it with a wrapper.
+- **Oversized tool results:** inspect with the **Read tool**, never
+  `python3 -c`/`jq` (arbitrary code is unwhitelistable). Better, don't
+  produce the dump: `$THR list --compact` for assembly,
+  `--sender`/`--subject-contains` for lookups, `$THR show` for one thread.
 
 - `config.yaml` (in the data dir) — schema v2: per-account `tiers:` map
   realizing each canonical tier CONCEPT as this account's folder name,
@@ -230,17 +219,12 @@ frontend rules stay a contiguous tail that can be stripped wholesale.
    log tail — if the sync died, rerun `$SES sync-background`). If not
    done yet, tell the user and wait. Once present: re-index and consume
    that report (step 4), then act.
-   **Acting: for move/remove batches — the dominant case — one
-   `$BATCH run` call is the whole unit** (act + auto-derived events +
-   echo-absorbed re-index + box-scoped sync; see Acting). Flags stay on
-   `-local` himalaya, replies on IMAP himalaya; for those keep the same
-   act → log → re-index → push unit by hand (full `$IDX index` is cheap
-   ~25 s; box-scoped sync = exactly the folders touched, one account per
-   invocation).
+   Then act, per Acting — `$BATCH run` for move/remove (the dominant
+   case), the same unit by hand for flags and replies.
    **HARD INVARIANT: a batch is not complete until its sync has run.**
    Never begin the next batch — or report one done — while its changes
-   exist only in the local mirror. `$BATCH run` IS the unit in one call;
-   check its `sync[].ok` and re-run the push on failure.
+   exist only in the local mirror. Check `sync[].ok` and re-run the push
+   on failure.
 7. **Session end — residue check first.** `$THR residue` —
    every thread still holding untriaged messages. Empty = clean close.
    Anything listed must be either deliberate (waiting thread, explicit
@@ -338,61 +322,40 @@ Then, for everything else:
    $THR read --account <acct> --message-id <id> [--html-text] [--headers-only]
    ```
    If resolving ambiguity means showing the user the content, mark read
-   at that point: `$THR flag --account <acct> --message-id <id> --seen`
-   (himalaya id resolution happens inside the script — reference §Quirks
-   for why that dance is never done by hand).
-5. **Unsubscribe — assume-out by default (user policy, 2026-07-19).**
-   Assume the user wants to unsubscribe: for noise-board senders below
-   the decline threshold, the board's default proposed disposition is
-   **unsubscribe + trash** — don't ask "unsubscribe too?"; propose it and
-   let the user pull out senders they want to keep. Check
-   `sender_stats.declined_unsubs` (in `$HIST context`) per sender first:
-   at **2+ declines the sender has graduated** — at least `newsletter`,
-   no unsubscribe proposal (re-offer only if their handling changes:
-   reading stops, bulk-trashing starts).
-   **An active rule outranks all of this.** Some senders are
-   **unsubscribe-exempt**: the same channel carries both noise and
-   signals the user must not lose, and unsubscribing kills both (e.g.
-   Credit Karma — leaving means no more new-credit-line or score-change
-   alerts; "can't unsubscribe" means *won't*, deliberately). For a
-   sender whose rule says `unsubscribe-exempt` / `scan-then-trash`:
-   never propose unsubscribe, ignore the decline counter, scan each mail
-   for the important content the channel exists for, and trash the
-   generic engagement promos.
-   Extraction is one call:
-   `$UNSUB links --account <acct> --message-id <id>` — its `recommended`
-   object is the whole policy (automated vs manual, user rule
-   2026-07-19):
-   - **`automated` set** (a HEADER-derived URL — `List-Unsubscribe`
-     exists for programmatic unsubscribing; `automated_method` says
-     one-click-post or get): **offer to run it** — this is the preferred
-     option and the board's default proposal ("unsubscribe (automated) +
-     trash"). Execute with `$UNSUB exec --account <acct> --message-id
-     <id>` (add `--url <automated-url>` when the method is get); rule 4 —
-     board approval of a plan that includes unsubscribing IS the
-     explicit request.
-   - **`manual` set** (a body/embedded link): **additionally print it**,
-     full bare URL on its own line (rule F1), for the user to click
-     themselves. **Body links are NEVER executed** — `$UNSUB exec`
-     refuses them by design: too often a confirmation step follows the
-     click, so a bare GET "succeeds" while unsubscribing nothing (and
-     would log `unsubscribed` falsely).
-   - Only `manual` available → the proposal is "here's the link,
-     unsubscribe by hand + trash"; only after the user confirms doing it
-     does `--unsubscribed` get logged.
-   - `mailto`-only → route through the normal send gate (rule 1).
-   Log confirmations via `--unsubscribed`; a batch answer applies to the
-   whole batch.
-   **A confirmed unsubscribe is also trash approval** (user rule):
-   "I've unsubscribed" — or a completed `$UNSUB exec` they requested —
-   authorizes trashing the associated messages without a separate ask;
-   log `final_action=trash, decided_by=approved, --unsubscribed`. Only
-   those messages, nothing wider.
-   **Every decline feeds the threshold counter:** when the user keeps a
-   sender the board proposed unsubscribing from, log that event with
-   `declined-unsubscribe` in `--notes` — verbatim, that exact token; it
-   is what `sender_stats.declined_unsubs` counts. One decline dampens
-   nothing yet; the second graduates the sender out of the noise tiers.
+   at that point: `$THR flag --account <acct> --message-id <id> --seen`.
+5. **Unsubscribe — assume-out by default** (user policy, 2026-07-19). Two
+   separate decisions. **Whether** to propose it — first match wins, so
+   read top-down:
+
+   | Check, in order | Then |
+   |---|---|
+   | Active rule says `unsubscribe-exempt` / `scan-then-trash` | Never propose it; ignore the decline count. Scan each mail for the signal the channel exists for, trash the engagement promos. (One subscription carries both; leaving kills the signal too — e.g. Credit Karma's new-credit-line and score-change alerts. "Can't unsubscribe" here means *won't*, deliberately.) |
+   | `sender_stats.declined_unsubs >= 2` (from `$HIST context`) | Graduated — classify `newsletter` or above, stop proposing. Re-offer only if their handling changes: reading stops, bulk-trashing starts. |
+   | Otherwise — the default | Assume out: proposed disposition is **unsubscribe + trash**. Don't ask "unsubscribe too?"; propose it and let the user pull senders out. |
+
+   **By what mechanism** — one call, `$UNSUB links --account <acct>
+   --message-id <id>`; its `recommended` object decides:
+
+   | Available | Propose | Execute |
+   |---|---|---|
+   | `automated` (HEADER-derived — `List-Unsubscribe` exists for exactly this; `automated_method` = `one-click-post` or `get`) | "unsubscribe (automated) + trash" — preferred, and the board's default | `$UNSUB exec --account <acct> --message-id <id>`; add `--url <automated-url>` when the method is `get` |
+   | both `automated` and `manual` | automated as the default, **and** print the manual URL too | automated only |
+   | `manual` only (body/embedded link) | "here's the link, unsubscribe by hand + trash" | **Never.** `$UNSUB exec` refuses body links by design: a confirmation step usually follows the click, so a bare GET "succeeds" while unsubscribing nothing — and would log `unsubscribed` falsely. Print the full bare URL on its own line (rule F1). |
+   | `mailto` only | route through the normal send gate (rule 1) | never directly |
+
+   Per rule 4, board approval of a plan that includes unsubscribing IS the
+   explicit request. Three logging consequences follow:
+   - **A confirmed unsubscribe is also trash approval** (user rule): "I've
+     unsubscribed", or a completed `$UNSUB exec` they asked for, authorizes
+     trashing those messages without a separate ask — log
+     `final_action=trash, decided_by=approved, --unsubscribed`. Those
+     messages only, nothing wider.
+   - **Manual links log only after the user confirms** actually doing it.
+   - **Every decline feeds the threshold:** when the user keeps a sender the
+     board proposed unsubscribing from, put `declined-unsubscribe` in
+     `--notes` — verbatim, that exact token; it is what
+     `sender_stats.declined_unsubs` counts. One decline changes nothing; the
+     second graduates the sender. A batch answer applies to the whole batch.
 6. **Noise escalation — when unsubscribe isn't possible:** (1)
    unsubscribe if possible; (2) else **propose a server-side filter** —
    draft the exact match expression, action, and carve-outs for the user
@@ -421,8 +384,9 @@ graph plus a guarded subject fallback, and derives state directly.
   trash/activate batches don't need it** — `$BATCH`'s `thread_of` items
   expand members themselves.
 - `$THR flag --account <acct> --message-id <id> --seen|--block|--unblock`
-  — mechanized flag ops (himalaya id resolution inside; rule 2's
-  clear-then-set is `--block`).
+  — mechanized flag ops; rule 2's clear-then-set is `--block`. **Resolves
+  himalaya's unstable ids fresh, internally — never do that dance by
+  hand** (reference §Quirks). This is the only flag path.
 - `$THR residue` — end-of-session leftovers check (step 7).
 - A thread's messages live in one tier location at a time (system folders
   excepted — Sent copies never move). **Threads never move to Inbox.**
@@ -442,7 +406,7 @@ hardcoded:**
 | Resolve, closed one-off | `cold` named → move to `"<tiers.cold>/<year>-<Name>"`; `cold` null → `remove` (strip last label; tier derived by absence) |
 | Resolve, closed chapter in a family | move to `"<cold name or cold_root>/<Family>/<year>-<Name>"` — always a REAL folder; create first if new (`himalaya folder create`) |
 | Discard | move to `<tiers.trash>` |
-| Save reply for later | Reply exit 5b — `himalaya message save` into `<tiers.drafts>` |
+| Save reply for later | Reply step 5, "Save for later" exit — writes into `<tiers.drafts>` |
 
 **Approved move/remove batches → `$BATCH run`** (one call: act + derived
 events + echo-absorbed re-index + box-scoped push):
@@ -473,9 +437,13 @@ Message-ids are the index's bare form (no angle brackets). `final_action`
 derives from the destination tier; sender/subject from the index; per-item
 overrides win over batch flags (full schema: reference §JSON). Pre-flight
 validates every item before anything acts. Consume `change_report.
-external` per step 4; check `sync[].ok`. Hand-written `$HIST log-events`
-JSON remains only for events with no move attached (skips, flags, replies,
-drafts).
+external` per step 4; check `sync[].ok`.
+
+**Flags and replies are not moves, so they run the same unit by hand:**
+act (`-local` himalaya for flags, IMAP himalaya for replies) → log the
+event → `$IDX index` (a full run is cheap, ~25 s) → box-scoped push,
+`mbsync -c ~/.config/isync/mbsyncrc '<acct>:<folders touched>'`, one
+account per invocation. Same hard invariant: not done until the sync runs.
 
 `$ACT move`/`$ACT remove` are the low-level layer for one-offs and recovery;
 `remove` refuses to strip a message's only copy. Resolve-before-act is
@@ -485,8 +453,7 @@ rerun `$IDX index` and retry.
 - **Flag / unflag** (autonomous; thread-wide clear-then-set, rule 2 —
   mechanized): `$THR flag --account <acct> --message-id <any member>
   --block` clears `\Flagged` from every member and sets it on the latest
-  state-eligible one; `--unblock` clears only. Never hand-roll the
-  himalaya id dance — the script resolves ids fresh internally.
+  state-eligible one; `--unblock` clears only.
 - **Move / resolve / trash** (approved): `$BATCH run` (or `$ACT` one-off)
   applied to every non-system, non-trash/junk member.
 - **Reply** (approved; IMAP account — the one non-local operation):
@@ -532,32 +499,20 @@ stays-resolved"` / `"reopens"` / `"refiles"` in the event's `notes`.
 
 ## Logging (every decision, at act time)
 
-`$BATCH run` logs move/remove events itself. For everything else:
+`$BATCH run` logs its own move/remove events. Everything with no move
+attached — skips, flags, replies, drafts — is logged by hand:
 
 ```sh
-# One event:
-$HIST log-event --session "<session_started_at>" \
-  --account gmail --sender "who@example.com" --subject "..." \
-  --thread-state holding --category newsletter --inactive-days 4 \
-  --proposed trash --final trash --decided-by approved \
-  --from-folder INBOX --to-folder "[Gmail]/Trash" \
-  [--message-id "..."] [--thread-root-id "..."] [--rule-id N] \
-  [--notes "..."] [--unsubscribed]
-
-# Batch insert (all-or-nothing). <session_started_at> means the literal
-# timestamp from session start — always written out, never a shell
-# variable (a quoted heredoc wouldn't expand one anyway):
-$HIST log-events <<'JSON'
-[{"session_started_at": "2026-07-09T18:15:00Z", "account": "gmail",
-  "sender_addr": "a@example.com", "category": "spam-noise",
-  "proposed_action": "trash", "final_action": "trash",
-  "decided_by": "approved", "from_folder": "INBOX",
-  "to_folder": "[Gmail]/Trash"}]
-JSON
-
-# Notes, the moment something is noteworthy:
+$HIST log-event --session "<session_started_at>" --account gmail \
+  --sender "who@example.com" --category newsletter --thread-state holding \
+  --proposed trash --final trash --decided-by approved
 $HIST log-note --session "<session_started_at>" "resume state / watch item"
 ```
+
+`<session_started_at>` is the literal timestamp from `$SES start`, written
+out every time — never a shell variable (and a quoted heredoc would not
+expand one anyway). Remaining flags, the all-or-nothing `log-events` batch
+form, and the full field list: reference §Logging.
 
 `decided_by`: `auto` (autonomous — flags only), `approved` (as-is),
 `override` (user changed the outcome — always log the original

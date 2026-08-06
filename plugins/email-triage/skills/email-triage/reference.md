@@ -9,23 +9,25 @@ are complete without this file; this is the *why* and the *exact shapes*.
 
 Only if something is missing. Verify `himalaya`, `mbsync`, and `python3`
 are installed; walk the user through anything missing. If `history.db` is
-missing: `${CLAUDE_SKILL_DIR}/scripts/init_history_db.py`. If `index.db`
-is missing: `$IDX init --db "$IDXDB"` (or just run `index` — it
-auto-inits). If `config.yaml` or `~/.config/isync/mbsyncrc` is missing,
-this is a from-scratch setup outside a normal triage session — stop and
-walk the user through the full build sequence in `implementation-plan.md`
-rather than improvising it here.
+missing: `<scripts-dir>/init_history_db.py`. If `index.db` is missing:
+`<scripts-dir>/indexer.py init` (or just run `index` — it auto-inits;
+`--db` defaults from `$EMAIL_TRIAGE_DATA_DIR`, so pass nothing). If
+`config.yaml` or `~/.config/isync/mbsyncrc` is missing, this is a
+from-scratch setup outside a normal triage session — stop and walk the
+user through the full build sequence in `implementation-plan.md` rather
+than improvising it here.
 
 himalaya accounts live in `~/.config/himalaya/config.toml`, not this
 skill's config: `icloud`/`gmail` are IMAP (reply/send only),
-`icloud-local`/`gmail-local` are Maildir pointed at `$MAILDIR/<account>`
-(all reads and flag ops).
+`icloud-local`/`gmail-local` are Maildir pointed at
+`<maildir_path>/<account>` from `config.yaml` (all reads and flag ops).
 
 ## Account and tool quirks (all live-verified)
 
-- **`mbsync` requires `-c "$MBSYNCRC"` on every invocation** — not
-  auto-discovered (2.1). Box-scoped syntax:
-  `mbsync -c "$MBSYNCRC" 'gmail:INBOX,Areas/Taxes'`. **One account per
+- **`mbsync` requires `-c ~/.config/isync/mbsyncrc` on every invocation**
+  — not auto-discovered (2.1). Box-scoped syntax:
+  `mbsync -c ~/.config/isync/mbsyncrc 'gmail:INBOX,Areas/Taxes'` — written
+  literally, never through a variable (see Incident history). **One account per
   invocation** — combined `icloud gmail` calls flake with
   `read: unexpected EOF` ~25% of the time (opening the second channel); a
   single retry always recovered. Gmail costs ~60–80 s per invocation
@@ -154,14 +156,52 @@ usually follows, so a bare GET claims false success); `mailto:` never
 executed. Stdlib urllib, no cookies/auth, capped redirects, 15 s
 timeout, `--dry-run` available.
 
+## Logging (exact forms)
+
+The spine carries the common `log-event` call; these are the rest.
+
+**`log-event`, every flag.** Required: `--session`, `--account`,
+`--sender`, `--proposed`, `--final`, `--decided-by`. Optional:
+`--subject`, `--category`, `--thread-state`, `--inactive-days`,
+`--from-folder`, `--to-folder`, `--message-id`, `--thread-root-id`,
+`--rule-id N`, `--notes`, `--unsubscribed`.
+
+```sh
+$HIST log-event --session "<session_started_at>" \
+  --account gmail --sender "who@example.com" --subject "..." \
+  --thread-state holding --category newsletter --inactive-days 4 \
+  --proposed trash --final trash --decided-by approved \
+  --from-folder INBOX --to-folder "[Gmail]/Trash" \
+  [--message-id "..."] [--thread-root-id "..."] [--rule-id N] \
+  [--notes "..."] [--unsubscribed]
+```
+
+**`log-events` — batch insert, all-or-nothing** (one transaction; one
+invalid item aborts the whole batch with no partial writes). Field names
+are the DB column names, not the CLI flag names. Write the real timestamp
+into the JSON — a quoted heredoc (`<<'JSON'`) does NOT expand `$SESSION`,
+and an unexpanded literal would corrupt the log:
+
+```sh
+$HIST log-events <<'JSON'
+[{"session_started_at": "2026-07-09T18:15:00Z", "account": "gmail",
+  "sender_addr": "a@example.com", "category": "spam-noise",
+  "proposed_action": "trash", "final_action": "trash",
+  "decided_by": "approved", "from_folder": "INBOX",
+  "to_folder": "[Gmail]/Trash"}]
+JSON
+```
+
 ## Analytics (on demand)
 
-`ANA="${CLAUDE_SKILL_DIR}/scripts/analytics.py"` — DuckDB over both DBs,
-read-only, canned queries only (never write raw SQL in-session; the §9
-attach gotchas are encoded in the script once). **Invoke via
-`uv run "$ANA" <subcommand>`** — a PEP 723 block self-provisions the
-optional duckdb dependency; core triage never needs it. If `uv` is
-unavailable, skip analytics gracefully — `$HIST context` still carries
+DuckDB over both DBs, read-only, canned queries only (never write raw SQL
+in-session; the §9 attach gotchas are encoded in the script once).
+**Invoke as `uv run <scripts-dir>/analytics.py <subcommand>`** — written
+literally, one statement, `<scripts-dir>` from the skill launch banner.
+This is the sole command that takes a wrapper: the PEP 723 block
+self-provisions the optional duckdb dependency, and the allow rule is
+written for that exact form. Core triage never needs it — if `uv` is
+unavailable, skip analytics gracefully; `$HIST context` still carries
 sender_stats.
 
 | Subcommand | Answers |
@@ -224,3 +264,33 @@ Project graduation runs on a slower loop than per-session triage.
   bundle — plain-shell glue falls outside allowed-tools, and the nohup
   sync chains would have prompted too. Hence the rule: every standard
   session step lives inside a whitelisted script.
+- **The invocation contract (spine's Invocation rules), root-caused on a
+  second startup prompt (5.10):** Claude Code's permission engine matches
+  the **literal text of each shell statement**. Three consequences, each
+  of which cost a live prompt:
+  - Invoking through a variable (`SES=...; "$SES" start`) can *never*
+    auto-approve — the matcher cannot see through the variable. Hence the
+    literal-filename rule, and hence the spine's `$SES`/`$THR`/… being
+    documentation notation rather than shell state.
+  - Every additional statement in a compound command (`FOO=...`, `echo`,
+    `cd`) is another unmatched statement, so each is another chance to
+    prompt. Hence one statement per call, and hence every script
+    defaulting its paths from `$EMAIL_TRIAGE_DATA_DIR` — the zero-preamble
+    property exists to keep calls single-statement.
+  - Wrappers (`python3 x.py`, `uv run x.py`) change the statement text and
+    miss the rule. `analytics.py` is exempt only because PEP 723
+    self-provisioning requires `uv run`; its allow rule is written for
+    that form.
+  Durable auto-approval is meant to come from prefix-matched allow rules
+  on the scripts directory in the user's settings, the same documented
+  mechanism as the long-standing `Bash(himalaya *)` rule. **Status
+  2026-08-06: those rules are NOT present** in `~/.claude/settings.json`
+  (only `Bash(himalaya *)` is) — plan 5.10(d) was never completed. Nothing
+  is broken, because the skill's own `allowed-tools` frontmatter covers
+  the scripts while the skill is active; the settings rules were the
+  belt-and-braces half.
+- **`$CLAUDE_SKILL_DIR` is not set in live sessions** (verified
+  2026-07-19; `$SES start`'s `env` block re-confirms it every session, as
+  a cheap tripwire for a future harness change). The skill launch banner's
+  "Base directory for this skill" is the only reliable source for
+  `<scripts-dir>`.
