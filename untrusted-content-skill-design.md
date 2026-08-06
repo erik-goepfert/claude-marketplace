@@ -584,20 +584,25 @@ real mechanisms were checked):
 2. **Tool subtraction** — keep the single flow but remove what an injection
    could reach for (WebFetch, WebSearch, Write, Edit, Task) via
    `disallowed-tools`, and/or `permissions.deny` for a durable version.
-   This is new to the analysis and is the best cost/benefit: structural,
-   roughly one line, no re-architecture, and it closes the "prompt-gated
-   fetch" hole above rather than relying on the user reading a prompt.
-   Caveat that must be designed around: `disallowed-tools` is **per-turn**,
-   so a session-long guarantee needs settings. Also check what the skill
-   itself needs — `Read` is required (oversized tool-results rule), so the
-   subtraction list must be explicit, not "everything unlisted."
+   *(Implemented 2026-08-06, then **removed** — see §11. It looked like the
+   best cost/benefit here, and the estimate was wrong in one respect that
+   only matters once you write it down: `disallowed-tools` is per-turn, so
+   what reads as "structural, roughly one line" actually covers the turn that
+   loads the skill and none of the rest of a multi-turn session. The
+   session-long form needs `permissions.deny`, which is global and therefore
+   taxes every other kind of session. The lesson generalizes: a
+   partially-effective control that other documents cite as a boundary is
+   worse than no control, because the citation is what does the damage.)*
 3. *A true capability split* — read-only classification phase, separate
    action step consuming validated JSON. Strongest, and the only one that
    holds if the model itself is steered mid-turn; weigh against
-   single-flow ergonomics.
+   single-flow ergonomics. **This is now the only open option** (§11).
 
 Option 2 is not a substitute for 1 or 3 — it shrinks reach, while the
-approval gate still governs the mailbox changes our own scripts make.
+approval gate still governs the mailbox changes our own scripts make. With
+option 2 withdrawn, **option 1 is what is actually in force**: the gap this
+section calls honest is open, uncompensated by any capability mechanism, and
+engine rule 6 plus the approval gate carry it.
 
 ## 9. Spoofing / identity (skill-specific, not in the general doc)
 
@@ -684,19 +689,24 @@ during implementation rather than shrinking.
 - **`untrusted.py` seam.** *(Assigned → Phase 6.2.)* Every emitter routes
   through the shared helper; the structural test greps each script's JSON
   for a string field absent from `_trust.untrusted_fields`.
-- **Capability split vs. approval gate.** *(RESOLVED 2026-08-06 → tool
-  subtraction, the user's decision; Phase 6.8.)* `disallowed-tools` in the
-  skill's frontmatter removes `WebFetch WebSearch Write Edit NotebookEdit
-  Task Agent Artifact CronCreate` while it is active. Viability was checked
-  rather than assumed: the flow needs Bash (every script) and Read (the
-  oversized-tool-results rule) and nothing else — batch items arrive by
-  heredoc, so `Write` is not required, and no part of the skill fetches or
-  spawns subagents. **Bash necessarily stays**, so this is a partial boundary
-  and §4.6/engine rule 6 still carries weight behaviourally; the restriction
-  is also per-turn, with `permissions.deny` drafted in `reference.md` for the
-  user to install. Option 3 (read-only classification phase) is deferred, not
-  dismissed — it remains the only posture that holds if the model is steered
-  mid-turn.
+- **Capability split vs. approval gate.** *(RESOLVED 2026-08-06 → neither;
+  §4.6/engine rule 6 is the whole control. User's decision, after a reversal
+  worth recording.)* Tool subtraction was implemented — a `disallowed-tools`
+  line removing fetch/write/subagent/publish/schedule — and then **removed**,
+  because it lapses at the user's next message: it covers the turn that loads
+  the skill and none of the many that follow, while being cited in two
+  documents as backing the rule up. A control that is leaned on and mostly
+  absent is worse than an honestly behavioural rule. Durable
+  `permissions.deny` was declined separately for being global —
+  `Write`/`Edit`/`WebFetch` are needed in every other kind of session. **So
+  §8's "honest gap" stays open and is now stated as such rather than
+  compensated:** no tool is absent, and the only thing between a shell command
+  and execution is the user's permission prompt. The compensations are the
+  approval gate, the enum-constrained event writer, no shell interpolation in
+  the scripts, and the containment layer itself, which no permission setting
+  touches. A read-only classification phase feeding a separate act step remains
+  the only posture that would change this, and the only one that holds if the
+  model is steered mid-turn — deferred, not dismissed.
 - **Does anything else round-trip through the model?** *(Still open, and it
   grew twice during implementation — which is the argument for keeping it
   open.)* The carve-out started as two cases found by inspection (`url` into

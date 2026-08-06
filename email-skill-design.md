@@ -166,15 +166,25 @@ block together.
      bypassed, and bypassing it is the single move that turns a contained
      message into an uncontained one.
 
-   A **partial capability boundary** backs this rule up (Phase 6.8, decided
-   2026-08-06): the skill's `disallowed-tools` removes fetch, write/edit,
-   subagent, publish and scheduling tools while it is active. Bash and Read
-   remain because the scripts need them, so the rule above still carries real
-   weight — and the restriction is per-turn, with `permissions.deny` the
-   durable form. Recorded honestly because the alternative posture (a read-only
-   classification phase feeding a separate act step) remains the only one that
-   holds if the model is steered mid-turn, and is deferred rather than
-   dismissed.
+   **There is no capability boundary; this rule is the entire control**
+   (Phase 6.8, decided 2026-08-06). Tool subtraction via `disallowed-tools` was
+   considered and declined: it lapses when the user sends their next message, so
+   it would cover the first turn of a session and read like a boundary for the
+   rest — and a control cited as backing this rule up while covering roughly one
+   turn in ten is worse than an honestly behavioural rule. Durable
+   `permissions.deny` rules were declined for a different reason: they are
+   global, and most of the list (`Write`, `Edit`, `WebFetch`) is needed in every
+   other kind of session, so hardening triage would tax all other work.
+
+   What this means concretely: nothing structural prevents an injection from
+   being *acted on* — no tool is absent, and the only thing between a shell
+   command and execution is the user's permission prompt. The compensations are
+   the approval gate (rule 1), the enum-constrained event writer, no shell
+   interpolation anywhere in the scripts, and the containment layer itself,
+   which is script-side and independent of any permission setting. The posture
+   that would actually change this is a read-only classification phase feeding a
+   separate act step (§15) — deferred, not dismissed, and the only one that
+   holds if the model is steered mid-turn.
 
 ---
 
@@ -1595,6 +1605,6 @@ Rationale lives in the body; this is the index of choices.
 - Default-deny in both directions: each emitter authors a `TRUSTED_FIELDS` allowlist and each table a `TRUSTED_COLUMNS` one; the untrusted list is *derived by subtraction*, never hand-kept, so a field someone forgets ships escaped-and-declared instead of bare. Paths are matched absolutely (`headers.account` ≠ `account`) because under `--headers-only` the key space itself is sender-chosen.
 - Escape prose, never handles (decided 2026-08-06, in review before implementation): `message_id`, unsubscribe `url` and `sender_addr` are values the model hands back to another command, which matches them raw — an escaped handle silently matches nothing, and a silent failure reads as "that link is dead," not as a bug in our wrapping. Handles are declared untrusted regardless; being listed and being escaped are separate properties. Where possible the round-trip is removed entirely instead (`$UNSUB exec --link N`).
 - Confinement is the primary anti-laundering defense (invariant 11): the DB and Maildir are the only homes for untrusted content, both wrap on read, and writes are clean text — so a value stays re-readable from source and nothing needs to persist pre-wrapped. Model-written derivatives count as untrusted, since a summary of an injection carries its words.
-- Capability posture: tool subtraction (Phase 6.8, user's decision 2026-08-06). `disallowed-tools` removes fetch/write/subagent/publish/schedule while the skill is active; Bash and Read stay because the scripts need them, so engine rule 6 still does real work. Per-turn by design, `permissions.deny` for durable. The stronger read-only/act split is deferred, not dismissed — it is the only posture that survives the model being steered mid-turn.
+- Capability posture: **none, deliberately** (Phase 6.8, user's decision 2026-08-06). Tool subtraction via `disallowed-tools` was implemented and then removed: it lapses at the next user message, so it covers one turn of a multi-turn session while being cited as a boundary — worse than an honestly behavioural rule. Durable `permissions.deny` was declined as global: `Write`/`Edit`/`WebFetch` are needed in every other kind of session. So §4.6 is the whole control, and the compensations are the approval gate, the enum-constrained event writer, no shell interpolation in the scripts, and the script-side containment layer, which no permission setting can affect. The read-only/act split remains the only posture that survives the model being steered mid-turn; deferred, not dismissed.
 - Signal on *shape*, not on presence (Phase 6.4/6.7, both base rates measured on live mail before shipping): 78% of HTML messages hide text, so `hidden_text_present` is a diagnostic, while injection-shaped content matched 0 of 16,981 subjects and is therefore worth interrupting on. Hidden text is dropped and never handed to the model; only our own classification of it crosses. Detection labels never quote the matched text.
 - The untrusted-content layer adds no dependency (§14): stdlib only, declining both a CSS parser and a classifier, because containment never rests on either — a detection miss costs a warning, not a breach.

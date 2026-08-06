@@ -7,36 +7,37 @@ are complete without this file; this is the *why* and the *exact shapes*.
 
 ## Capability posture (Phase 6.8, decided 2026-08-06)
 
-The skill's frontmatter carries `disallowed-tools`, removing from the pool
-what an injection would reach for and the flow never needs: `WebFetch`
-`WebSearch` (exfiltration), `Write` `Edit` `NotebookEdit` (out-of-pipeline
-persistence — batch items go in by heredoc, so none of these are needed),
-`Task` `Agent` (a fresh context that never saw engine rule 6), `Artifact`
-(publishing), `CronCreate` (scheduled persistence).
+**There is none, on purpose. Engine rule 6 is the whole control** — read it as
+the primary mechanism, not as a backstop to something structural.
 
-**Bash and Read stay, because the scripts need them.** So this is a real but
-*partial* boundary, and engine rule 6 still carries weight behaviourally.
+Two mechanisms were considered and both declined:
 
-**It is per-turn.** The restriction clears when the user sends their next
-message, exactly like `allowed-tools`' grant. For coverage across a whole
-session, these belong in `~/.claude/settings.json` — the user has to add them;
-the assistant must not widen or narrow its own permissions:
+- **`disallowed-tools` in the skill frontmatter.** Implemented, then removed.
+  It genuinely removes tools from the pool, but it lapses when the user sends
+  their next message — so it covers the turn that loads the skill and none of
+  the many turns that follow (present board → approve → act → next category).
+  A control cited in the rules as backing them up, while actually covering
+  about one turn in ten, is worse than a rule that is plainly behavioural.
+- **`permissions.deny` in `~/.claude/settings.json`.** Declined because deny
+  rules are global: `Write`, `Edit` and `WebFetch` are needed in every other
+  kind of session, so hardening triage this way would tax all other work.
+  Denying only the residue (`Artifact`, `CronCreate`) buys little.
 
-```json
-{
-  "permissions": {
-    "deny": [
-      "WebFetch", "WebSearch", "Write", "Edit", "NotebookEdit",
-      "Task", "Agent", "Artifact", "CronCreate"
-    ]
-  }
-}
-```
+**What actually compensates**, and none of it depends on a permission setting:
+the approval gate (rule 1), `event_row_from_dict`'s enum constraints on every
+logged action, no shell interpolation anywhere in the scripts, and the
+containment layer itself — escaping, manifests, envelopes, column allowlists —
+which is script-side and unaffected by any of this. Containment is not the
+question; *reach after a successful injection* is, and that reach is currently
+bounded only by the user's permission prompt.
 
-Those deny rules apply to **every** session, not just triage — which is a
-bigger decision than the frontmatter, and the reason it is the user's to make.
-Same file also wants 5.10(d)'s **allow** rules for the scripts, since
-`allowed-tools` only covers the invoking turn (see §Incident history).
+If session-long coverage is ever wanted, the mechanism that fits is a
+**read-only classification phase feeding a separate act step**, not a global
+deny. That posture is deferred rather than dismissed, and it is the only one
+that still holds if the model is steered mid-turn.
+
+Separately, this file wants 5.10(d)'s **allow** rules for the scripts, since
+`allowed-tools` also covers only the invoking turn (see §Incident history).
 
 ## Bootstrap (from-scratch setup)
 
