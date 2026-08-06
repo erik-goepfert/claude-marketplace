@@ -280,6 +280,19 @@ def apply_trust(payload, trusted_fields, handle_fields=(), envelope_fields=None,
     return {"_trust": manifest, **result}
 
 
+def under(base, fields):
+    """Qualify a relative allowlist with the container path it sits under.
+
+    Paths are absolute (see apply_trust), but the same object shape often
+    appears at more than one path — a `threads.py` thread object is top-level
+    under `show` and nested under `threads` in `list`. Composing with this
+    keeps one authored allowlist per shape instead of two that can drift, and
+    it nests: `under("threads", {"members.folder"})` is
+    `threads.members.folder`.
+    """
+    return {f"{base}.{f}" for f in fields}
+
+
 def string_paths(payload):
     """Every dotted path in `payload` that holds a string value.
 

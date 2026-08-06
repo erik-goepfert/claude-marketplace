@@ -1122,12 +1122,44 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       script's JSON, assert every string field outside `TRUSTED_FIELDS`
       appears in `_trust.untrusted_fields` — mechanical enforcement of
       invariants 3 and 5. (UC §5b, inventory UC §3)
-- [ ] **6.3 Full body envelope on the read path.** `threads.py read`
+      **IN PROGRESS 2026-08-06 — `threads.py` done, 7 emitters to go.**
+      Landed: `list` / `list --compact` / `show` / `residue` / `flag`, with
+      allowlists composed by shape via a new `untrusted.under()` (a thread
+      object is top-level under `show` and nested under `threads` in `list`;
+      one authored allowlist per shape, composed to both paths, so the two
+      cannot drift). `list` now emits `{"_trust": …, "threads": […]}`.
+      `date_utc` was checked and IS trusted — `indexer.parse_date_utc`
+      strftimes it and returns None on a bad Date header, so no sender bytes
+      survive. `reference.md` gained the output-contract paragraph; SKILL's
+      step 4 notes the body envelope. **The structural test is
+      `assert_manifest_is_complete`** — it subtracts the allowlist and the
+      manifest from `untrusted.string_paths(payload)` and requires the
+      remainder to be empty, so it compares against the payload rather than a
+      hand-written expectation (a hand-written one fails open, which is
+      exactly what UC §5 forbids). Remaining emitters: `indexer.py` change
+      report, `unsub.py` links, `batch.py` `change_report.external`,
+      `analytics.py` rules/candidates/domains, `act.py` move/remove,
+      `session.py check-fullsync`.
+- [x] **6.3 Full body envelope on the read path.** `threads.py read`
       wraps `body` in the nonce envelope (the highest-risk surface — full
       sender body in context); the header sender values are escaped +
       manifested. Confirm one-message-per-context (read is already
       single-message; never batch raw bodies into one context). (design
       UC §5a; invariants 2, 8)
+      **DONE 2026-08-06**, with `threads.py`'s share of 6.2 — same file, same
+      commit. `apply_trust(..., envelope_fields={"body": "email body"})`, so
+      the envelope and the manifest share one nonce and the body cannot be
+      escaped twice. One-message-per-context is structural, not a rule to
+      remember: `read` takes a single `--message-id` and has no batch form.
+      Two decisions worth recording: (a) **`headers.Message-ID` and
+      `headers.In-Reply-To` are handles, not prose** — the reply flow copies
+      them into a References chain and `&lt;id@host&gt;` is a corrupt
+      References value, so escaping them would have broken reply threading;
+      (b) **no `headers.*` path is allowlisted at all**, in either mode, and
+      the `--headers-only` test plants a sender header literally named
+      `account` to prove the dotted-path match holds where the key space is
+      sender-chosen. Containment is not redaction — the injected text is
+      preserved verbatim inside the envelope, because 6.7 needs to see it.
 - [ ] **6.4 Neutralize HTML hidden-text.** Extend `_HTMLTextExtractor`:
       skip content inside elements whose inline `style` carries
       `display:none` / `visibility:hidden` / zero-or-near-zero font-size,
