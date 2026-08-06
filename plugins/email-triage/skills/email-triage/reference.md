@@ -81,6 +81,15 @@ Message-ID (a live session tried and got an empty match); the only join
 back to the index is from_addr + date, which is exactly what
 `$THR flag` does internally — use it instead of doing this by hand.
 
+**The `_trust` block is on EVERY script's JSON, not just `$THR` (6.2).**
+`$IDX`, `$ACT`, `$BATCH`, `$UNSUB`, `$SES` and `$ANA` all carry it. Same
+reading in each: `untrusted_fields` names sender-valued paths, prose is
+escaped, handles are not. Three that surprise people —
+`$ACT`/`$BATCH`'s `failed[].error` and `$ANA`'s `candidates[].sender` are
+untrusted (our prose quotes the sender's id; the sender field IS sender data),
+while `$SES`'s `config` is trusted (you wrote it). `$SES check-fullsync`'s
+`log_tail` and `$BATCH`'s `sync[].stderr` are mbsync's words, not ours.
+
 **`$THR read` hidden-text fields (6.4).** `hidden_text_present` means
 CSS-hidden text was dropped from `body`. It is a **diagnostic, not a signal**:
 78% of HTML mail in this mailbox hides text, nearly all of it legitimate
@@ -135,9 +144,11 @@ index → re-index/sync; ambiguous → act manually).
 `moved` entries have `from_folder`/`to_folder` instead of `folder`;
 `flag_changed` entries add `old_flags`/`new_flags` (5.2).
 
-**`$IDX priority-folders`:** per account `{"fast": [names],
-"mbsync_fast": "<acct>:<f1>,<f2>,...", "slow_hint": "full channel"}` —
-pass `mbsync_fast` verbatim as ONE mbsync argument.
+**`$IDX priority-folders`:** `{"priority_folders": {<account>: {"fast":
+[names], "mbsync_fast": "<acct>:<f1>,<f2>,...", "slow_hint": "full
+channel"}}}` — pass `mbsync_fast` verbatim as ONE mbsync argument. (Wrapped
+under `priority_folders` since 6.2, matching `$SES start`'s field name; it
+was a bare map.)
 
 **`$BATCH run` items** (stdin or `--file`), array of:
 `{"account", "message_id", "from_folder"}` plus exactly one of

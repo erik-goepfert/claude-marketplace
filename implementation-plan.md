@@ -1101,7 +1101,7 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       UC §5's "don't flatten header dicts" rule mechanical rather than
       advisory. Also added `string_paths()`, the helper 6.2's structural
       tests and exit criterion 1 hang off.
-- [ ] **6.2 Escape + manifest at every scalar emitter.** Each emitter
+- [x] **6.2 Escape + manifest at every scalar emitter.** Each emitter
       (`threads.py` list/compact/show/residue/flag, `indexer.py` index
       change report, `unsub.py` links, `batch.py`
       `change_report.external`, **plus the three added by the 2026-08-06
@@ -1140,6 +1140,69 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       report, `unsub.py` links, `batch.py` `change_report.external`,
       `analytics.py` rules/candidates/domains, `act.py` move/remove,
       `session.py check-fullsync`.
+      **COMPLETE 2026-08-06.** All eight modules done. `history.py`'s two emit
+      sites are deliberately NOT here: `context` is 6.5's `TRUSTED_COLUMNS`
+      work and `backup` sits in the same file, so one module gets one commit.
+      Audited with `grep -n "json.dump"` across the scripts — every other
+      model-bound emit routes through `apply_trust`.
+
+      **Five findings that generalize beyond their own emitter:**
+      1. **Our own prose is untrusted when it quotes a sender.**
+         `act.py`/`batch.py`'s `failed[].error` interpolates `message_id!r`;
+         `analytics.py`'s `candidates[].suggested_predicate` is
+         `f"sender = {sender}"`. Both read like pipeline fields and are — but a
+         sender picks part of the string. Default-deny caught both with no
+         special casing, which is the argument for default-deny in one line.
+      2. **Escape on the way to the model's eyes; never escape what it hands
+         back.** The sharpest case is two fields that are both "predicates":
+         `rules[].predicate` comes OUT of the DB to be read (escape it), while
+         `candidates[].suggested_predicate` goes INTO the DB via `add-rule`
+         (must survive verbatim, or the stored rule silently matches nothing).
+      3. **External processes are their own trust domain.** `session.py`'s
+         `log_tail` and `batch.py`'s `sync[].stderr` are mbsync's text — not a
+         vocabulary we control, describing data senders produced. Untrusted,
+         and free to escape since nothing feeds them back.
+      4. **Aggregates are not automatically safe.** A COUNT is; the GROUP BY
+         key it came from is usually sender text (`domains[].domain`). And
+         `categories[].category` is model-authored from email content, so
+         invariant 7 applies — same reasoning that makes `event.notes`
+         untrusted.
+      5. **Compose allowlists, never restate them.** `indexer.py` authors the
+         change-report entry shape once; `batch.py` imports the composers for
+         its nested copy. `analytics.py` exposes `wrap_for_model()` so its
+         tests wrap through the same function `main()` uses — a test that
+         restates the arguments cannot catch `main()` drifting from them.
+
+      **Two API additions to `untrusted.py`:** `under()` (compose one authored
+      allowlist onto the several paths a shape appears at) and
+      `apply_trust(trusted_subtrees=...)` for maps with a dynamic key space
+      that an exact allowlist cannot name (`priority_folders` is keyed by
+      account, `env` by variable). The subtree escape is a separate argument
+      rather than a syntax inside `trusted_fields` because it is the ONE way
+      out of default-deny, so reaching for it should be visible in review; a
+      test documents that pointing it at `headers` would undo the dotted-path
+      defence, so nobody finds that out by accident.
+
+      **Contract changes** (all in `reference.md`): `$THR list` and
+      `$IDX priority-folders` are now objects rather than bare arrays/maps —
+      they had nowhere to carry `_trust`; `$UNSUB exec --dry-run`'s
+      `headers`/`body` became `request_headers`/`request_body`, because a bare
+      `headers` in this codebase reads like the message-header dict, which is
+      the untrusted one, and a trust allowlist is the wrong place for that
+      ambiguity.
+
+      **`$UNSUB exec --link N` landed here** (design §5's "do not round-trip
+      the URL"). `links` numbers every candidate in `indexed[]`; `exec --link N`
+      selects from a list it re-extracts itself, so provenance is structural
+      instead of an exact-string match and no URL has to survive being copied
+      through the model. `--url` stays as the fallback with its check intact.
+      Measured on live data: **0 of 17,061 indexed `from_addr` values** contain
+      `&`, `<` or `>`, so escaping addresses would be a no-op today — but `&`
+      is legal atext and `<` survives a quoted local part, so it is
+      sender-triggerable rather than impossible, which is why the handle
+      classification is the right one and not just the convenient one. A test
+      also confirmed the index stores message-ids **without** angle brackets,
+      which is what makes index-time markup rejection coherent.
 - [x] **6.3 Full body envelope on the read path.** `threads.py read`
       wraps `body` in the nonce envelope (the highest-risk surface — full
       sender body in context); the header sender values are escaped +

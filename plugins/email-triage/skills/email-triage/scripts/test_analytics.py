@@ -66,6 +66,7 @@ indexer = _load("indexer")
 # importable, so a duckdb-less environment skips cleanly instead of the
 # whole test module aborting on import.
 analytics = _load("analytics") if HAVE_DUCKDB else None
+untrusted = _load("untrusted")
 
 
 def utc_now_iso() -> str:
@@ -429,6 +430,85 @@ class AnalyticsTest(unittest.TestCase):
         self.assertEqual(spam_noise["decisive"], 0)
         self.assertIsNone(spam_noise["action_mix"]["trash_rate"])
         self.assertIsNone(spam_noise["unsubscribed"]["rate"])
+
+
+@unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed -- analytics.py is an optional Phase 3 helper")
+class AnalyticsTrustTests(AnalyticsTest):
+    """Phase 6.2 on analytics.py. Aggregates are not automatically safe: a
+    COUNT is, but the GROUP BY key it came from is usually sender text."""
+
+    def wrapped(self, report):
+        """Wrap through analytics' OWN function, not a restatement of its
+        arguments -- a restatement could not catch main() drifting."""
+        payload = analytics.wrap_for_model(report)
+        return payload, payload.pop("_trust")
+
+    def assert_complete(self, report):
+        payload, trust = self.wrapped(report)
+        undeclared = (untrusted.string_paths(payload)
+                      - set(analytics.ANALYTICS_TRUSTED)
+                      - set(trust["untrusted_fields"]))
+        self.assertEqual(undeclared, set(), f"unclassified: {undeclared}")
+        return payload, trust
+
+    def test_every_report_manifest_is_complete(self):
+        for name, report in (
+            ("categories", analytics.cmd_categories(self.con, self.ns())),
+            ("domains", analytics.cmd_domains(
+                self.con, self.ns(min_events=1, category=None))),
+            ("trends", analytics.cmd_trends(self.con, self.ns(weeks=8))),
+            ("rules", analytics.cmd_rules(self.con, self.ns())),
+            ("sessions", analytics.cmd_sessions(self.con, self.ns(limit=10))),
+            ("candidates", analytics.cmd_candidates(
+                self.con, self.ns(min_events=1, days=3650))),
+        ):
+            with self.subTest(report=name):
+                self.assert_complete(report)
+
+    def test_group_by_keys_derived_from_senders_are_declared(self):
+        _p, trust = self.wrapped(analytics.cmd_domains(
+            self.con, self.ns(min_events=1, category=None)))
+        self.assertIn("domains.domain", trust["untrusted_fields"])
+        # Its own timestamps are ours and stay bare.
+        for path in ("domains.first_seen", "domains.last_seen"):
+            self.assertNotIn(path, trust["untrusted_fields"])
+
+    def test_rules_is_the_second_door_onto_the_untrusted_predicate(self):
+        # UC §3: `rules` reads the same predicate/action columns history.py
+        # context does, so it needs the same treatment at this door too.
+        _p, trust = self.wrapped(analytics.cmd_rules(self.con, self.ns()))
+        self.assertIn("rules.predicate", trust["untrusted_fields"])
+        self.assertIn("rules.action", trust["untrusted_fields"])
+        # origin is CHECK-constrained in the schema, so it is a real enum.
+        self.assertNotIn("rules.origin", trust["untrusted_fields"])
+
+    def test_model_authored_category_is_untrusted(self):
+        # invariant 7: the model assigned these during triage, from email
+        # content. Not a schema enum, so not structurally safe.
+        _p, trust = self.wrapped(analytics.cmd_categories(self.con, self.ns()))
+        self.assertIn("categories.category", trust["untrusted_fields"])
+
+    def test_cli_argument_echo_is_trusted(self):
+        # `category` at top level is what the USER asked for, not data read
+        # back out -- a different thing from categories.category above.
+        self.assertIn("category", analytics.ANALYTICS_TRUSTED)
+        self.assertNotIn("categories.category", analytics.ANALYTICS_TRUSTED)
+
+    def test_suggested_predicate_is_a_handle_not_prose(self):
+        """It exists to be pasted into `$HIST add-rule`, which stores it and
+        later matches senders against it. An entity-escaped predicate silently
+        matches nothing -- the same failure class as an escaped unsubscribe
+        URL, and just as invisible when it happens."""
+        payload, trust = self.wrapped(analytics.cmd_candidates(
+            self.con, self.ns(min_events=1, days=3650)))
+        self.assertTrue(payload["candidates"], "fixture produced no candidates")
+        for entry in payload["candidates"]:
+            self.assertEqual(entry["suggested_predicate"],
+                             f"sender = {entry['sender']}")
+            self.assertNotIn("&amp;", entry["suggested_predicate"])
+        # Unescaped, but still declared -- the two are separate properties.
+        for path in ("candidates.sender", "candidates.suggested_predicate"):
+            self.assertIn(path, trust["untrusted_fields"])
 
 
 if __name__ == "__main__":

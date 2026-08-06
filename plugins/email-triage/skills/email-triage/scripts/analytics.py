@@ -56,6 +56,9 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import untrusted  # noqa: E402
+
 try:
     import duckdb
 except ImportError:
@@ -68,6 +71,56 @@ except ImportError:
 DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
 
 ACTIONS = ("flag", "reply", "archive", "trash", "hold", "activate")
+
+
+# Trust classification (Phase 6.2; untrusted-content-skill-design.md §5).
+# Aggregates are not automatically safe: a COUNT is, but the GROUP BY key it
+# came from is often sender text, and this module is UC §3's "second door" onto
+# the untrusted predicate/action columns that `history.py context` also reads.
+#
+# Only string leaves need classifying -- every count and rate here is a number.
+ANALYTICS_TRUSTED = {
+    # Timestamps and week labels are our own strftime output, not header text.
+    "since", "weeks.iso_week", "sessions.session_started_at",
+    "domains.first_seen", "domains.last_seen",
+    "rules.created_at", "rules.last_used",
+    "candidates.last_arrival",
+    # `origin` is CHECK-constrained to ('user','claude-proposed') in the
+    # schema, so it is structurally an enum.
+    "rules.origin",
+    # The --category CLI argument echoed back: what the USER asked for, not a
+    # value read out of the data. (`categories.category` IS data -- see below.)
+    "category",
+}
+# Handles: values that exist to be handed straight back to another command, so
+# escaping them would corrupt what they are for. `$HIST add-rule` stores a
+# predicate and later matches senders against it -- an entity-escaped predicate
+# silently never matches anything, the same failure class as an escaped
+# unsubscribe URL. Measured 2026-08-06: 0 of 17,061 indexed from_addr values
+# contain `&`, `<` or `>`, so escaping would be a no-op today; but `&` is legal
+# atext and `<` survives a quoted local part, which makes it sender-triggerable
+# rather than impossible.
+ANALYTICS_HANDLES = {"candidates.sender", "candidates.suggested_predicate"}
+# Everything else is escaped and declared by default-deny. The distinction worth
+# naming, since two of these are both "predicates":
+#   rules.predicate / rules.action  -- coming OUT of the DB for the model to
+#       read. Display text: escape it.
+#   candidates.suggested_predicate  -- going INTO the DB via add-rule. Must
+#       survive verbatim: don't.
+# Escape on the way to the model's eyes; never escape what it must hand back.
+# Also untrusted: `domains.domain` (derived from sender_addr) and
+# `categories.category` (model-authored during triage -- invariant 7).
+
+
+def wrap_for_model(result: dict) -> dict:
+    """The single place analytics output is trust-classified.
+
+    main() calls it and so do the trust tests, deliberately: a test that
+    restated these arguments could not catch main() drifting away from them,
+    and every subcommand here returns its report through one exit.
+    """
+    return untrusted.apply_trust(result, ANALYTICS_TRUSTED,
+                                 handle_fields=ANALYTICS_HANDLES)
 
 
 def utc_now() -> str:
@@ -505,7 +558,7 @@ def main() -> None:
         result = args.func(con, args)
     finally:
         con.close()
-    json.dump(result, sys.stdout, indent=2, sort_keys=True)
+    json.dump(wrap_for_model(result), sys.stdout, indent=2, sort_keys=True)
     print()
 
 
