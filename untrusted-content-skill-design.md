@@ -1,8 +1,13 @@
 # Untrusted Content Handling — applied to the email-triage skill
 
-**Status:** Design v1, **sequenced as Phase 6** (tasks 6.1–6.8) in
+**Status:** Design v1, **sequenced as Phase 6** (tasks 6.1–6.10) in
 `implementation-plan.md` (2026-07-23; Phase 6 tasks cite this doc's
-sections and invariants). This document maps the general design in
+sections and invariants as `UC §n`). **Revised 2026-08-06** by a
+pre-implementation review against the real code: four corrections, each
+marked inline — handles are exempt from escaping (§5), three emitters were
+missing from the inventory (§3), arrays and sender-controlled header key
+names need explicit handling (§5), and `allowed-tools` is pre-approval
+rather than a sandbox, which changes §§2/8 and gives 6.8 a third option. This document maps the general design in
 `untrusted-content-design.md` onto the concrete architecture of this skill
 (scripts, columns, functions), records where our reality diverges from
 that document's assumptions, and names the specific surfaces and controls.
@@ -69,13 +74,30 @@ Four consequences that shape everything below:
    persisted" is satisfied by construction — nothing writes the nonce to
    disk.
 
-4. **We do NOT have capability separation.** The general doc's §8 assumes
-   a read-only triage phase with no write commands in scope. In our skill
-   the model has `batch.py` (moves/removes/logging) and `himalaya`
-   (reply/send) available *throughout*. Our only barrier between a
-   content-steered classification and a real mailbox change is the
-   **approval gate (SKILL rule 1)** — behavioral, not a capability wall.
-   This is the weakest link and is called out honestly in §8.
+4. **We do not currently USE capability separation — but the harness does
+   offer it** (corrected 2026-08-06; the original text asserted it was
+   unavailable). The general doc's §8 assumes a read-only triage phase with
+   no write commands in scope. In our skill the model has `batch.py`
+   (moves/removes/logging) and `himalaya` (reply/send) available
+   *throughout*, and today the only barrier between a content-steered
+   classification and a real mailbox change is the **approval gate (SKILL
+   rule 1)** — behavioral, not a capability wall. What the harness actually
+   provides, verified against the Claude Code skills documentation:
+
+   | Mechanism | Effect | Scope |
+   |---|---|---|
+   | `allowed-tools` (frontmatter) | **Pre-approval only.** "It does not restrict which tools are available: every tool remains callable." | The invoking turn only; clears on the next user message |
+   | `disallowed-tools` (frontmatter) | **Genuine removal** — "tools removed from Claude's available pool while this skill is active" | Also the invoking turn only |
+   | `permissions.deny` (settings) | Genuine removal | Durable, session-wide |
+
+   Two consequences. First, **our `allowed-tools` block is not a sandbox** —
+   it never was, and §8 must not treat it as one. Second, a real capability
+   wall IS reachable: `disallowed-tools` for the invoking turn, and
+   `permissions.deny` for a durable one. That gives §8/6.8 a middle option
+   between "single flow behind a behavioral gate" and a full read-only
+   phase: keep the flow, remove the tools an injection could reach for.
+   Because both frontmatter fields are per-turn, anything meant to hold for
+   a whole multi-turn triage session belongs in settings, not frontmatter.
 
 Two more divergences from the general doc's assumptions, both specific to
 us:
@@ -110,6 +132,20 @@ applied anywhere.
 | `batch.py run` → `change_report.external` | same as index change report | Medium |
 | `history.py context` → `sender_stats` | `sender_addr` (sender-set) | Medium — re-enters every session |
 | `history.py context` → `events`(via notes)/`session_notes`/`contacts` | `session_notes.note`, `events.notes`, `events.subject`, `contacts.notes/relation/display_name` | **High (laundering)** — model-written or verbatim sender text read back as if trusted |
+| `history.py context` → `active_rules` | `rules.predicate`, `rules.action` | Medium — both contain sender addresses, and `action` is long freeform prose (the live Credit Karma rule's action is a full paragraph) |
+| `analytics.py rules` | `predicate`, `action` | Medium — **a second reader of the same untrusted columns** |
+| `analytics.py candidates` | `sender`, `suggested_predicate` | Medium — sender address, echoed into a proposed rule string |
+| `analytics.py domains` | `domain` | Low/medium — derived from `sender_addr` |
+| `act.py move` / `remove` | `message_id` (echoed back per acted item) | Low — a handle, not prose |
+| `session.py check-fullsync` | `log_tail` (mbsync stderr, includes folder/label names) | Low — folder names are user-set, not sender-set |
+
+*The last five rows were added 2026-08-06, found by enumerating every
+script that prints JSON rather than reasoning from the read path.
+`analytics.py` is the notable miss: §6 classifies `rules.predicate` and
+`rules.action` as untrusted columns, and `analytics.py` reads them on a
+path entirely separate from `history.py context` — so scoping the
+persistence fix to `context` alone would have left a second, unwrapped
+door onto the same columns.*
 
 Everything in the right-hand column is currently emitted **bare** — literal
 `<` and all. Closing that is the work this document scopes.
@@ -279,12 +315,82 @@ matching the column allowlist exactly. Only string values are candidates
 objects (`latest.*`, `headers.*`) are walked recursively and marked by
 dotted path.
 
+**Arrays of strings are in scope too** (added 2026-08-06 — the original text
+covered objects only, which would have let a real untrusted field through).
+Our outputs contain both polarities, so "walk objects" is not sufficient:
+
+| Array field | Trust |
+|---|---|
+| `references_chain` | **Untrusted** — sender-set Message-IDs (a handle list: listed, not escaped, per the handles rule above) |
+| `flags`, `tiers_present` | Trusted — pipeline enums |
+| `headers.<Name>` when a header repeats (e.g. `Received`) | Untrusted — `full_message_headers` collapses repeats into a list |
+
+The walker therefore recurses into lists as well as dicts, classifying by
+the containing field's path; a list of non-strings needs no treatment.
+
+**Matching MUST be by full dotted path, never by leaf name — because under
+`--headers-only` the key space is sender-controlled.**
+`full_message_headers` builds its dict from `msg.keys()`, so the sender
+chooses the field names: a header called `account`, `folder_tier`, or
+`state` collides with names on the illustrative allowlist below. If the
+implementation compares leaf names, `headers.account` matches allowlisted
+`account` and sender bytes go out **bare and unlisted** — the exact failure
+default-deny exists to prevent, reintroduced through the key space rather
+than the value space. Path-qualified matching (`headers.account` ∉
+`TRUSTED_FIELDS`) closes it, and no `headers.*` path should ever be
+allowlisted: under `--headers-only` every header value is untrusted without
+exception. A sender can also produce a header named `_trust`; nested under
+`headers` it cannot collide with the top-level manifest, but any future
+flattening of these paths would make it collide — so don't flatten.
+
 The test for the `TRUSTED_FIELDS` allowlist is **"can this value contain
 sender bytes,"** NOT "did our code emit this field." The canonical trap is
 `threads.py`'s `root_message_id`: our code *computes* it (`thread_root_id`
 selects the root member), but its value is a sender-chosen Message-ID —
 **untrusted**. Default-deny is what protects against exactly this
 intuition slip: the safe classification is the automatic one.
+
+**Handles vs. prose: escaping must not corrupt a value the model feeds
+back** (decision 2026-08-06, found in review before implementation). Some
+untrusted fields are *display text* the model only reads (`subject`,
+`body`, anchor `text`, `notes`); others are **handles** the model reads and
+then passes to another command (`message_id` → `batch.py`/`act.py`/`$THR
+show`, anchor `url` → `$UNSUB exec`). Entity-escaping a handle breaks the
+round-trip, because the receiving script matches against the *raw* value:
+
+- `$UNSUB exec` enforces provenance by **exact string equality** against
+  header URLs it re-extracts from the message. Escaped `&` → `&amp;` never
+  matches. **16 of ~40 sampled live `List-Unsubscribe` headers contain
+  `&`**, so escaping `url` would break the automated unsubscribe path — the
+  *preferred* path under the 2026-07-19 policy — for roughly half of all
+  senders. It also degrades the manual path: `&amp;` inside a query string
+  is sent literally and breaks the request, so an escaped URL is a broken
+  URL, and rule F1 prints it for the user to click.
+- `message_id` is currently safe by luck: **0 of 17,063** indexed
+  message-ids contain `&`, `<`, or `>`. But those characters are legal in
+  the local part, so a crafted Message-ID is a sender-triggerable break (or
+  probe) of the act path.
+
+The rule: **escape prose; never escape a handle.** For handles, the control
+is not entity-encoding — it's removing the sender bytes from the
+model→script channel entirely, or validating on receipt:
+
+- `url` — do not round-trip it. `$UNSUB links` returns an indexed list and
+  `$UNSUB exec --link <n>` selects from the set it re-extracts itself.
+  Strictly stronger than escaping (no sender-controlled URL crosses the
+  model at all) and it removes the provenance string-compare.
+- `message_id` — emit unescaped, still listed in `_trust.untrusted_fields`
+  (it is sender-valued and must not be believed), and have the receiving
+  scripts treat it as an opaque key: parameterized lookup only, never
+  interpolated. Additionally reject any message-id containing `<`, `>`, or
+  control characters at *index* time, so the value can't carry markup at
+  all — cheaper and more robust than escaping on every emit.
+
+Being listed as untrusted and being escaped are therefore **separate
+properties**: the manifest still names every sender-valued field, but the
+escape pass skips handles. The manifest is the trust signal; escaping is a
+defense against markup forgery, and a handle that cannot contain markup
+does not need it.
 
 Illustrative allowlist for `threads.py list --compact` (pipeline-generated
 only): `account, state, drafted, inactive_days, member_count,
@@ -437,22 +543,55 @@ one.** During triage the model can call `batch.py` (move/remove + log) and
   text it can write is `notes`/`subject`, both untrusted-by-column (§6/§7).
   This is our analogue of the general doc §6 backstop, and it already
   exists.
-- **No fetch/browse capability** — `allowed-tools` excludes WebFetch/
-  WebSearch/general Bash; `unsub.py exec` is the sole HTTP path and it
+- **Fetch/browse is PROMPT-GATED, not absent** (corrected 2026-08-06 — the
+  original claim here was wrong and this is the entry to read most
+  carefully). `allowed-tools` pre-approves; it does not restrict, and
+  "every tool remains callable." WebFetch, WebSearch, and general Bash are
+  therefore reachable during a triage session — each raises a permission
+  prompt rather than failing. A prompt is a genuine control, and a good one
+  (the user sees the target URL before anything fires), but it is
+  *interactive*, not structural: it depends on the user reading it, and on
+  no prior "don't ask again" having widened the settings. The narrower true
+  claim: **`unsub.py exec` is the only HTTP path we *built***, and it
   refuses any URL not re-matched to the message's own header links
-  (provenance check, header-only since 2026-07-19). An injected "visit
-  X"/"click Y" has no tool that will act on it.
+  (provenance check, header-only since 2026-07-19). An injected "visit X"
+  has no *purpose-built* tool that will act on it, but it is not without a
+  tool.
 - **No shell interpolation of content** — all DB writes are parameterized;
   moves use maildir keys read off disk, never text paraphrased from the
-  message. Injection-to-shell/SQL is closed by construction.
+  message. Injection-to-shell/SQL is closed by construction **within our
+  scripts**. That property is about our code, and it survives the
+  correction above; it says nothing about the general Bash tool, which
+  remains prompt-gated rather than absent.
 
 **Candidate hardening (named, not scheduled):** scope the approval gate up
 where content risk is highest — e.g. batch approval that names each
 distinct sender/disposition rather than an aggregate count, so an injected
 skew to one item can't hide inside "archive these 12"; and a VIP/priority
-caveat (below). A true capability split (read-only classification, separate
-action step consuming validated JSON) is the strongest option and is worth
-weighing against the skill's single-flow ergonomics when this is sequenced.
+caveat (below).
+
+**Three options for 6.8, not two** (revised 2026-08-06 once the harness's
+real mechanisms were checked):
+
+1. *Single flow behind a tightened approval gate* — status quo plus the
+   named-sender batch approval. Cheapest, entirely behavioral.
+2. **Tool subtraction** — keep the single flow but remove what an injection
+   could reach for (WebFetch, WebSearch, Write, Edit, Task) via
+   `disallowed-tools`, and/or `permissions.deny` for a durable version.
+   This is new to the analysis and is the best cost/benefit: structural,
+   roughly one line, no re-architecture, and it closes the "prompt-gated
+   fetch" hole above rather than relying on the user reading a prompt.
+   Caveat that must be designed around: `disallowed-tools` is **per-turn**,
+   so a session-long guarantee needs settings. Also check what the skill
+   itself needs — `Read` is required (oversized tool-results rule), so the
+   subtraction list must be explicit, not "everything unlisted."
+3. *A true capability split* — read-only classification phase, separate
+   action step consuming validated JSON. Strongest, and the only one that
+   holds if the model itself is steered mid-turn; weigh against
+   single-flow ergonomics.
+
+Option 2 is not a substitute for 1 or 3 — it shrinks reach, while the
+approval gate still governs the mailbox changes our own scripts make.
 
 ## 9. Spoofing / identity (skill-specific, not in the general doc)
 
@@ -479,7 +618,15 @@ imply elevated trust:
 ## 10. Invariants (for our implementation and review)
 
 1. Every sender-originated byte entering a model context is entity-escaped
-   by the emitting script (no literal `<` from a sender in any JSON value).
+   by the emitting script (no literal `<` from a sender in any JSON value)
+   — **except handles** (`message_id`, `references_chain` entries, anchor
+   `url`), which the model feeds back into other commands and which
+   escaping would corrupt (§5, "Handles vs. prose"). Handles are still
+   listed as untrusted in the manifest; markup is kept out of them at the
+   source instead (message-ids rejected at index time if they contain
+   `<`/`>`/control chars; URLs not round-tripped through the model at all).
+   Restated as the testable property: **no literal `<` from a sender in any
+   JSON value that is prose**, and **no handle altered in transit**.
 2. The message **body** is additionally wrapped in a fresh-nonce envelope;
    the bracketed inner tag appears exactly twice per envelope, framing
    names it by bare name only.
@@ -488,7 +635,11 @@ imply elevated trust:
    `TRUSTED_FIELDS` allowlist and escapes+lists every string field not on
    it (default-deny; the untrusted list is never hand-maintained). The
    allowlist test is "can the value contain sender bytes," not "did our
-   code emit the field" (see `root_message_id`).
+   code emit the field" (see `root_message_id`). The walker recurses into
+   **lists as well as objects**, and matches by **full dotted path, never
+   leaf name** — `--headers-only` takes its keys from `msg.keys()`, so a
+   sender can name a header after an allowlisted field and a leaf-name
+   match would emit it bare (§5).
 4. Nonces are `uuid4`-fresh per script invocation and never written to
    disk.
 5. Trust is a column property (§6 allowlist), decided at write time;
@@ -524,9 +675,21 @@ Most have since been decided; status noted so the trail stays honest.
 - **`untrusted.py` seam.** *(Assigned → Phase 6.2.)* Every emitter routes
   through the shared helper; the structural test greps each script's JSON
   for a string field absent from `_trust.untrusted_fields`.
-- **Capability split vs. approval gate.** *(Open → Phase 6.8 decision.)*
-  Read-only classification phase (strongest) vs. the single flow behind a
-  tightened approval gate. Cost/ergonomics call.
+- **Capability split vs. approval gate.** *(Open → Phase 6.8 decision;
+  option space widened 2026-08-06.)* Three options, not two: the single
+  flow behind a tightened approval gate; **tool subtraction** via
+  `disallowed-tools`/`permissions.deny` (newly identified — the doc had
+  assumed no capability mechanism existed); or a full read-only
+  classification phase. Cost/ergonomics call, but option 2 is close to
+  free, so the question is no longer "behavioral or re-architect."
+- **Does anything else round-trip through the model?** *(New, open.)* The
+  handles carve-out (§5) was derived from the two cases found by
+  inspection — `url` into `$UNSUB exec`, `message_id` into
+  `batch.py`/`act.py`/`$THR`. Any *future* field the model reads and passes
+  back joins that set, and escaping it would break it silently (a refused
+  unsubscribe or a failed lookup looks like bad data, not like a wrapping
+  bug). Worth a standing check whenever a script grows an input that
+  another script's output supplies.
 - **`TRUSTED_COLUMNS` re-review cadence.** *(Open.)* A schema change adds
   columns; the allowlist must be revisited or new columns default to
   wrapped (safe) but possibly over-wrapped. Candidate check whenever

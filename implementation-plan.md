@@ -1015,6 +1015,37 @@ questions have since been decided in place (`UC §11` records status); the
 two still genuinely open are the capability posture (6.8) and the
 `TRUSTED_COLUMNS` re-review cadence (folded into 6.5).
 
+**Pre-implementation review (2026-08-06) — read before 6.1.** A dedicated
+review of this phase against the real code produced four corrections, all
+now folded into the UC doc; they change what 6.2 and 6.8 do, so they are not
+optional reading:
+
+1. **Handles must not be escaped** (UC §5, "Handles vs. prose"). Escaping
+   `url` would break `$UNSUB exec`, which matches by exact string equality
+   against re-extracted header URLs — **16 of ~40 sampled live
+   `List-Unsubscribe` headers contain `&`**, and an escaped URL is also a
+   broken URL for the user to click. Escaping `message_id` is a latent
+   sender-triggerable break of the act path (0 of 17,063 affected today).
+   Decision: escape prose, never handles; still LIST handles as untrusted;
+   replace URL round-tripping with `$UNSUB exec --link <n>`, and reject
+   markup in message-ids at index time instead.
+2. **Three more emitters** are in the inventory (UC §3): `analytics.py`
+   (`rules` reads the same untrusted `predicate`/`action` columns as
+   `history.py context` — a second door onto them), `act.py` (`message_id`),
+   `session.py check-fullsync` (`log_tail`).
+3. **Arrays and sender-controlled key names** (UC §5). The walker must
+   recurse into lists (`references_chain` is untrusted; `flags`/
+   `tiers_present` are not), and matching must be by **full dotted path** —
+   `--headers-only` builds its dict from `msg.keys()`, so a sender can name
+   a header `account` and collide with the allowlist.
+4. **`allowed-tools` is pre-approval, NOT a sandbox** — verified against the
+   Claude Code docs: "it does not restrict which tools are available: every
+   tool remains callable," and the grant covers only the invoking turn.
+   UC §§2/8 were wrong about this. WebFetch/WebSearch/Bash are prompt-gated,
+   not absent. Conversely `disallowed-tools` DOES remove tools (also
+   per-turn; `permissions.deny` for durable), which gives 6.8 a real third
+   option it was assumed not to have.
+
 Threat recap (UC §§1–2): email bodies, subjects, display names, and
 most headers are attacker-controlled; the risks are injected text read as
 instructions, delimiter/structure forgery, HTML hidden-text, and
@@ -1047,7 +1078,10 @@ our `strip_html` does NOT neutralize CSS-hidden text.
 - [ ] **6.2 Escape + manifest at every scalar emitter.** Each emitter
       (`threads.py` list/compact/show/residue/flag, `indexer.py` index
       change report, `unsub.py` links, `batch.py`
-      `change_report.external`) authors a **`TRUSTED_FIELDS` allowlist**
+      `change_report.external`, **plus the three added by the 2026-08-06
+      review: `analytics.py` rules/candidates/domains, `act.py`
+      move/remove, `session.py check-fullsync`**) authors a
+      **`TRUSTED_FIELDS` allowlist**
       of pipeline-generated field names, escapes every *string-valued*
       field NOT on it, and **derives** `_trust.untrusted_fields` by
       subtraction — default-deny, so a forgotten field fails safe (escaped
@@ -1082,7 +1116,19 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       `sender_stats` columns); `history.py context` and any DB→model
       emitter wrap non-allowlisted columns via `untrusted.py` on the way
       out (fresh nonce per read; at-rest text stays clean escaped
-      content). Also the mechanical half of the laundering fix —
+      content). **"Wrap" here means escape + manifest, NOT a full nonce
+      envelope** (clarified 2026-08-06 — read literally against 6.3's
+      envelope language, this task would put an envelope around each of the
+      ~129 `sender_addr` values `context` returns). Envelopes are for the
+      body only; `UC §11`'s first open question settled this. Note
+      `context` uses `SELECT *`, which is a feature here — new columns flow
+      out and default-deny classifies them untrusted automatically — but it
+      means the allowlist must be keyed **per table**, since `notes` is
+      untrusted in `events`/`contacts` while `account` is trusted in
+      `events`. Live example of the drift this guards against:
+      `sender_stats` gained `holds` and lost `skips` on 2026-08-06, and
+      UC §6 describes that view's trusted columns only loosely ("all
+      counts, rates") — enumerate them. Also the mechanical half of the laundering fix —
       `session_notes.note`, `events.notes`, `events.subject`,
       `events.sender_addr` are simply not on the list. Tests: a listed
       column emits bare, an unlisted/new column emits wrapped.
@@ -1138,15 +1184,33 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       the same rule is carrying the whole weight behaviorally and needs to be
       written that much more strictly. Deciding after 6.6 means writing 6.6
       twice.
-      Decide between a genuine read-only classification phase (strongest
-      blast-radius control — the model cannot call `batch.py`/`himalaya`
-      while reading sender content) and keeping the single flow behind a
-      tightened approval gate. Minimum bar either way: batch approval names
-      each distinct sender/disposition so an injected skew to one item can't
-      hide inside "archive these 12". Records the decision and its
-      rationale; the enum-constrained logging backstop (already in
-      `event_row_from_dict`) and the no-fetch / no-shell-interpolation
-      properties are the standing compensations named in the design.
+      **Three options, not two** (revised 2026-08-06 after verifying what
+      the harness actually offers — the doc had assumed capability
+      separation was unavailable to us):
+      (1) *single flow behind a tightened approval gate* — status quo plus
+      the named-sender batch approval; entirely behavioral;
+      (2) **tool subtraction** — keep the flow, remove what an injection
+      could reach for (WebFetch, WebSearch, Write, Edit, Task) via
+      `disallowed-tools`, with `permissions.deny` for a durable version.
+      NEW to the analysis and the best cost/benefit: structural, ~one line,
+      no re-architecture. Two design constraints: `disallowed-tools` is
+      **per-turn** (a session-long guarantee needs settings), and the
+      subtraction list must be explicit — the skill itself requires `Read`
+      (oversized tool-results rule), so "deny everything unlisted" would
+      break it;
+      (3) *a true capability split* — read-only classification phase, a
+      separate action step consuming validated JSON; strongest, and the only
+      one that still holds if the model is steered mid-turn.
+      Option 2 does not replace 1 or 3: it shrinks reach, while the approval
+      gate still governs the mailbox changes our own scripts make.
+      Minimum bar regardless: batch approval names each distinct
+      sender/disposition so an injected skew to one item can't hide inside
+      "archive these 12". Records the decision and its rationale; the
+      enum-constrained logging backstop (already in `event_row_from_dict`)
+      and no-shell-interpolation-in-our-scripts are the standing
+      compensations. **Do not cite "no fetch capability" as a
+      compensation** — that claim was false (see the pre-implementation
+      review above); fetch is prompt-gated, not absent.
       (UC §8, `UC §11` open questions)
 - [ ] **6.9 `suggest-events` — absorb change-report consumption into the
       indexer** (added 2026-08-06). **Not security work.** It lives in
