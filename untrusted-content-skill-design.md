@@ -7,7 +7,13 @@ pre-implementation review against the real code: four corrections, each
 marked inline — handles are exempt from escaping (§5), three emitters were
 missing from the inventory (§3), arrays and sender-controlled header key
 names need explicit handling (§5), and `allowed-tools` is pre-approval
-rather than a sandbox, which changes §§2/8 and gives 6.8 a third option. This document maps the general design in
+rather than a sandbox, which changes §§2/8 and gives 6.8 a third option.
+**IMPLEMENTED 2026-08-06** — Phase 6.1–6.10 all landed; see the plan for the
+per-task record and `§11` for what the build changed about this design. Three
+findings worth carrying forward: the handles carve-out grew from two fields to
+four during implementation (§11), `hidden_text_present` proved useless as a
+signal at a 78% live base rate and was demoted to a diagnostic (§4), and the
+whole layer needed no new dependency. This document maps the general design in
 `untrusted-content-design.md` onto the concrete architecture of this skill
 (scripts, columns, functions), records where our reality diverges from
 that document's assumptions, and names the specific surfaces and controls.
@@ -667,6 +673,9 @@ imply elevated trust:
 ## 11. Open questions
 
 Most have since been decided; status noted so the trail stays honest.
+**As of Phase 6's close (2026-08-06) one remains genuinely open** — whether
+anything else round-trips through the model — and it is the one that grew
+during implementation rather than shrinking.
 
 - **List-scale wrapping cost.** *(Decided → §5, Phase 6.2/6.3.)*
   Manifest + escape for lists, full nonce envelope only for `read`.
@@ -675,25 +684,46 @@ Most have since been decided; status noted so the trail stays honest.
 - **`untrusted.py` seam.** *(Assigned → Phase 6.2.)* Every emitter routes
   through the shared helper; the structural test greps each script's JSON
   for a string field absent from `_trust.untrusted_fields`.
-- **Capability split vs. approval gate.** *(Open → Phase 6.8 decision;
-  option space widened 2026-08-06.)* Three options, not two: the single
-  flow behind a tightened approval gate; **tool subtraction** via
-  `disallowed-tools`/`permissions.deny` (newly identified — the doc had
-  assumed no capability mechanism existed); or a full read-only
-  classification phase. Cost/ergonomics call, but option 2 is close to
-  free, so the question is no longer "behavioral or re-architect."
-- **Does anything else round-trip through the model?** *(New, open.)* The
-  handles carve-out (§5) was derived from the two cases found by
-  inspection — `url` into `$UNSUB exec`, `message_id` into
-  `batch.py`/`act.py`/`$THR`. Any *future* field the model reads and passes
-  back joins that set, and escaping it would break it silently (a refused
-  unsubscribe or a failed lookup looks like bad data, not like a wrapping
-  bug). Worth a standing check whenever a script grows an input that
-  another script's output supplies.
-- **`TRUSTED_COLUMNS` re-review cadence.** *(Open.)* A schema change adds
-  columns; the allowlist must be revisited or new columns default to
-  wrapped (safe) but possibly over-wrapped. Candidate check whenever
-  `init_history_db.py` / the `envelopes` DDL changes.
+- **Capability split vs. approval gate.** *(RESOLVED 2026-08-06 → tool
+  subtraction, the user's decision; Phase 6.8.)* `disallowed-tools` in the
+  skill's frontmatter removes `WebFetch WebSearch Write Edit NotebookEdit
+  Task Agent Artifact CronCreate` while it is active. Viability was checked
+  rather than assumed: the flow needs Bash (every script) and Read (the
+  oversized-tool-results rule) and nothing else — batch items arrive by
+  heredoc, so `Write` is not required, and no part of the skill fetches or
+  spawns subagents. **Bash necessarily stays**, so this is a partial boundary
+  and §4.6/engine rule 6 still carries weight behaviourally; the restriction
+  is also per-turn, with `permissions.deny` drafted in `reference.md` for the
+  user to install. Option 3 (read-only classification phase) is deferred, not
+  dismissed — it remains the only posture that holds if the model is steered
+  mid-turn.
+- **Does anything else round-trip through the model?** *(Still open, and it
+  grew twice during implementation — which is the argument for keeping it
+  open.)* The carve-out started as two cases found by inspection (`url` into
+  `$UNSUB exec`, `message_id` into `batch.py`/`act.py`/`$THR`). Building
+  6.2–6.5 added **`sender_addr`/`contacts.addr`** (matched raw by `$HIST
+  context --senders` and by rule predicates) and
+  **`candidates.suggested_predicate`** (exists to be pasted into `add-rule`,
+  where an escaped predicate silently matches nothing). The useful
+  formulation that emerged: **escape on the way to the model's eyes; never
+  escape what it hands back.** `rules.predicate` and
+  `candidates.suggested_predicate` are the clearest pair — same kind of
+  string, opposite direction, opposite treatment. Two structural fixes now
+  exist as the preferred alternative to escaping: remove the round-trip
+  (`$UNSUB exec --link N`) or route the value in a file the model never
+  retypes (6.9's `suggestions.log_file`). Standing check whenever a script
+  grows an input another script's output supplies.
+- **`TRUSTED_COLUMNS` re-review cadence.** *(RESOLVED 2026-08-06 → Phase
+  6.5.)* Not a calendar; a trigger at the two places a schema actually
+  changes — `init_history_db.migrate()`'s docstring and the `envelopes` DDL
+  comment, each naming the allowlist to update. Backed by a test rather than
+  by discipline: `history.py` carries a third set, `UNTRUSTED_COLUMNS`, which
+  runtime never consults (default-deny already covers anything unlisted) and
+  which exists purely so the suite can distinguish **"we looked at this
+  column and it holds sender prose"** from **"nobody has looked at it yet."**
+  Safety alone cannot tell those apart, which is exactly why over-wrapping is
+  the risk a cadence question is really about. Verified against the live
+  schema: 44 columns across five tables/views, all classified, no drift.
 - **Nonce collision / reuse.** *(Decided.)* Fresh per process makes it
   negligible; Phase 6.1's "nonce fresh per call" test confirms nothing
   caches one.

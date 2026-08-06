@@ -1642,7 +1642,7 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       and that `log_file` is valid `log-events` input end to end. SKILL step 4
       went from ~25 lines of derivation rules to ~20 lines that are mostly about
       reviewing four buckets — the derivation itself is gone from the prose.
-- [ ] **6.10 Doc alignment** (the 4.6-equivalent; added 2026-08-06 after a
+- [x] **6.10 Doc alignment** (the 4.6-equivalent; added 2026-08-06 after a
       review found ~10 drift items that accumulated because Phases 5–8 had
       no such task). **Runs last — it documents whatever actually landed.**
       Design doc: new §4.6 engine rule (matching SKILL's numbered block
@@ -1659,6 +1659,38 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       layer, and §9's "External actions become events" gains the mechanized
       derivation plus the propose-never-log boundary. Plugin reinstall at
       the end.
+      **DONE 2026-08-06.** Design doc: new **§4.6** (numbered 1:1 with SKILL's
+      engine rule 6, four parts plus the honest note that the capability
+      boundary is partial); **§7.4** gained the trust-classified report contract
+      *and* the `--suggest-events` layer with its propose-never-log boundary;
+      **§8** gained "trust is a column property, applied on the read path, not
+      at rest," naming `date_utc` as the over-wrapping trap; **§9**'s "External
+      actions become events" gained the mechanized derivation, and its
+      counterparty rule was **corrected** — resolution is from the Sent
+      message's own recipients minus the account address, not via the
+      `In-Reply-To` parent, which needs the parent indexed and gives no answer
+      when it isn't; **§14** states the no-new-dependency property explicitly
+      and names the two libraries deliberately declined (a CSS parser, a
+      classifier) with the reason that survives review: containment never rests
+      on either, so a detection miss costs a warning rather than a breach.
+      Appendix gained 8 decision lines.
+
+      Taxonomy doc: **confirmed no change needed** — grepped for untrusted /
+      injection / escape / display_name / trust and the only two hits are about
+      `\Seen` integrity and per-session re-judgement, neither of which Phase 6
+      touches.
+
+      `UC §11`: capability posture and re-review cadence both marked RESOLVED
+      with their answers. The header now records that the doc is implemented,
+      with the three findings that changed it. **One question is left
+      deliberately open** — "does anything else round-trip through the model?"
+      — and the honest reason is recorded: it *grew* during implementation, from
+      two handle fields to four (`sender_addr`/`contacts.addr` and
+      `candidates.suggested_predicate` joined `url` and `message_id`). The
+      formulation that emerged is worth more than the list: **escape on the way
+      to the model's eyes; never escape what it hands back** — with
+      `rules.predicate` vs `candidates.suggested_predicate` as the clearest
+      pair, same kind of string, opposite direction, opposite treatment.
 
 **Exit criteria (Phase 6).** All of — 6.9 excepted, since it is not
 security work and may be deferred to its own phase without affecting any
@@ -1679,6 +1711,41 @@ emitter):
    to do or the model will route around it.
 5. The 6.8 posture decision is recorded with its rationale, and 6.6's rule
    text matches the posture actually chosen.
+
+**Exit status (2026-08-06): 4 of 5 met; criterion 4 needs a live session.**
+1. ✅ **Met.** 315 tests across 9 suites, up from 110. The structural test is
+   `assert_manifest_is_complete` and its per-module equivalents: they subtract
+   the allowlist and the manifest from `untrusted.string_paths(payload)` and
+   require nothing left over, so they compare against the *payload* rather than
+   a hand-written expectation — a hand-written one fails open, which is the
+   failure mode default-deny exists to prevent. Column classification is
+   verified against the **live** schema (44 columns, no drift), not a fixture.
+2. ✅ **Met, and it earned its place in this list.** The live read did not
+   merely confirm the fixture — it overturned two design decisions. The flag
+   was demoted to a diagnostic (78% base rate) and three bugs surfaced that
+   dropped *legitimate* content, including one that emptied every Amazon and
+   Sweetgreen body. A fixture would have passed all of it.
+3. ✅ **Met.** `grep -n "json.dump"` across the scripts; every model-bound emit
+   routes through `apply_trust`. Eight modules, ~20 emit sites.
+4. ❌ **Not met — requires a real triage session.** The only criterion that
+   cannot be satisfied from this side. Watch for: whether the `_trust` block and
+   envelope make classification harder to *do* (the stated risk is the model
+   routing around them); whether `--suggest-events`' four buckets actually
+   collapse step 4 in practice; and whether `injection_signals` stays quiet on a
+   real inbox, since its value rests entirely on the 0-of-16,981 base rate
+   holding outside the measured sample.
+5. ✅ **Met.** 6.8 recorded with rationale and both limits; 6.6's posture
+   paragraph names what was removed and states plainly that Bash and Read
+   remain, "so this rule is still doing real work, not decoration."
+
+**Still open, unchanged by Phase 6** — both belong to the user:
+- **2.9** — nothing backs up `history.db` on a schedule (deferred by choice
+  2026-08-06). `history.py backup` exists; nothing calls it.
+- **5.10(d)** — the two prefix-matched **allow** rules for the scripts in
+  `~/.claude/settings.json`. Load-bearing from turn 2 of every session, since
+  `allowed-tools` covers only the invoking turn. `reference.md` §Capability
+  posture now drafts the matching **deny** rules for 6.8's durable form in the
+  same file.
 
 ---
 
