@@ -67,6 +67,7 @@ indexer = _load("indexer")
 # whole test module aborting on import.
 analytics = _load("analytics") if HAVE_DUCKDB else None
 untrusted = _load("untrusted")
+history = _load("history")
 
 
 def utc_now_iso() -> str:
@@ -482,17 +483,19 @@ class AnalyticsTrustTests(AnalyticsTest):
         # origin is CHECK-constrained in the schema, so it is a real enum.
         self.assertNotIn("rules.origin", trust["untrusted_fields"])
 
-    def test_model_authored_category_is_untrusted(self):
-        # invariant 7: the model assigned these during triage, from email
-        # content. Not a schema enum, so not structurally safe.
-        _p, trust = self.wrapped(analytics.cmd_categories(self.con, self.ns()))
-        self.assertIn("categories.category", trust["untrusted_fields"])
-
-    def test_cli_argument_echo_is_trusted(self):
-        # `category` at top level is what the USER asked for, not data read
-        # back out -- a different thing from categories.category above.
-        self.assertIn("category", analytics.ANALYTICS_TRUSTED)
-        self.assertNotIn("categories.category", analytics.ANALYTICS_TRUSTED)
+    def test_validated_enum_labels_are_trusted_not_merely_unescaped(self):
+        """`category` is enum-validated on every write path
+        (event_row_from_dict's check_choice against CATEGORIES), so it is
+        structurally an enum and cannot carry content. Invariant 7 is about
+        model-written PROSE derived from email -- notes, subject. Declaring a
+        label out of our own vocabulary untrusted would be misleading, since
+        the model reasons WITH these labels rather than about them."""
+        payload, trust = self.wrapped(
+            analytics.cmd_categories(self.con, self.ns()))
+        self.assertNotIn("categories.category", trust["untrusted_fields"])
+        self.assertTrue(payload["categories"])
+        for row in payload["categories"]:
+            self.assertIn(row["category"], (None,) + tuple(history.CATEGORIES))
 
     def test_suggested_predicate_is_a_handle_not_prose(self):
         """It exists to be pasted into `$HIST add-rule`, which stores it and

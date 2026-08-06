@@ -9,6 +9,11 @@ from pathlib import Path
 DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
 
 SCHEMA = """
+-- Trust is a COLUMN property, decided at write time and applied on the
+-- model-bound read path (history.py TRUSTED_COLUMNS, Phase 6.5). At rest every
+-- value here is clean text with no wrapping tags, which is what lets the read
+-- path wrap freshly per call and keeps a value re-readable from source. New
+-- columns must be classified there -- see migrate()'s docstring.
 CREATE TABLE IF NOT EXISTS events (
     id                 INTEGER PRIMARY KEY,
     session_started_at TEXT NOT NULL,
@@ -95,7 +100,16 @@ FROM events GROUP BY sender_addr;
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """Additive migrations for DBs created before a schema change."""
+    """Additive migrations for DBs created before a schema change.
+
+    ADDING OR RENAMING A COLUMN HERE? Classify it in history.py's
+    TRUSTED_COLUMNS / HANDLE_COLUMNS / UNTRUSTED_COLUMNS (Phase 6.5). This is
+    the re-review trigger, placed where the schema actually changes rather than
+    on a calendar. Default-deny means a new column fails SAFE at runtime
+    (escaped and declared) even if you forget -- but possibly over-wrapped, and
+    an unclassified column fails test_history.py's classification test on
+    purpose, so the drift surfaces here instead of quietly.
+    """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
     if "unsubscribed" not in cols:
         conn.execute("ALTER TABLE events ADD COLUMN unsubscribed INTEGER NOT NULL DEFAULT 0")

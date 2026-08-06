@@ -67,6 +67,13 @@ import untrusted
 # --------------------------------------------------------------------------
 
 SCHEMA = """
+-- Adding a column here? It reaches a model context through this module's own
+-- change report and through threads.py's list/show/read, so classify it in
+-- indexer.CHANGE_ENTRY_TRUSTED / _HANDLES and in threads.py's per-shape
+-- allowlists (Phase 6.5's re-review trigger, placed where the schema actually
+-- changes). Default-deny makes a forgotten column fail safe -- escaped and
+-- declared untrusted -- but possibly over-wrapped: `date_utc` looks like a
+-- header value and is in fact our own strftime output.
 CREATE TABLE IF NOT EXISTS envelopes (
     id               INTEGER PRIMARY KEY,       -- surrogate key
     message_id       TEXT NOT NULL,             -- Message-ID header (or synthetic-*); join key, NOT identity

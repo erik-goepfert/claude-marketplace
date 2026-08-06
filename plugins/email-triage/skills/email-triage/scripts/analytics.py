@@ -88,9 +88,15 @@ ANALYTICS_TRUSTED = {
     # `origin` is CHECK-constrained to ('user','claude-proposed') in the
     # schema, so it is structurally an enum.
     "rules.origin",
-    # The --category CLI argument echoed back: what the USER asked for, not a
-    # value read out of the data. (`categories.category` IS data -- see below.)
-    "category",
+    # The --category CLI argument echoed back, and the data column of the same
+    # name. Both are safe for one reason: `category` is enum-validated on EVERY
+    # write path (history.event_row_from_dict check_choice against CATEGORIES,
+    # plus argparse choices), so it is structurally an enum and cannot carry
+    # content. Invariant 7's concern is model-written PROSE derived from email
+    # (`notes`, `subject`); a validated label out of our own fixed vocabulary is
+    # a different thing, and declaring it untrusted would be actively
+    # misleading -- the model reasons WITH these labels.
+    "category", "categories.category",
 }
 # Handles: values that exist to be handed straight back to another command, so
 # escaping them would corrupt what they are for. `$HIST add-rule` stores a
@@ -108,8 +114,8 @@ ANALYTICS_HANDLES = {"candidates.sender", "candidates.suggested_predicate"}
 #   candidates.suggested_predicate  -- going INTO the DB via add-rule. Must
 #       survive verbatim: don't.
 # Escape on the way to the model's eyes; never escape what it must hand back.
-# Also untrusted: `domains.domain` (derived from sender_addr) and
-# `categories.category` (model-authored during triage -- invariant 7).
+# Also untrusted: `domains.domain`, derived from sender_addr by splitting on
+# `@` -- a transformation of sender text is still sender text.
 
 
 def wrap_for_model(result: dict) -> dict:

@@ -1294,7 +1294,7 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       a character from a lookup key breaks every lookup for that message with
       no visible cause, so keeping handles clean belongs at index time, where a
       rejection is loud.
-- [ ] **6.5 Trusted-column allowlist on the DB read path.** A
+- [x] **6.5 Trusted-column allowlist on the DB read path.** A
       default-deny `TRUSTED_COLUMNS` allowlist (UC §6, named against
       our real `envelopes`/`events`/`session_notes`/`contacts`/`rules`/
       `sender_stats` columns); `history.py context` and any DB→model
@@ -1316,6 +1316,50 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       `session_notes.note`, `events.notes`, `events.subject`,
       `events.sender_addr` are simply not on the list. Tests: a listed
       column emits bare, an unlisted/new column emits wrapped.
+      **DONE 2026-08-06.** `history.py` gains three per-table dicts:
+      `TRUSTED_COLUMNS`, `HANDLE_COLUMNS`, and — the piece the task text didn't
+      anticipate — `UNTRUSTED_COLUMNS`. Runtime never consults the third one
+      (default-deny already covers anything unlisted); it exists so the test can
+      distinguish **"we looked at this column and it holds sender prose"** from
+      **"nobody has looked at this column yet."** Safety alone cannot tell you
+      which, and that difference is the whole point of a re-review trigger.
+      Verified against the LIVE schema, not just a fixture: **44 columns across
+      all five tables/views, every one classified, no drift** — and the live
+      `sender_stats` matches the enumeration exactly (9 columns), which is what
+      the "enumerate, don't describe" note was about.
+
+      Per-table keying is load-bearing rather than tidy: `notes` is untrusted in
+      `events` AND `contacts`, while `account` is trusted in `events`. A flat
+      set keyed by bare column name would have to pick one answer per name and
+      would be wrong somewhere.
+
+      Two classifications worth recording:
+      - **`sender_addr` / `contacts.addr` are HANDLES**, not prose. `$HIST
+        context --senders a@b`, `add-rule --predicate "sender = a@b"` and the
+        `$ANA candidates` output all match the raw value, so an escaped address
+        silently matches nothing. Note they are sender-valued *even though the
+        user asked to store them* — the string still came out of a From header,
+        which is the `root_message_id` trap wearing yet another hat.
+      - **`category` is TRUSTED, and I had it wrong in 6.2.** It is
+        enum-validated on every write path (`event_row_from_dict`'s
+        `check_choice` against `CATEGORIES`, plus argparse `choices`), so it is
+        structurally an enum and cannot carry content. Invariant 7's concern is
+        model-written *prose* derived from email (`notes`, `subject`); a
+        validated label from our own fixed vocabulary is a different thing, and
+        declaring it untrusted is actively misleading — the model reasons WITH
+        these labels. `analytics.py` was corrected to match.
+
+      The re-review trigger landed as prose at the two places a schema actually
+      changes: `init_history_db.migrate()`'s docstring and the `envelopes` DDL
+      comment, each naming the specific allowlist to update and stating that
+      default-deny makes a forgotten column fail *safe but possibly
+      over-wrapped* (`date_utc` is the example — it looks like a header value
+      and is our own strftime output).
+
+      Also confirmed by test: **at-rest text carries no wrapping tags.** Writes
+      are clean, the read path wraps per call, so a value stays re-readable from
+      source — which is what makes the confinement rule affordable rather than
+      lossy.
       **Also closes `UC §11`'s re-review-cadence question:** a schema change
       adds columns, and default-deny means new ones fail safe (wrapped) but
       possibly over-wrapped — so put the re-review trigger where the schema

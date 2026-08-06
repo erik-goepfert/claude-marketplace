@@ -21,6 +21,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import untrusted  # noqa: E402
+
 DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
 
 # Thread dispositions. Every verb names the condition or place it produces.
@@ -255,9 +258,103 @@ def cmd_backup(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     for old in copies[:-args.keep] if args.keep > 0 else []:
         old.unlink()
         pruned.append(old.name)
-    print(json.dumps({"backed_up": str(target),
-                      "copies": len(copies) - len(pruned),
-                      "pruned": pruned}))
+    # No sender data here at all -- paths and filenames we generated -- but it
+    # still carries a manifest, so "every model-bound emitter declares its
+    # trust" holds without exception for the reader to check.
+    print(json.dumps(untrusted.apply_trust(
+        {"backed_up": str(target), "copies": len(copies) - len(pruned),
+         "pruned": pruned},
+        {"backed_up", "pruned"})))
+
+
+# --------------------------------------------------------------------------
+# Trust as a column property (Phase 6.5; untrusted-content-skill-design.md §6)
+# --------------------------------------------------------------------------
+# Keyed PER TABLE, which is not decoration: `notes` is untrusted in `events`
+# and `contacts`, while `account` is trusted in `events`. One flat set of column
+# names would have to pick a single answer for each name and would be wrong
+# somewhere. `cmd_context` uses `SELECT *` -- a feature here, since a new column
+# flows out and default-deny classifies it untrusted automatically, but only
+# because matching is per (table, column) rather than by bare name.
+#
+# Trust is decided at WRITE time (which column is it?) and applied on the
+# model-bound READ path. At-rest text stays clean: nothing in the DB carries
+# tags, so the read path can wrap freshly every time and a value is always
+# re-readable from source. That is what makes the confinement rule affordable.
+TRUSTED_COLUMNS = {
+    "events": {
+        "id", "session_started_at", "occurred_at", "account", "thread_state",
+        "inactive_days", "from_folder", "to_folder", "rule_id", "unsubscribed",
+        # Enum-constrained on every write path, so structurally safe:
+        # proposed/final_action and category via event_row_from_dict's
+        # check_choice, decided_by by both that and a schema CHECK.
+        "proposed_action", "final_action", "decided_by", "category",
+    },
+    "session_notes": {"id", "session_started_at", "written_at"},
+    "contacts": {"is_vip", "updated_at"},
+    "rules": {"id", "created_at", "active", "origin"},
+    # Enumerated rather than described as "all counts, rates" (UC §6 was loose
+    # here). The view drifts: it gained `holds` and lost `skips` on 2026-08-06,
+    # and a description cannot fail a test.
+    "sender_stats": {
+        "events_total", "decisions", "holds", "reply_rate", "trash_rate",
+        "override_rate", "declined_unsubs", "last_seen_at",
+    },
+}
+
+# Untrusted AND unescaped: values the model reads and then passes back as a
+# lookup key. `$HIST context --senders a@b,c@d`, `$HIST add-rule --predicate
+# "sender = a@b"`, `$THR show --message-id ...` all match the raw value, so an
+# entity-escaped address silently matches nothing. Note these addresses are
+# sender-valued even when the USER asked to store them: the string still came
+# out of a From header, which is the `root_message_id` trap again.
+HANDLE_COLUMNS = {
+    "events": {"message_id", "thread_root_id", "sender_addr"},
+    "contacts": {"addr"},
+    "sender_stats": {"sender_addr"},
+}
+
+# Deliberately untrusted. Runtime does not consult this set -- default-deny
+# already covers anything unlisted. It exists so the test can tell "we looked
+# at this column and it holds sender-derived prose" apart from "nobody has
+# looked at this column yet", and so a NEW column fails the suite instead of
+# drifting in silently as merely-wrapped.
+UNTRUSTED_COLUMNS = {
+    # subject is a header; notes is ours or the model's, and invariant 7 makes
+    # model-written derivatives of email content untrusted too -- a summary of
+    # an injection still carries its words. session_notes.note is the
+    # cross-session laundering vector the confinement rule exists for.
+    "events": {"subject", "notes"},
+    "session_notes": {"note"},
+    # display_name is untrusted by invariant 10: identity matches on the real
+    # address, never the name a sender chose for itself. relation/notes are free
+    # text about a correspondent.
+    "contacts": {"display_name", "relation", "notes"},
+    # UC §3's shared door: analytics.py `rules` reads these same two columns.
+    "rules": {"predicate", "action"},
+    "sender_stats": set(),
+}
+
+
+def column_trust(paths_to_tables: dict):
+    """(trusted_paths, handle_paths) for an output nesting rows under keys.
+
+    The per-table sets above are authored once and qualified onto whatever path
+    each table's rows land at, so a second emitter over the same table cannot
+    disagree with this one."""
+    trusted, handles = set(), set()
+    for path, table in paths_to_tables.items():
+        trusted |= untrusted.under(path, TRUSTED_COLUMNS[table])
+        handles |= untrusted.under(path, HANDLE_COLUMNS.get(table, ()))
+    return trusted, handles
+
+
+CONTEXT_TABLES = {
+    "session_notes": "session_notes",
+    "active_rules": "rules",
+    "sender_stats": "sender_stats",
+    "contacts": "contacts",
+}
 
 
 def cmd_context(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -286,8 +383,15 @@ def cmd_context(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         params = tuple(addrs)
     stats = [dict(r) for r in conn.execute(stats_sql, params)]
     contacts = [dict(r) for r in conn.execute("SELECT * FROM contacts")]
+    trusted, handles = column_trust(CONTEXT_TABLES)
+    # Escape + manifest, NOT a nonce envelope per value: an envelope around each
+    # of ~129 sender_addr strings would bury the structure it is meant to guard.
+    # Envelopes are for the body (6.3); scalars get the manifest (6.2).
     json.dump(
-        {"session_notes": notes, "active_rules": rules, "sender_stats": stats, "contacts": contacts},
+        untrusted.apply_trust(
+            {"session_notes": notes, "active_rules": rules,
+             "sender_stats": stats, "contacts": contacts},
+            trusted, handle_fields=handles),
         sys.stdout,
         indent=2,
     )
