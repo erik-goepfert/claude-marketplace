@@ -408,9 +408,39 @@ recent_arrivals AS (
 SELECT s.sender, s.decisive, s.trash_rate, r.last_arrival
 FROM sender_agg s
 JOIN recent_arrivals r ON r.sender = s.sender
+-- Rule-coverage check. Interprets the two predicate FORMS actually in use
+-- rather than substring-matching the whole predicate text (fixed 2026-08-06;
+-- see design §15.4). The old `predicate LIKE '%' || sender || '%'` only ever
+-- matched a predicate that spelled out the full address, so
+-- `sender ends-with creditkarma.com` failed to cover
+-- notifications@mail.creditkarma.com -- and Credit Karma was proposed as an
+-- auto-trash candidate despite an active rule saying scan-then-trash and
+-- NEVER propose unsubscribe.
+--
+-- Each branch mirrors the SEMANTICS of the rule it reads, so coverage is
+-- neither stricter nor looser than the rule itself. The substring form is
+-- KEPT as a final fallback: any predicate shape not parsed here still gets
+-- the old behavior, so this is purely additive.
+--
+-- regexp_extract returns '' on no match, hence the <> '' guard on the
+-- suffix branch: without it an unmatched extract would make the comparison
+-- `sender LIKE '%'`, which matches EVERY sender and would silently hide all
+-- candidates.
 WHERE NOT EXISTS (
     SELECT 1 FROM h.rules ru
-    WHERE ru.active = 1 AND ru.predicate LIKE '%' || s.sender || '%'
+    WHERE ru.active = 1
+      AND (
+            -- 'sender = <addr>'  (exact)
+            s.sender = regexp_extract(lower(ru.predicate),
+                                      '^ *sender *= *([^ ]+) *$', 1)
+            -- 'sender ends-with <suffix>'  (suffix, as the rule means it)
+         OR (regexp_extract(lower(ru.predicate),
+                            '^ *sender +ends-with +([^ ]+) *$', 1) <> ''
+             AND s.sender LIKE '%' || regexp_extract(lower(ru.predicate),
+                            '^ *sender +ends-with +([^ ]+) *$', 1))
+            -- fallback: a predicate that literally names the address
+         OR lower(ru.predicate) LIKE '%' || s.sender || '%'
+          )
 )
 ORDER BY s.decisive DESC, s.sender
 """

@@ -1305,12 +1305,49 @@ than deleted so the trail stays honest. **Genuinely still open: 4 and 6.**
    optimization needed or attempted.
 3. **iCloud custom-keyword behavior** — moot under this design (state is
    `\Flagged` + local DB); only relevant if custom flags are ever reconsidered.
-4. **Rule predicate language.** *(Open.)* Start with the simplest thing
-   (sender equality, maybe sender + subject-contains) and let real usage
-   drive any richer predicate syntax. Phase 3 keeps this parked until
-   sender-equality demonstrably fails; note the vocabulary has since widened
-   on the *action* side rather than the predicate side (interaction patterns,
+4. **Rule predicate language.** *(Open, but no longer purely theoretical —
+   see the coverage lesson below.)* Start with the simplest thing (sender
+   equality, maybe sender + subject-contains) and let real usage drive any
+   richer predicate syntax. Phase 3 keeps this parked until sender-equality
+   demonstrably fails; note the vocabulary has since widened on the *action*
+   side rather than the predicate side (interaction patterns,
    `unsubscribe-exempt` — §9).
+
+   **Predicates are already a second form in practice, and prose is not a
+   grammar** (found 2026-08-06). Real rules use `sender = <addr>` *and*
+   `sender ends-with <suffix>`, and the `action` field carries freeform
+   English alongside its pattern name. Nothing parses any of it — rules are
+   read as prose by the model, which is why the widening went unnoticed. It
+   surfaced through a consumer that *did* try to interpret them:
+   `analytics.py candidates` excluded already-covered senders with
+   `predicate LIKE '%' || sender || '%'`, i.e. "does the predicate text
+   contain this address." That only ever worked for the exact-address form,
+   so `sender ends-with creditkarma.com` failed to cover
+   `notifications@mail.creditkarma.com` — and Credit Karma was proposed as
+   an auto-trash rule candidate despite an active rule stating
+   `scan-then-trash; unsubscribe-exempt … NEVER propose unsubscribe`. Not
+   just noise: the proposal contradicted the standing decision.
+
+   Fixed narrowly: the coverage check now interprets the two forms actually
+   in use, each branch mirroring the semantics of the rule it reads, with
+   the substring test kept as a fallback so unparsed shapes keep their old
+   behavior (purely additive). Two lessons for whenever this question is
+   properly answered:
+
+   - **Every predicate form needs a matcher, or coverage silently
+     under-reports.** The failure mode is invisible — a duplicate proposal
+     looks like a normal proposal. Adding a form without teaching the
+     consumers is how it happens.
+   - **Design the failure direction deliberately.** Under-matching proposes
+     a redundant rule (annoying, visible). Over-matching hides a genuine
+     candidate (silent, and looks like "no rules needed"). The `ends-with`
+     matcher needs an explicit empty-extract guard for exactly this reason:
+     an unmatched regex yields `''`, and `sender LIKE '%'` would match
+     every sender and empty the candidate list.
+
+   A real predicate grammar becomes worthwhile the moment a third form
+   appears or a second consumer needs to evaluate one — at which point the
+   parser belongs next to `history.py`'s enums, not duplicated per query.
 5. **Sync latency.** *(Answered → plan 2.2, and it measured* slow*.)* iCloud
    incrementals are seconds; **Gmail pays ~60–80 s of per-session overhead
    regardless of scope** (a single 25-message box took 81 s; the full channel

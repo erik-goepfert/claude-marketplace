@@ -190,9 +190,25 @@ class AnalyticsTest(unittest.TestCase):
                          sender_addr="ruletest@covered.com", category="marketing",
                          proposed_action="trash", final_action="trash", decided_by="approved")
 
+        # promo@mail.suffixcov.com: same shape again, but covered by an
+        # `ends-with` predicate rather than an exact address. This is the
+        # live Credit Karma bug (2026-08-06): the old substring coverage
+        # check compared the sender against the whole predicate text, so
+        # `sender ends-with suffixcov.com` never matched
+        # promo@mail.suffixcov.com and the sender was proposed for an
+        # auto-trash rule despite already being governed by one.
+        for i in range(5):
+            # Timestamps deliberately INSIDE session S1's existing 00:00-01:04
+            # window: test_sessions_spread asserts that span, and new fixture
+            # data must not silently redefine it.
+            insert_event(hconn, session_started_at=self.S1, occurred_at=f"2026-01-01T00:3{i}:00Z",
+                         sender_addr="promo@mail.suffixcov.com", category="marketing",
+                         proposed_action="trash", final_action="trash", decided_by="approved")
+
         # rules: one that drove events (via rule_id -- ruleC), one that
         # never fired (zero-event row must still appear, per the LEFT JOIN
-        # contract), one that covers ruletest@covered.com.
+        # contract), one that covers ruletest@covered.com by exact address,
+        # and one that covers promo@mail.suffixcov.com by suffix.
         hconn.execute(
             "INSERT INTO rules (created_at, active, predicate, action, origin) VALUES (?, 1, ?, 'archive', 'claude-proposed')",
             (self.S1, "sender = friend@example.com"),
@@ -205,6 +221,10 @@ class AnalyticsTest(unittest.TestCase):
         hconn.execute(
             "INSERT INTO rules (created_at, active, predicate, action, origin) VALUES (?, 1, ?, 'trash', 'user')",
             (self.S1, "sender = ruletest@covered.com"),
+        )
+        hconn.execute(
+            "INSERT INTO rules (created_at, active, predicate, action, origin) VALUES (?, 1, ?, 'scan-then-trash', 'user')",
+            (self.S1, "sender ends-with suffixcov.com"),
         )
         hconn.execute("UPDATE events SET rule_id = ? WHERE id IN (?, ?)", (rule_c_id, f1, f2))
 
@@ -236,6 +256,7 @@ class AnalyticsTest(unittest.TestCase):
         insert_envelope(iconn, key="hit", from_addr="Trashy@Spam.com", date_utc=days_ago_iso(5))
         insert_envelope(iconn, key="miss", from_addr="nearmiss@spam.com", date_utc=days_ago_iso(400))
         insert_envelope(iconn, key="covered", from_addr="ruletest@covered.com", date_utc=days_ago_iso(5))
+        insert_envelope(iconn, key="suffixcov", from_addr="promo@mail.suffixcov.com", date_utc=days_ago_iso(5))
         iconn.commit()
         iconn.close()
 
@@ -259,10 +280,11 @@ class AnalyticsTest(unittest.TestCase):
     def test_categories_rates_math(self):
         result = analytics.cmd_categories(self.con, self.ns())
         marketing = self.by_key(result["categories"], "category", "marketing")
-        self.assertEqual(marketing["events"], 16)  # 6 trashy + 5 nearmiss + 5 ruletest
-        self.assertEqual(marketing["decisive"], 15)  # the trashy hold excluded
+        # 6 trashy + 5 nearmiss + 5 ruletest + 5 suffixcov
+        self.assertEqual(marketing["events"], 21)
+        self.assertEqual(marketing["decisive"], 20)  # the trashy hold excluded
         self.assertAlmostEqual(marketing["action_mix"]["trash_rate"], 1.0)
-        self.assertAlmostEqual(marketing["unsubscribed"]["rate"], 1 / 15)
+        self.assertAlmostEqual(marketing["unsubscribed"]["rate"], 1 / 20)
         self.assertEqual(marketing["unsubscribed"]["count"], 1)
 
         passive = self.by_key(result["categories"], "category", "passive-update")
@@ -345,6 +367,28 @@ class AnalyticsTest(unittest.TestCase):
         senders = {c["sender"] for c in result["candidates"]}
         self.assertNotIn("ruletest@covered.com", senders)
         self.assertIn("trashy@spam.com", senders)  # sanity: exclusion is rule-specific, not global
+
+    def test_candidates_respects_ends_with_rule(self):
+        # Regression for the live Credit Karma bug (2026-08-06): coverage must
+        # interpret the predicate FORM, not substring-match its text.
+        # promo@mail.suffixcov.com is not a substring of
+        # "sender ends-with suffixcov.com", so the old check missed it and
+        # proposed an auto-trash rule for an already-governed sender.
+        result = analytics.cmd_candidates(self.con, self.ns(min_events=5, days=30))
+        senders = {c["sender"] for c in result["candidates"]}
+        self.assertNotIn("promo@mail.suffixcov.com", senders,
+                         "an active `sender ends-with <suffix>` rule must count as coverage")
+        self.assertIn("trashy@spam.com", senders)  # exclusion is still rule-specific
+
+    def test_candidates_coverage_does_not_swallow_everything(self):
+        # The suffix branch uses regexp_extract, which returns '' on no match.
+        # Unguarded, `sender LIKE '%' || ''` matches EVERY sender and would
+        # silently empty the candidate list -- the worst failure mode here,
+        # since it looks like "no rules needed". The exact-address rules in
+        # the fixture exercise that no-match path.
+        result = analytics.cmd_candidates(self.con, self.ns(min_events=5, days=30))
+        self.assertTrue(result["candidates"], "coverage check must not exclude all senders")
+        self.assertIn("trashy@spam.com", {c["sender"] for c in result["candidates"]})
 
     # -- rules: zero-event row present, via LEFT JOIN ------------------------
 
