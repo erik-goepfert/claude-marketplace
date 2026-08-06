@@ -54,6 +54,7 @@ import act  # noqa: E402
 import history  # noqa: E402
 import indexer  # noqa: E402
 import threads  # noqa: E402
+import untrusted  # noqa: E402
 
 # Destination tier -> logged action. Anything absent is not a triage
 # destination and fails pre-flight (untriaged, sent, drafts, all_mail,
@@ -266,6 +267,46 @@ def log_events(data_dir: Path, done: list) -> int:
     return len(rows)
 
 
+# Trust classification (Phase 6.2; untrusted-content-skill-design.md §5).
+# The change-report half is COMPOSED from indexer.py's single definition rather
+# than restated, since batch nests the same four entry shapes one level deeper.
+#
+# The event row is the interesting part: `sender_addr`, `subject` and `notes` are
+# all absent from the allowlist. The first two are plainly sender text; `notes`
+# is ours or the model's, and invariant 7 makes model-written derivatives of
+# email content untrusted too -- a summary of an injection is still an
+# injection's words. That is also the laundering path the confinement rule
+# closes: whatever goes into history.db comes back out wrapped.
+EVENT_TRUSTED = {"session_started_at", "account", "thread_state", "category",
+                 "proposed_action", "final_action", "from_folder", "to_folder",
+                 "decided_by"}
+EVENT_HANDLES = {"message_id", "thread_root_id"}
+
+BATCH_TRUSTED = (
+    {"dry_run", "sync"}
+    | untrusted.under("plan", {"account", "from_folder", "to_folder"})
+    | untrusted.under("plan.event", EVENT_TRUSTED)
+    | untrusted.under("acted.moved", {"account", "from_folder", "to_folder", "file"})
+    | untrusted.under("acted.removed", {"account", "removed_from"})
+    | untrusted.under("failed", {"account"})
+    | untrusted.under("sync", {"account", "boxes"})
+    | untrusted.under("change_report", {"unrecognized_folders"})
+    | indexer.change_report_trusted("change_report.external")
+)
+BATCH_HANDLES = (
+    untrusted.under("plan", {"message_id"})
+    | untrusted.under("plan.event", EVENT_HANDLES)
+    | untrusted.under("acted.moved", {"message_id"})
+    | untrusted.under("acted.removed", {"message_id"})
+    | untrusted.under("failed", {"message_id"})
+    | indexer.change_report_handles("change_report.external")
+)
+# Absent on purpose, so default-deny escapes and declares them:
+#   failed.error   -- interpolates the message-id (same trap as act.py)
+#   sync.stderr    -- mbsync's own text, an external vocabulary
+#   *.subject, *.sender_addr, *.from_addr, plan.event.notes -- sender prose
+
+
 def reindex_absorbing_echo(db_path: Path, maildir_root: Path, config_path, acted_ids: set) -> dict:
     """Full re-index; split the change report into this batch's own echo
     (absorbed) and external residue (returned for SKILL step-6 handling)."""
@@ -375,11 +416,13 @@ def main(argv=None) -> int:
             conn.close()
 
         if args.dry_run:
-            json.dump({"dry_run": True,
-                       "plan": [{k: p[k] for k in ("account", "message_id",
-                                                   "from_folder", "to_folder", "remove")}
-                                | {"event": p["event"]} for p in prepared]},
-                      sys.stdout, indent=2)
+            json.dump(untrusted.apply_trust(
+                {"dry_run": True,
+                 "plan": [{k: p[k] for k in ("account", "message_id",
+                                             "from_folder", "to_folder", "remove")}
+                          | {"event": p["event"]} for p in prepared]},
+                BATCH_TRUSTED, handle_fields=BATCH_HANDLES),
+                sys.stdout, indent=2)
             print()
             return 0
 
@@ -407,7 +450,9 @@ def main(argv=None) -> int:
             out["sync"] = sync_boxes(done, args.mbsync, args.mbsyncrc)
             sync_ok = all(s["ok"] for s in out["sync"])
 
-        json.dump(out, sys.stdout, indent=2, sort_keys=True)
+        json.dump(untrusted.apply_trust(out, BATCH_TRUSTED,
+                                        handle_fields=BATCH_HANDLES),
+                  sys.stdout, indent=2, sort_keys=True)
         print()
         return 0 if not failed and sync_ok else 1
     except BatchError as e:

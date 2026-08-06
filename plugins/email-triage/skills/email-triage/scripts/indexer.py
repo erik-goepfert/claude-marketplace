@@ -58,6 +58,8 @@ from email.parser import BytesHeaderParser
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 
+import untrusted
+
 # --------------------------------------------------------------------------
 # Schema (§8, verbatim envelopes DDL + indexes; folder_tier is an additive
 # column for the 2026-07-09 taxonomy scope, and message_tiers is a new view
@@ -566,6 +568,40 @@ def insert_row(cur: sqlite3.Cursor, fields: dict) -> int:
 # --------------------------------------------------------------------------
 
 
+# Trust classification (Phase 6.2; untrusted-content-skill-design.md §5).
+# One entry shape appears at four paths in the change report, and batch.py nests
+# the whole thing again under change_report.external -- so the shape is authored
+# once here and composed with untrusted.under() wherever it lands. Two hand-kept
+# copies of a security allowlist is how they drift.
+CHANGE_REPORT_KINDS = ("new", "moved", "deleted", "flag_changed")
+# Folder names come from the Maildir layout, date_utc from our own strftime, and
+# the flag lists from the filename suffix -- none of it sender text.
+CHANGE_ENTRY_TRUSTED = {"account", "folder", "from_folder", "to_folder",
+                        "date_utc", "old_flags", "new_flags"}
+# Handle: the model feeds these straight into $THR show / $ACT / $BATCH.
+CHANGE_ENTRY_HANDLES = {"message_id"}
+# `subject` and `from_addr` are absent from both on purpose -- sender prose,
+# escaped and declared by default-deny.
+
+
+def change_report_trusted(prefix: str = "") -> set:
+    """`CHANGE_ENTRY_TRUSTED` qualified onto all four report paths."""
+    base = f"{prefix}." if prefix else ""
+    return set().union(*(untrusted.under(base + kind, CHANGE_ENTRY_TRUSTED)
+                         for kind in CHANGE_REPORT_KINDS))
+
+
+def change_report_handles(prefix: str = "") -> set:
+    base = f"{prefix}." if prefix else ""
+    return set().union(*(untrusted.under(base + kind, CHANGE_ENTRY_HANDLES)
+                         for kind in CHANGE_REPORT_KINDS))
+
+
+# unrecognized_folders holds folder names, which no sender can choose.
+INDEX_TRUSTED = change_report_trusted() | {"unrecognized_folders"}
+INDEX_HANDLES = change_report_handles()
+
+
 def envelope_report_entry(account, folder, fields: dict) -> dict:
     return {
         "account": account,
@@ -772,7 +808,9 @@ def cmd_index(args: argparse.Namespace) -> None:
         conn.commit()
     finally:
         conn.close()
-    print(json.dumps(report, indent=2, sort_keys=True))
+    print(json.dumps(untrusted.apply_trust(report, INDEX_TRUSTED,
+                                           handle_fields=INDEX_HANDLES),
+                     indent=2, sort_keys=True))
 
 
 # Fast-lane tier keys for priority-folders (4.3): untriaged + active + sent +
@@ -805,7 +843,16 @@ def priority_fast_map(config_path: Path) -> dict:
 
 
 def cmd_priority_folders(args: argparse.Namespace) -> None:
-    print(json.dumps(priority_fast_map(args.config or default_config_path()), indent=2, sort_keys=True))
+    # Wrapped under a key (was the bare map) so it can carry `_trust`, and so
+    # it matches the field name `session.py start` already uses for the same
+    # data. Keys are account names from config, values are folder names --
+    # a dynamic key space, but ours, which is the one case a trusted subtree
+    # is legitimate.
+    print(json.dumps(
+        untrusted.apply_trust(
+            {"priority_folders": priority_fast_map(args.config or default_config_path())},
+            (), trusted_subtrees={"priority_folders"}),
+        indent=2, sort_keys=True))
 
 
 def main() -> None:
