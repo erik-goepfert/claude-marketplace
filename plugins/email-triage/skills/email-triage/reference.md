@@ -171,13 +171,24 @@ retry each; marker touch / lock rmdir only if ALL succeed).
 **`$UNSUB links`:** `header` (`https`/`mailto`/`one_click_post`), `body`
 anchors (including image-button links by alt text), and `recommended:
 {automated, automated_method (one-click-post|get|null), manual, mailto}`
-— `automated` is header-derived only; `manual` is the top body link.
-`exec` default is the RFC 8058 one-click POST; `--url` GET requires a
-HEADER-derived URL (provenance re-checked at fire time) and **refuses
-body links** (manual-only, user policy 2026-07-19 — a confirmation step
-usually follows, so a bare GET claims false success); `mailto:` never
-executed. Stdlib urllib, no cookies/auth, capped redirects, 15 s
-timeout, `--dry-run` available.
+— `automated` is header-derived only; `manual` is the top body link. Plus
+`indexed[]`: every candidate numbered 1..n (`n`, `kind` =
+`header-https`/`header-mailto`/`body`, `method`, `source`, `text`, `url`), in
+a stable order.
+
+`exec` default is the RFC 8058 one-click POST. **To pick a different link use
+`--link N` from `indexed[]`, not `--url`** — `exec` re-extracts the list
+itself, so provenance is structural and no URL has to survive being copied.
+`--url` still works and still re-checks provenance by exact string match, but
+it is the fallback. Either way a **body link is refused** (manual-only, user
+policy 2026-07-19 — a confirmation step usually follows, so a bare GET claims
+false success) and `mailto:` is never executed. Stdlib urllib, no
+cookies/auth, capped redirects, 15 s timeout, `--dry-run` available (its
+preview fields are `request_headers`/`request_body`).
+
+**URLs are handles, not prose:** they come back **unescaped** so they still
+work — as `exec` input and as something the user can click — while still being
+listed in `_trust.untrusted_fields`. Anchor `text` is prose and *is* escaped.
 
 ## Logging (exact forms)
 

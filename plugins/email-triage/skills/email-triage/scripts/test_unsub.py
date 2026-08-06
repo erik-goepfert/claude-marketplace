@@ -23,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import indexer  # noqa: E402
 import unsub  # noqa: E402
+import untrusted  # noqa: E402
 
 
 def make_maildir_folder(root, folder):
@@ -214,9 +215,12 @@ class UnsubTestCase(unittest.TestCase):
         self.assertTrue(out["dry_run"])
         self.assertEqual(out["method"], "POST")
         self.assertEqual(out["url"], "https://example.com/unsub?u=1")
-        self.assertEqual(out["headers"]["Content-Type"], "application/x-www-form-urlencoded")
-        self.assertEqual(out["headers"]["User-Agent"], "email-triage-unsub/1.0")
-        self.assertEqual(out["body"], "List-Unsubscribe=One-Click")
+        # Renamed from headers/body in 6.2: a bare `headers` in this codebase
+        # reads like the message-header dict, which is the untrusted one.
+        self.assertEqual(out["request_headers"]["Content-Type"],
+                         "application/x-www-form-urlencoded")
+        self.assertEqual(out["request_headers"]["User-Agent"], "email-triage-unsub/1.0")
+        self.assertEqual(out["request_body"], "List-Unsubscribe=One-Click")
 
     def test_exec_default_requires_one_click_https(self):
         msg = self._no_unsub_message()
@@ -269,8 +273,8 @@ class UnsubTestCase(unittest.TestCase):
         out = self.run_exec(msg["Message-ID"], "--url", "https://example.com/header-only-unsub", "--dry-run")
         self.assertEqual(out["method"], "GET")
         self.assertEqual(out["url"], "https://example.com/header-only-unsub")
-        self.assertIsNone(out["body"])
-        self.assertNotIn("Content-Type", out["headers"])
+        self.assertIsNone(out["request_body"])
+        self.assertNotIn("Content-Type", out["request_headers"])
 
     # -- _send: pure response-classification logic, no real network (opener mocked) --
 
@@ -303,6 +307,103 @@ class UnsubTestCase(unittest.TestCase):
             result = unsub._send("GET", "https://example.com/u", {}, None)
         self.assertEqual(result["status"], 200)
         self.assertIn("interactive page", result["note"])
+
+
+class TrustAndIndexedLinkTests(UnsubTestCase):
+    """Phase 6.2 on unsub.py: URLs are handles, and `exec --link N` removes the
+    round-trip that escaping them would have broken."""
+
+    # A URL with the `&` that would become `&amp;` under prose escaping. 16 of
+    # ~40 sampled live List-Unsubscribe headers contain one.
+    AMP_URL = "https://x.example/u?id=7&tok=abc&list=42"
+
+    def build(self, key="ku", one_click=True, body_html=None):
+        msg = EmailMessage()
+        msg["From"] = "news@example.com"
+        msg["To"] = "me@example.com"
+        msg["Subject"] = "Newsletter"
+        msg["Message-ID"] = f"<{key}@example.com>"
+        msg["List-Unsubscribe"] = f"<{self.AMP_URL}>, <mailto:off@x.example>"
+        if one_click:
+            msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+        msg.set_content(body_html or
+                        "<html><body><a href='https://b.example/u?a=1&b=2'>"
+                        "Unsubscribe &amp; <b>stop</b> mail</a></body></html>",
+                        subtype="html")
+        self.write_message("INBOX", key, msg)
+        return f"<{key}@example.com>"
+
+    def test_urls_are_never_escaped_but_are_declared(self):
+        out = self.run_links(self.build())
+        self.assertEqual(out["header"]["https"], [self.AMP_URL])
+        self.assertEqual(out["recommended"]["automated"], self.AMP_URL)
+        self.assertEqual(out["body"][0]["url"], "https://b.example/u?a=1&b=2")
+        declared = set(out["_trust"]["untrusted_fields"])
+        for path in ("header.https", "body.url", "indexed.url",
+                     "recommended.automated"):
+            self.assertIn(path, declared)
+
+    def test_anchor_text_is_prose_and_is_escaped(self):
+        out = self.run_links(self.build())
+        # convert_charrefs decodes `&amp;` to `&` before we escape, so the
+        # sender's `&` comes back as `&amp;` and their `<b>` as `&lt;b&gt;`.
+        text = out["body"][0]["text"]
+        self.assertNotIn("<b>", text)
+        self.assertIn("&amp;", text)
+        self.assertIn("body.text", out["_trust"]["untrusted_fields"])
+
+    def test_manifest_is_complete(self):
+        out = self.run_links(self.build())
+        undeclared = (untrusted.string_paths(out)
+                      - {p for p in untrusted.string_paths(out)
+                         if p.startswith("_trust")}
+                      - set(unsub.LINKS_TRUSTED)
+                      - set(out["_trust"]["untrusted_fields"]))
+        self.assertEqual(undeclared, set())
+
+    def test_indexed_numbering_is_stable_and_ordered(self):
+        out = self.run_links(self.build())
+        kinds = [(e["n"], e["kind"]) for e in out["indexed"]]
+        self.assertEqual(kinds, [(1, "header-https"), (2, "header-mailto"),
+                                 (3, "body")])
+        self.assertEqual(out["indexed"][0]["method"], "one-click-post")
+
+    def test_exec_link_fires_without_a_url_round_trip(self):
+        mid = self.build()
+        out = self.run_exec(mid, "--link", "1", "--dry-run")
+        self.assertEqual(out["method"], "POST")
+        # The URL exec used is the one IT re-extracted, byte-identical.
+        self.assertEqual(out["url"], self.AMP_URL)
+        self.assertEqual(out["request_body"], "List-Unsubscribe=One-Click")
+
+    def test_exec_link_uses_get_when_there_is_no_one_click_post(self):
+        mid = self.build(key="kg", one_click=False)
+        out = self.run_exec(mid, "--link", "1", "--dry-run")
+        self.assertEqual(out["method"], "GET")
+        self.assertEqual(out["url"], self.AMP_URL)
+
+    def test_exec_link_on_a_body_link_is_refused(self):
+        mid = self.build(key="kb")
+        with self.assertRaises(SystemExit) as cm:
+            self.run_exec(mid, "--link", "3", "--dry-run")
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_exec_link_on_a_mailto_routes_through_the_send_gate(self):
+        mid = self.build(key="km")
+        out = self.run_exec(mid, "--link", "2", "--dry-run")
+        self.assertEqual(out["method"], "mailto")
+        self.assertIn("send flow", out["note"])
+
+    def test_exec_link_out_of_range_is_a_fatal_error(self):
+        mid = self.build(key="kx")
+        with self.assertRaises(unsub.FatalError):
+            self.run_exec(mid, "--link", "99", "--dry-run")
+
+    def test_link_and_url_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            unsub.build_parser().parse_args(
+                self._base_argv("exec", "<x@y>", "--link", "1",
+                                "--url", "https://z.example"))
 
 
 if __name__ == "__main__":

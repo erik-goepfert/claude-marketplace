@@ -340,7 +340,7 @@ Then, for everything else:
 
    | Available | Propose | Execute |
    |---|---|---|
-   | `automated` (HEADER-derived — `List-Unsubscribe` exists for exactly this; `automated_method` = `one-click-post` or `get`) | "unsubscribe (automated) + trash" — preferred, and the board's default | `$UNSUB exec --account <acct> --message-id <id>`; add `--url <automated-url>` when the method is `get` |
+   | `automated` (HEADER-derived — `List-Unsubscribe` exists for exactly this; `automated_method` = `one-click-post` or `get`) | "unsubscribe (automated) + trash" — preferred, and the board's default | `$UNSUB exec --account <acct> --message-id <id>` — the bare call already picks the header link and the right method. If you must name a link, use `--link N` from `indexed[]`, never a pasted URL |
    | both `automated` and `manual` | automated as the default, **and** print the manual URL too | automated only |
    | `manual` only (body/embedded link) | "here's the link, unsubscribe by hand + trash" | **Never.** `$UNSUB exec` refuses body links by design: a confirmation step usually follows the click, so a bare GET "succeeds" while unsubscribing nothing — and would log `unsubscribed` falsely. Print the full bare URL on its own line (rule F1). |
    | `mailto` only | route through the normal send gate (rule 1) | never directly |
