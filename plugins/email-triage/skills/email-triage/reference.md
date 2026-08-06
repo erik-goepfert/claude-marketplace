@@ -5,6 +5,39 @@ account/tool quirks, exact JSON shapes, analytics, the PARA review phase,
 bootstrap, or the incident history behind a spine rule. The spine's rules
 are complete without this file; this is the *why* and the *exact shapes*.
 
+## Capability posture (Phase 6.8, decided 2026-08-06)
+
+The skill's frontmatter carries `disallowed-tools`, removing from the pool
+what an injection would reach for and the flow never needs: `WebFetch`
+`WebSearch` (exfiltration), `Write` `Edit` `NotebookEdit` (out-of-pipeline
+persistence — batch items go in by heredoc, so none of these are needed),
+`Task` `Agent` (a fresh context that never saw engine rule 6), `Artifact`
+(publishing), `CronCreate` (scheduled persistence).
+
+**Bash and Read stay, because the scripts need them.** So this is a real but
+*partial* boundary, and engine rule 6 still carries weight behaviourally.
+
+**It is per-turn.** The restriction clears when the user sends their next
+message, exactly like `allowed-tools`' grant. For coverage across a whole
+session, these belong in `~/.claude/settings.json` — the user has to add them;
+the assistant must not widen or narrow its own permissions:
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "WebFetch", "WebSearch", "Write", "Edit", "NotebookEdit",
+      "Task", "Agent", "Artifact", "CronCreate"
+    ]
+  }
+}
+```
+
+Those deny rules apply to **every** session, not just triage — which is a
+bigger decision than the frontmatter, and the reason it is the user's to make.
+Same file also wants 5.10(d)'s **allow** rules for the scripts, since
+`allowed-tools` only covers the invoking turn (see §Incident history).
+
 ## Bootstrap (from-scratch setup)
 
 Only if something is missing. Verify `himalaya`, `mbsync`, and `python3`
