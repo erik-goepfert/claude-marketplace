@@ -977,10 +977,15 @@ and be inherited, not retrofitted onto two frontends later.
 > **that doc governs** — it is the one written against the real pipeline.
 
 Ordered by dependency; each task independently committable, same discipline
-as Phase 5. Most of the UC doc's open questions have since been decided in
-place (`UC §11` records status); the two still genuinely open are the
-capability posture (6.8 below) and the `TRUSTED_COLUMNS` re-review cadence
-(folded into 6.5).
+as Phase 5. Two exceptions to flag up front: **6.8 is out of dependency
+order** (decide the capability posture before writing 6.6's rule, or write
+it twice), and **6.9 is not security work at all** — it rides here only
+because it must follow 6.2's emitter contract, and it is the one task that
+can be deferred without weakening the posture. 6.10 (doc alignment) runs
+last by construction, since it documents whatever landed. Most of the UC doc's open
+questions have since been decided in place (`UC §11` records status); the
+two still genuinely open are the capability posture (6.8) and the
+`TRUSTED_COLUMNS` re-review cadence (folded into 6.5).
 
 Threat recap (UC §§1–2): email bodies, subjects, display names, and
 most headers are attacker-controlled; the risks are injected text read as
@@ -1115,21 +1120,95 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       `event_row_from_dict`) and the no-fetch / no-shell-interpolation
       properties are the standing compensations named in the design.
       (UC §8, `UC §11` open questions)
-- [ ] **6.9 Doc alignment** (the 4.6-equivalent; added 2026-08-06 after a
-      review found ~10 drift items that accumulated because Phases 5–8 had
-      no such task). Design doc: new §4.6 engine rule (matching SKILL's
-      numbered block 1:1); §7.4's change-report contract gains the
-      `_trust` manifest and the escaped-field guarantee; §8 notes that
-      sender-valued columns are wrapped on the model-bound read path, not
-      at rest; §14 gains no new dependency (stdlib only — state that
-      explicitly, it's a design property worth defending). Taxonomy doc:
-      no change expected — confirm. `UC §11`: mark the capability-posture
-      and re-review-cadence questions resolved with their answers. Appendix
-      decisions log: one line per governing decision (containment choke
-      point in the scripts, default-deny allowlists, confinement rule,
-      capability posture). Plugin reinstall at the end.
+- [ ] **6.9 `suggest-events` — absorb change-report consumption into the
+      indexer** (added 2026-08-06). **Not security work.** It lives in
+      Phase 6 for two concrete reasons and is the one task here that can
+      slip without weakening the security posture: (a) it MUST come after
+      6.2, because the rows it emits carry `subject` and `sender_addr` —
+      sender-valued strings needing the escape + `_trust` manifest, which
+      6.2 builds; building it before means 6.2 covers a second output shape
+      and likely wraps the same fields twice; (b) built after 6.2 it is
+      covered by exit criterion 3 by construction rather than retrofitted.
+      It also serves as the first *new* emitter written against 6.2's
+      contract, which is the cheapest test that the contract is usable.
 
-**Exit criteria (Phase 6).** All of:
+      **What.** A `suggest-events` subcommand turning the change report the
+      indexer already produces into **proposed event rows** in exactly
+      `$HIST log-events`' input format — replacing ~25 lines of SKILL
+      step-4 prose rules the model must apply by hand, every session, over
+      potentially hundreds of entries.
+
+      **The mechanism already exists**, pointed at a different input:
+      `batch.py prepare()` derives a complete event row from an action
+      (`final_action` from the destination tier, sender/subject from the
+      index row, validated via `history.event_row_from_dict`), and
+      `reindex_absorbing_echo()` subtracts self-echo by
+      `(account, message_id)`. This applies the same two steps to
+      change-report entries, sourcing the echo set from `history.db`
+      instead of in-memory batch state.
+
+      **Per rule:** `moved` → tier→action mapping (`trash`→`trash`,
+      `cold`/`ongoing`→`archive`, `active`→`activate`) is a pure lookup,
+      fully mechanical — **extract that map so `batch.py` and this share
+      one copy, not two**. `flag_changed` → compare `old_flags`/`new_flags`
+      (5.2 added them for exactly this) and emit only on a `\Flagged`
+      delta; `\Seen` churn never. `new` in the `sent` tier → manual *reply*
+      event, counterparty = thread members' `from_addr` minus
+      `accounts.<a>.email` from config. `deleted` → the trash/junk tier
+      test is mechanical, but "surface and confirm" is a user interaction,
+      so it classifies and routes to `needs_confirmation` without emitting
+      an event. `parse_errors`/`unrecognized_folders` stay passthrough.
+
+      **Self-echo gets more correct, not just cheaper — the main win.** The
+      prose rule ("drop entries matching what you executed and logged this
+      session") depends on model recall across a long, possibly compacted
+      session. `SELECT account, message_id, final_action FROM events WHERE
+      session_started_at = ?` is the authoritative record and cannot
+      forget. `batch.py` already absorbs its own echo; hand-done flags and
+      replies, and anything past a compaction boundary, are currently model
+      memory alone — the gap 5.2's double-logging contradiction lived in.
+
+      **Hard boundary: it proposes, never logs.** `batch.py` is safe
+      because it acts only on explicit instruction; this infers intent from
+      filesystem deltas, one step further removed. Auto-logging would make
+      a derivation bug both invisible and scaled. Output:
+      `suggested_events[]` (pipeable straight to `log-events`),
+      `needs_confirmation[]`, `unresolved[]` (ambiguous counterparty,
+      unindexed parent — reason attached, never a guessed `sender_addr`),
+      and `self_echo_absorbed[]` as a **visible list, not a count**:
+      `decided_by=manual` is a factual claim that the user acted outside a
+      session, so an echo-subtraction gap would relabel our own action as
+      theirs, and the list is what makes that mismatch surfaceable.
+
+      **Effect on the spine:** step 4 collapses from ~25 lines of rules to
+      ~6 (run it, review suggestions, confirm the flagged ones). Tests:
+      tier→action mapping per tier; `\Seen`-only delta emits nothing while
+      a `\Flagged` delta emits one event; a logged event this session is
+      absorbed and listed; `deleted` from trash vs. elsewhere routes
+      differently; ambiguous Sent counterparty lands in `unresolved`
+      rather than guessing. ~100–150 lines plus tests.
+- [ ] **6.10 Doc alignment** (the 4.6-equivalent; added 2026-08-06 after a
+      review found ~10 drift items that accumulated because Phases 5–8 had
+      no such task). **Runs last — it documents whatever actually landed.**
+      Design doc: new §4.6 engine rule (matching SKILL's numbered block
+      1:1); §7.4's change-report contract gains the `_trust` manifest and
+      the escaped-field guarantee; §8 notes that sender-valued columns are
+      wrapped on the model-bound read path, not at rest; §14 gains no new
+      dependency (stdlib only — state that explicitly, it's a design
+      property worth defending). Taxonomy doc: no change expected —
+      confirm. `UC §11`: mark the capability-posture and re-review-cadence
+      questions resolved with their answers. Appendix decisions log: one
+      line per governing decision (containment choke point in the scripts,
+      default-deny allowlists, confinement rule, capability posture). If
+      6.9 landed: §7.4's output contract also documents the suggestion
+      layer, and §9's "External actions become events" gains the mechanized
+      derivation plus the propose-never-log boundary. Plugin reinstall at
+      the end.
+
+**Exit criteria (Phase 6).** All of — 6.9 excepted, since it is not
+security work and may be deferred to its own phase without affecting any
+of the below (if it *does* land here, criteria 1 and 3 must include its
+emitter):
 1. Every test suite green, including the new structural tests: for each
    emitter's JSON, no string field outside `TRUSTED_FIELDS` is absent from
    `_trust.untrusted_fields`; every real DB column is classified against
