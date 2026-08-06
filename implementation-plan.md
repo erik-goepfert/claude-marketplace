@@ -960,13 +960,33 @@ Plugin cache refreshed after the final commit.
       `~/.claude/settings.json` (documented semantics, like the existing
       himalaya rule) — USER adds these; the agent is guardrail-blocked
       from widening its own permissions.
-      **(d) NOT DONE as of 2026-08-06** — `~/.claude/settings.json` still
-      contains only `Bash(himalaya *)`. Nothing is broken: the skill's own
-      `allowed-tools` frontmatter covers the scripts while the skill is
-      active, which is why three sessions have run without noticing. The
-      settings rules were the belt-and-braces half (coverage outside an
-      active skill session), so this is a real but low-severity residue —
-      recorded because the task otherwise reads as complete.
+      **(d) DONE 2026-08-06 (user added them).** Four rules, not two: the
+      `.py` scoping the user asked for needs a pair per directory, because a
+      pattern with no trailing wildcard must match the WHOLE command string —
+      `…/scripts/*.py` matches a bare `init_history_db.py` but not
+      `…/threads.py list --compact`, while `…/scripts/*.py *` matches the
+      second and not the first. The version segment is a wildcard
+      (`email-triage/*/skills/…`) so a bump past `0.1.0` doesn't silently stop
+      matching. Validated against 14 simulated invocations before closing.
+
+      **Two corrections to what this entry previously said**, both worth
+      keeping visible because they were wrong in the reassuring direction:
+      - "the skill's own `allowed-tools` frontmatter covers the scripts while
+        the skill is active" — false. It covers only the turn that INVOKES the
+        skill; from turn 2 of every session onward, script calls fell through
+        to settings. A triage session is mostly turns 2..N.
+      - "which is why three sessions have run without noticing" — also false.
+        Checked: no script allow rules existed anywhere, and every
+        `allowedTools` array in `~/.claude.json` was empty. Nothing had been
+        silently accumulating them via "don't ask again"; the calls were simply
+        being approved one at a time.
+
+      Known residue, accepted: `*` matches `/` as well as spaces, so
+      `…/scripts/../../../evil.py` would match a rule that reads as
+      path-anchored. Low severity — it needs an executable to already exist
+      outside the directory, and anything that could plant one could equally
+      overwrite `threads.py` — and the alternative (a global deny on `../` in
+      Bash) would tax normal development. Recorded rather than fixed.
       Also swept 2026-08-06: `reference.md` still carried pre-5.10
       variable-style invocations that violated this very contract
       (`${CLAUDE_SKILL_DIR}/scripts/...` — an unset variable, so the
@@ -1760,11 +1780,9 @@ emitter):
 **Still open, unchanged by Phase 6** — both belong to the user:
 - **2.9** — nothing backs up `history.db` on a schedule (deferred by choice
   2026-08-06). `history.py backup` exists; nothing calls it.
-- **5.10(d)** — the two prefix-matched **allow** rules for the scripts in
-  `~/.claude/settings.json`. Load-bearing from turn 2 of every session, since
-  `allowed-tools` covers only the invoking turn. `reference.md` §Capability
-  posture now drafts the matching **deny** rules for 6.8's durable form in the
-  same file.
+- ~~**5.10(d)**~~ — **closed 2026-08-06**, user added four `.py`-scoped allow
+  rules covering both the plugin cache and the repo path. See 5.10 for the
+  two corrections that closing it exposed.
 
 ---
 
