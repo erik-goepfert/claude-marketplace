@@ -210,7 +210,7 @@ Project graduation runs on a slower loop than per-session triage.
 - **Heredoc `$SESSION` trap (Logging):** a quoted heredoc (`<<'JSON'`)
   does NOT expand `$SESSION`; an unexpanded literal would corrupt the
   log. Write the real timestamp into the JSON.
-- **Markdown links (rule 6):** `[text](url)` and backticked or elided
+- **Markdown links (rule F1):** `[text](url)` and backticked or elided
   URLs are unclickable in this user's terminal; both failure modes cost
   real round-trips. Bare full URL on its own line.
 - **Call-count economics (`$BATCH`):** the hand-orchestrated

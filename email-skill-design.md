@@ -1,11 +1,21 @@
 # Email Maintenance Skill — Design Document
 
-**Status:** Draft / pre-implementation
+**Status:** Built and in daily use. Phases 0–5 complete (MVP → full local
+stack → post-review hardening); Phase 6 (untrusted-content hardening) is next.
+Sections marked with amendment dates carry the current behavior; see
+`implementation-plan.md` for per-task outcomes.
 **Backend target:** iCloud + Gmail (standard IMAP)
 **Primary consumer:** Claude (via a Claude skill), not a human UI
-**Companions:** `implementation-plan.md` (phased rollout: MVP → full stack);
-`email-folder-taxonomy.md` (folder structure, flag semantics, and thread-state
-model — supersedes §10's state tables at Phase 2 cutover)
+**Companions:**
+- `implementation-plan.md` — phased rollout and the per-task record of what
+  was actually built, measured, and revised.
+- `email-folder-taxonomy.md` — folder structure, flag semantics, and the
+  thread-state model. **Supersedes §10's state tables** (Phase 2 cutover).
+- `untrusted-content-design.md` — the general prompt-injection/untrusted-input
+  design, provider-neutral.
+- `untrusted-content-skill-design.md` — that design grounded in *our* scripts,
+  columns, and functions. **Governs Phase 6**; where it and the
+  implementation plan disagree on a mechanism, it wins. Cited as `UC §n`.
 
 ---
 
@@ -38,8 +48,11 @@ remote-bound regardless, so they are left as thin `himalaya` calls.
   simpler approaches — see §5.)
 - **Fast, offline-capable analysis.** Thread assembly should not require one
   IMAP round-trip per message.
-- **Minimal, trustworthy state model.** One meaningful flag, clearly defined
-  (see §10).
+- **Minimal, trustworthy state model.** Two IMAP flags, each carrying exactly
+  one meaning and derived independently: `\Flagged` → the conversation state
+  (needs-reply / holding / waiting), and `\Draft` → the orthogonal `drafted`
+  status (Phase 4.5). `\Seen` is deliberately *not* triage state — it belongs
+  to the user (§4.5). No custom keywords, ever. See §10 and the taxonomy doc.
 - **Sessions that learn.** Decisions, overrides, and observations persist across
   sessions (§9), so triage quality compounds instead of resetting.
 - **Human-in-the-loop by construction.** The skill drafts and proposes; the user
@@ -62,6 +75,17 @@ remote-bound regardless, so they are left as thin `himalaya` calls.
 ## 4. Operating rules
 
 These are behavioral commitments, not implementation details.
+
+**These are the ENGINE rules, and they are numbered to match SKILL.md's
+engine block 1:1** — §4.n is SKILL rule n, permanently. SKILL.md additionally
+carries an `F`-prefixed *frontend* tail (currently F1: deliverables in a
+turn's final message, and bare-URL link formatting) which deliberately does
+**not** appear here: those rules exist only to survive the Claude Code
+harness, and Phase 10's TUI dissolves them. Keeping the frontend rules out of
+this section is what makes the engine contract frontend-agnostic (§7.6), and
+keeping the numbering shared is what lets both documents cite "rule 4" and
+mean the same thing. New engine rules append here and to SKILL's numbered
+block together.
 
 1. **Approval gate.** The skill never sends mail and never destroys or moves
    mail without the user approving that specific action in-session:
@@ -262,7 +286,7 @@ flowchart LR
   every labeled message therefore lands twice, once per label and once in All
   Mail, and the indexer dedups by Message-ID. The duplication is the price of
   mirroring Gmail's native archive state, which the taxonomy reads as a
-  virtual `Archive` tier instead of maintaining an explicit label
+  virtual `cold` tier instead of maintaining an explicit label
   (`email-folder-taxonomy.md`). Storage roughly doubles for Gmail; trivial at
   current sizes (§ plan 2.1 sizing note).
   Special-folder names differ per account (`Sent` vs `[Gmail]/Sent Mail`,
@@ -279,9 +303,16 @@ flowchart LR
 - **Scheduling discipline:** all syncs are **skill-invoked at safe points** —
   session start, after each approved action batch, and session end.
   **Two-stage refinement (2026-07-16, latency):** session start splits into
-  a foreground *priority sync* (INBOX + Active + Sent per account, ~60–90 s
-  — Sent included so waiting-state derivation sees phone-side replies) and
-  a backgrounded full sync with a completion marker; classification and
+  a foreground *priority sync* and a backgrounded full sync with a
+  completion marker. The priority set is **tier-derived, never
+  activity-derived** (Phase 4.3): tiers `untriaged` + `active` + `sent` +
+  `drafts`, emitted per account as mbsync box lists by `indexer.py
+  priority-folders`, so no folder name is hardcoded in the skill. `sent` is
+  load-bearing (waiting-state derivation must see phone-side replies) and
+  so is `drafts` (a draft finished on the phone must surface). Everything
+  else — `cold`, `ongoing`, `trash`, `junk`, `allmail` — is Stage 2, so
+  archiving activity can never promote cold storage into the fast lane.
+  Classification and
   discussion proceed on priority data, but **acting gates on the marker**
   (mbsync walking folders that act.py is renaming in is a race that must
   never happen). Session end symmetrically backgrounds the final sync in a
@@ -358,21 +389,33 @@ Notes:
   iCloud's ~30-day auto-purge then appears as genuine deletion and the rows
   age out naturally.
 
-### 7.5 `himalaya` (Maildir backend) — read + action layer
+### 7.5 The read + action layer (himalaya, being phased out)
 
-- All mutations go through here: `flag add` (needs-reply), `message move`
-  (archive / trash), `message reply` (which also sets `\Answered`).
-- Reading full bodies for Claude to draft replies also goes through here.
-- **Why keep himalaya at all**, given that flag/move on a local Maildir are
-  literally file renames Python could do? Because **reply composition and
-  sending are the parts not worth reimplementing**: correct quoting, MIME
-  handling, and above all constructing `In-Reply-To`/`References` on outgoing
-  replies so our own messages join their threads. Keeping reads and simple file
-  ops on himalaya too means one consistent interface instead of two half-owners
-  of the Maildir.
-- Version note: v1.2.0 is the current stable line; a v2 is in development on
-  `master` with CLI/schema changes. Pin to whichever is installed; §13 test 4
-  verifies the envelope JSON shape before any code trusts it.
+**Status (2026-08-06): himalaya has been progressively hollowed out and is
+scheduled for removal.** The original design put every read and every
+mutation through it; each of those claims has since been disproven by
+building the thing. What actually owns each operation today:
+
+| Operation | Owner | Why not himalaya |
+|-----------|-------|------------------|
+| Move / archive / tier-label strip | `act.py` | **Its Maildir moves are unusable** — the `,U=` filename token travels to the target folder and mbsync hard-errors, refusing the upload *after* syncing the source-side deletion (verified live, 2.6). `act.py` strips the token and resolves before acting. |
+| Content reads | `threads.py read` | Raw-file-backed off the index: stable, lossless, and `\Seen`-safe by construction since it never renames the file (5.1). himalaya's `message read` marks `\Seen` even for `--header` output. |
+| Batched act + log + index + sync | `batch.py run` | One call replaces a four-call hand-orchestrated cycle (5.4). |
+| Flags, draft-save, folder-create | himalaya *(until Phase 7)* | Trivially replaceable local file ops; Phase 7 replaces each with a direct Maildir operation. |
+| Reply composition + send | himalaya *(until Phase 8)* | The last genuine use. Phase 8 replaces it with stdlib `smtplib` + `email.message`. |
+
+- **The original "why keep himalaya" argument has inverted.** It was: reply
+  composition and sending aren't worth reimplementing (quoting, MIME,
+  `In-Reply-To`/`References`), so keep simple file ops there too for one
+  consistent interface. In practice we construct `References` ourselves
+  anyway (`template reply` omits it — 1.1), and himalaya's Maildir
+  **id-mapper became a net liability**: the unstable id space, the
+  resolve-fresh-by-`from_addr`+date dance, and the `,U=` stranding that
+  forced `act.py` into existence all trace back to it. Removing it from
+  local ops *removes* code — hence Phases 7 and 8.
+- Version note (while it remains): v1.2.0 is the pinned stable line; a v2 is
+  in development on `master` with CLI/schema changes. §13 test 4 verifies the
+  envelope JSON shape before any code trusts it.
 
 ### 7.6 The Claude skill — orchestration
 
@@ -408,9 +451,24 @@ implementation-plan.md Phase 10.
   read-only cache and replaced wholesale on update, and cannot reference files
   outside their own directory — so nothing mutable lives in the plugin. All
   machine state goes in a data directory (default
-  `~/.local/share/email-triage/`, overridable): `config.yaml` (accounts,
-  folder map, Maildir path), `history.db`, `index.db`. The Maildir location is
-  config, not convention.
+  `~/.local/share/email-triage/`, overridable via `$EMAIL_TRIAGE_DATA_DIR`,
+  which every script defaults its path flags from — §12's invocation
+  contract): `config.yaml`, `history.db`, `index.db`, the `mail/` mirror, the
+  `session.lock` directory, the `.fullsync-done` marker, and the sync logs.
+  The Maildir location is config, not convention.
+- **`config.yaml` is schema v2 (Phase 4).** It is not a flat folder map: each
+  account carries a `tiers:` block realizing every tier *concept* as that
+  account's folder *name* — `untriaged`, `active`, `ongoing`, `cold`, plus the
+  system roles `sent`, `drafts`, `trash`, `junk`, `all_mail`. Tiers are
+  **nullable** where an account has no such place: `active: null` collapses
+  live mail into untriaged (degrading cleanly to the MVP two-way
+  disposition), and `cold: null` means cold is a *condition, not a place*
+  (derived as present-only-in-`all_mail`, written via `act.py remove`), with
+  `cold_root` optionally naming a real chapter subtree that coexists with it.
+  The file also registers `server_rules:` per account (§11) and
+  `excluded_from_sync:`. This is the config boundary: names are translated to
+  tiers exactly once, at the indexer's classifier, and every script beneath
+  reasons in tiers only. A third account slots in by config alone.
 - **Nothing personal in the repo.** `history.db` is personal email metadata
   and `config.yaml` names accounts; the repo holds code, DDL, and docs only.
 - **Dependencies are checked, not installed.** First run verifies `himalaya`
@@ -430,15 +488,15 @@ implementation-plan.md Phase 10.
 
 ## 8. Index data model (`index.db`)
 
-A single table. Threads are a query-time derivation from the envelope graph
-(recursive CTE), not a stored entity, so there is no threads table. Per-folder
+One table plus one derived view. Threads are a query-time derivation from the
+envelope graph, not a stored entity, so there is no threads table. Per-folder
 sync state isn't needed either: everything syncs (no active/inactive split —
 see `email-folder-taxonomy.md`), and per-message `indexed_at` plus the
 snapshot pass give incrementality. The Gmail All-Mail duplicates (§7.1) are
 ordinary rows here — identity is `(folder, maildir_key)`, so the same
 Message-ID legitimately appears once per containing folder; tier
 classification (taxonomy doc) prefers the non-All-Mail row and reads
-All-Mail-only membership as the virtual `Archive` tier.
+All-Mail-only membership as the virtual `cold` tier.
 
 ```sql
 CREATE TABLE envelopes (
@@ -458,6 +516,8 @@ CREATE TABLE envelopes (
     is_answered     INTEGER NOT NULL DEFAULT 0, -- denormalized: '\Answered' present
     account          TEXT,
     indexed_at       TEXT,                      -- for incremental re-index (compare to file mtime)
+    folder_tier      TEXT,                      -- folder→tier classification, written at index time
+                                                --   so message_tiers stays plain SQL (added 2026-07-09)
     UNIQUE (folder, maildir_key)
 );
 
@@ -465,6 +525,22 @@ CREATE INDEX idx_message_id  ON envelopes(message_id);
 CREATE INDEX idx_in_reply_to ON envelopes(in_reply_to);
 CREATE INDEX idx_folder_date ON envelopes(folder, date_utc);
 ```
+
+**`folder_tier` and the `message_tiers` view** (added with the 2026-07-09
+taxonomy scope; tier IDs renamed by Phase 4.2). `folder_tier` is the
+classifier's output for a row's folder, resolved from the per-account
+`tiers:` config map (§7.1) — the one and only place a folder *name* is
+translated into a tier concept. Writing it at index time is what keeps the
+rollup plain SQL. `message_tiers` then derives one canonical tier per
+`(account, message_id)`: the highest-precedence non-`allmail` tier among
+that message's rows, or `cold` when its only rows are in All Mail — which
+is exactly how Gmail's virtual cold tier is read, and why a Gmail label
+removal registers as a move into it. Precedence runs
+`untriaged → active → ongoing → cold → sent → drafts → trash → junk →
+unrecognized → container`. The view is a derivation over the table, not
+stored state, so the "index is a disposable cache" property (§9) is intact.
+`container` tiers are derived (proper ancestors of a configured folder), so
+no container name is hardcoded anywhere.
 
 **Why identity works this way.** Message-ID is sender-controlled: duplicate
 deliveries of the same Message-ID (CC + list) and missing Message-IDs both
@@ -532,7 +608,9 @@ CREATE TABLE events (
                                           -- passive-update | ambiguous | actionable
     inactive_days      INTEGER,
     -- the decision (the learning signal)
-    proposed_action    TEXT NOT NULL,     -- flag | reply | archive | trash | skip | activate (2.7: moved to Active — decisive, unlike skip)
+    proposed_action    TEXT NOT NULL,     -- flag | reply | archive | trash | skip
+                                          --   | activate (2.7: moved to Active — decisive, unlike skip)
+                                          --   | draft    (4.5: saved a reply for later — decisive)
     final_action       TEXT NOT NULL,
     from_folder        TEXT,
     to_folder          TEXT,              -- populated for archive/trash/move
@@ -616,13 +694,29 @@ Threads in the `waiting` state are not skip-eligible — there is nothing to
 decide about a thread waiting on someone else, so logging "skip" for them every
 session would be pure noise.
 
-**Unsubscribe tracking is necessarily self-reported.** Rule §4.4 means the
-skill never follows a `List-Unsubscribe` link, so clicking it happens in the
-user's browser — an action the skill structurally cannot observe. `events`
-carries an `unsubscribed` boolean (default 0) set only when the user
-confirms, in-session, that they clicked it; the skill asks rather than
-inferring it from `final_action`. Without this column the only available
-proxy would be "marketing/newsletter thread ended in trash/archive," which
+**Unsubscribe tracking is self-reported except where the mechanism is
+self-verifying.** `events` carries an `unsubscribed` boolean (default 0), never
+inferred from `final_action`. The original rule was absolute: §4.4 meant the
+skill never followed a link, so the click happened in the user's browser —
+structurally unobservable. The Phase 5.3 execution carve-out narrowed that
+gap, so the write rule now tracks how trustworthy the mechanism actually
+used was (**decided 2026-08-06**):
+
+- **RFC 8058 one-click POST → set automatically on a 2xx.** That endpoint
+  exists for no purpose other than unsubscribing, and the POST is the same
+  operation a mail client's native button performs, so the response *is*
+  the confirmation. No user round-trip. This stays inside "facts, not
+  aggregates": we performed the operation and observed its result — a
+  stronger fact than self-report, not a derived one.
+- **Every other path asks, as before** — header GET, body link, `mailto:`.
+  A GET can land on a further confirmation step and still return 200, so a
+  2xx there is not evidence; writing `unsubscribed=1` would assert a fact
+  about a sender who keeps mailing, corrupting the exact signal the column
+  exists to carry. This is the same reasoning that makes automated
+  execution header-only (refinement above).
+
+Without this column the only available proxy would be
+"marketing/newsletter thread ended in trash/archive," which
 conflates deleting one message with ending a subscription — exactly the kind
 of derived-looking-like-a-fact mistake §9's "facts, not aggregates" principle
 exists to avoid. Added post-MVP, during the first live triage session, when
@@ -949,15 +1043,21 @@ Phase 4 follows a classify-first discipline:
    from marketing/newsletters — category by category as each is worked, never
    upfront, never for confidently classified mail. Post-MVP a body read is a
    local Maildir file read.
-6. **Unsubscribe extraction** captures both the `List-Unsubscribe` header
-   and the body's footer link, and surfaces the **body link as primary**
-   (reversed 2026-07-16 from the original header-first preference, on live
-   evidence: header links target RFC 8058 automated one-click POST
-   endpoints and frequently fail for a human browser GET, while
-   body/footer links on ESP click-tracking domains worked reliably).
-   Follows §4.4: surfaced, never followed. Since the click itself is invisible to the skill, it asks
-   whether the user unsubscribed and logs the answer on `events.unsubscribed`
-   (§9) — the only way that signal ever enters the history.
+6. **Unsubscribe extraction** is scripted (`unsub.py links`): the
+   `List-Unsubscribe`/`-Post` headers plus body anchors including
+   image-button alt text, ranked and split into an automated and a manual
+   set. Presentation follows §9's 2026-07-19 refinement — **the automated
+   header option is offered first when one exists** (it is the mechanism
+   designed for programmatic unsubscribing), with the embedded body link
+   additionally printed for hand-clicking; when only a body link exists,
+   unsubscribing is always a manual act the user performs and confirms.
+   (This supersedes the 2026-07-16 "body link as primary" ranking, which
+   was written for a hand-clicking-only world — before `unsub.py exec`
+   existed. The live evidence behind it still holds for *human browser
+   GETs*; it just no longer decides the ranking.) Follows §4.4: surfaced
+   by default, executed only on the user's explicit request. The
+   `events.unsubscribed` write rule is in §9 — automatic on a one-click
+   POST's 2xx, asked on every other path.
    **A confirmed unsubscribe doubles as trash approval** (added 2026-07-10,
    user rule): "I've unsubscribed" authorizes trashing the associated
    message or batch without a separate approval round-trip — scoped strictly
@@ -1109,10 +1209,11 @@ historically auto-saves sent mail to its Sent folder; iCloud may not).
 | Dependency | Purpose | Maturity / risk |
 |------------|---------|-----------------|
 | `mbsync` (isync) | IMAP ↔ Maildir sync | Mature, stable, widely packaged. Foot-gun: write-back must be configured explicitly (§7.1). |
-| `himalaya` | Body reads, reply composition (quoting + threading headers), flag/move, sending | Stable v1.2.0; v2 in dev — pin & verify (§13.4). Kept because composition/sending aren't worth reimplementing (§7.5). |
+| `himalaya` | *(being removed)* Flags, draft-save, folder-create — plus reply composition and sending | Stable v1.2.0; v2 in dev — pin & verify (§13.4). Moves and content reads have already moved to `act.py` / `threads.py read` (§7.5). Phase 7 replaces the remaining local file ops; Phase 8 replaces send with stdlib `smtplib` and drops the dependency entirely. |
 | SQLite | Index + history stores | Built into Python; rock solid; archival-grade file format |
-| Python 3 stdlib (`mailbox`, `email`, `sqlite3`) | Indexer + event logging | No third-party deps |
-| SMTP sender (`himalaya` send or `msmtp`) | Outgoing mail | Standard; behavior verified by §13.1 |
+| Python 3 stdlib (`mailbox`, `email`, `sqlite3`, `smtplib`) | Indexer, thread assembly, act layer, event logging — and outgoing mail from Phase 8 | No third-party deps. This is the deliberate floor: post-Phase-8 the whole system is `mbsync` + `python3`. |
+| SMTP sender | Outgoing mail | Currently `himalaya`; Phase 8 target is stdlib `smtplib` + STARTTLS + app password, reusing mbsync's existing keychain `PassCmd` (no new secret store). `msmtp` is the fallback only if auth misbehaves. Per-account Sent-copy behavior verified by §13.1. |
+| `uv` | *(optional)* Runs `analytics.py` via its PEP 723 inline-dependency block, self-provisioning DuckDB | Only the analytics path needs it; the skill skips analytics gracefully when absent. Nothing in the core depends on it. |
 | Password source (1Password CLI / `pass` / keyring) | Credentials for mbsync + SMTP | Keep secrets out of plaintext config |
 | DuckDB | *(optional)* read-only analytics over both SQLite files | Nothing depends on it; add only when wanted. Attach quirks (aggregate views unreadable, boolean casts) documented in §9 Analytics access. |
 | **Neverest** | *(evaluated, not adopted)* | Beta, single-dev, "not for production." Revisit only at a stable 1.0. |
@@ -1121,30 +1222,49 @@ historically auto-saves sent mail to its Sent folder; iCloud may not).
 
 ## 15. Open questions
 
-1. **Folder audit.** Enumerate top-level folders and dissolve legacy folders
-   into the taxonomy (`Areas/…` / `Archive` — see `email-folder-taxonomy.md`).
-   The earlier plan to park them under an unsynced `Inactive/` is dropped
-   (2026-07-09): everything syncs. Special-use folders (Sent, Trash) stay at
-   top level regardless of recency.
-2. **Indexer performance at real mailbox size.** Expected trivial for the
-   active set; only matters if a large Archive is indexed in full. Measure once
-   with real data before optimizing anything.
+Most have since been answered by building the thing; status is noted rather
+than deleted so the trail stays honest. **Genuinely still open: 4 and 6.**
+
+1. **Folder audit.** *(Answered → plan 2.3, 2026-07-09.)* Executed in full on
+   both accounts: 36 legacy folders dissolved into the taxonomy, ~1,182
+   iCloud messages moved with every count verified, ~20 Gmail labels
+   remapped, 897 noise messages trashed. The earlier plan to park folders
+   under an unsynced `Inactive/` was dropped — everything syncs. Special-use
+   folders (Sent, Trash) stay at top level regardless of recency. One item
+   deferred by choice: message-level re-file of iCloud's 69-message grab-bag
+   `Archive`.
+2. **Indexer performance at real mailbox size.** *(Answered → plan 2.4:
+   non-issue.)* The full mirror — 14,658 messages — indexed in **24.8 s**
+   with zero parse errors, and the second run was fully idempotent. No
+   optimization needed or attempted.
 3. **iCloud custom-keyword behavior** — moot under this design (state is
    `\Flagged` + local DB); only relevant if custom flags are ever reconsidered.
-4. **Rule predicate language.** Start with the simplest thing (sender equality,
-   maybe sender + subject-contains) and let real usage drive any richer
-   predicate syntax.
-5. **Sync latency.** Measure an incremental `mbsync` against the real mailbox
-   once configured; the batch-boundary cadence (§7.1) assumes seconds, not
-   minutes. If it measures slow, fall back to syncing only the folders the
-   batch touched, or to session-boundary syncs.
-6. **Cross-account moves.** himalaya has no native cross-account move; for now
-   the user handles these in a native client. Revisit if the need is real
-   (likely path: export raw message, append to the destination account).
-7. **Multi-machine history.** Decide between a designated primary triage
-   machine and a synced data directory (lockfile-guarded) before installing on
-   a second computer. Per-machine forked histories are the silent default if
-   undecided.
+4. **Rule predicate language.** *(Open.)* Start with the simplest thing
+   (sender equality, maybe sender + subject-contains) and let real usage
+   drive any richer predicate syntax. Phase 3 keeps this parked until
+   sender-equality demonstrably fails; note the vocabulary has since widened
+   on the *action* side rather than the predicate side (interaction patterns,
+   `unsubscribe-exempt` — §9).
+5. **Sync latency.** *(Answered → plan 2.2, and it measured* slow*.)* iCloud
+   incrementals are seconds; **Gmail pays ~60–80 s of per-session overhead
+   regardless of scope** (a single 25-message box took 81 s; the full channel
+   runs minutes). Both contingency fallbacks named here were therefore
+   adopted, not just one: batch boundaries use **box-scoped** invocations
+   rather than full-channel syncs (2.6), and session start was split into the
+   two-stage priority/background scheme with a tier-derived fast set
+   (2.10 / 4.3, §7.1).
+6. **Cross-account moves.** *(Open.)* No native cross-account move exists;
+   the user handles these in a native client. Revisit if the need proves
+   real — the likely path (export the raw message, append it to the
+   destination account) becomes straightforward once Phase 8 has us
+   assembling and appending messages ourselves.
+7. **Multi-machine history.** *(Decided provisionally → plan 1.5:
+   **designated primary machine**,* this *laptop.)* The alternative — a data
+   dir on synced storage, lockfile-guarded — was rejected for now because the
+   mirror's constant Maildir renames racing a sync daemon invite conflicted
+   copies (the same reasoning that keeps the data dir out of iCloud Drive,
+   plan 2.8). Revisit only if a second machine runs real triage rather than
+   an install test.
 
 ---
 
@@ -1154,20 +1274,31 @@ Rollout is phased: an **MVP** (direct-IMAP triage + history logging, no local
 mirror) precedes this full build — see `implementation-plan.md`. The sequence
 below is the full stack.
 
-1. **`mbsync` → both accounts** into a local Maildir, `Patterns *`
-   (everything, including `[Gmail]/All Mail` — §7.1), explicit `Sync All` /
+1. **`mbsync` → both accounts** into a local Maildir, `Patterns INBOX *`
+   (everything, including `[Gmail]/All Mail` — §7.1; `INBOX` must be listed
+   explicitly, since mbsync wildcards don't match it), explicit `Sync Full` /
    `Expunge Both` / `CopyArrivalDate yes`. Verify Sent + Archive + All Mail
-   come down.
+   come down. (Corrected from the pre-build draft's `Patterns *` / `Sync All`
+   during the 2.1 build: there is no `Sync All` keyword in mbsync's grammar,
+   and a bare `Patterns *` silently skips INBOX. `AuthMechs PLAIN` is also
+   required, or cyrus-SASL picks an uncompletable mechanism. Note mbsync
+   never auto-discovers `~/.config/isync/mbsyncrc` — every invocation needs
+   `-c`.)
 2. **Run the verification suite (§13).** Gate everything downstream on it —
    especially the round-trip test, which validates the riskiest assumption in
    the stack (bidirectional correctness).
 3. **Folder audit.** Dissolve legacy folders into the taxonomy (§15.1);
-   create the `Active` / `Areas/…` structure per `email-folder-taxonomy.md`.
-4. **Indexer** with the three-pass reconciliation (§7.4).
-5. **Thread assembly queries.** Recursive CTE / References-root grouping; the
-   two entry modes; rollup + inactive-days.
-6. **`himalaya` action wiring** with resolve-before-act discipline and the
-   session lockfile (§12).
+   create the live and ongoing structure per `email-folder-taxonomy.md`
+   (this user's realization: `Active` / `Areas/…`, but the names are config —
+   §7.1 schema v2).
+4. **Indexer** with the three-pass reconciliation (§7.4), the config-driven
+   tier classifier, and the change-report output contract.
+5. **Thread assembly queries.** Connected components over the
+   References/In-Reply-To graph; the two entry modes; rollup +
+   inactive-days.
+6. **Action wiring** with resolve-before-act discipline and the session
+   lockfile (§12). (Built as `act.py`, not himalaya — its Maildir moves
+   proved unusable; see §7.5.)
 7. **History DB + event logging.** Schema from §9; wire event writes into the
    act path and note-writing into the whole session.
 8. **The skill.** Orchestrate the five phases; approval gates per §4; history
@@ -1231,9 +1362,9 @@ Rationale lives in the body; this is the index of choices.
 - Priority scan ahead of the breakdown: security/time-sensitive threads (new sign-in, new SSH/API key, MFA change, suspicious charge, expiration/deadline language) always surface first, as an explicit rule rather than incidental model judgment (added after the MVP's first session). Scoped to unseen messages only — an already-seen thread has already had its chance to interrupt.
 - Two classification axes: lifecycle state and content category; the category is snapshotted on every event.
 - Targeted body reads only: ambiguity resolution and unsubscribe extraction.
-- Unsubscribe links surfaced (`List-Unsubscribe` header preferred), never followed.
+- Unsubscribe links surfaced by default, executed only on the user's explicit request (Phase 5.3 carve-out to §4.4). Automated execution is header-only — RFC 8058 one-click POST preferred, header GET otherwise; body links are always hand-clicked, since a bare GET on one can report 200 while unsubscribing nothing. Extraction is scripted (`unsub.py links`), `mailto:` unsubscribes route through the normal send gate.
 - Noise escalation ladder (2026-07-09): unsubscribe → server-side delete-filter (skill drafts, user installs, registered in config.yaml `server_rules`) → triage rule. Server rules delete, never file — filing filters bypass the Inbox tier and the learning loop.
-- Unsubscribe outcome is self-reported: `events.unsubscribed` is set only when the user confirms in-session, since the click itself is structurally invisible to the skill (added after the MVP's first session, prompted by wanting an "unsubscribe rate by category" metric the original schema couldn't answer).
+- Unsubscribe outcome is self-reported, with one exception: `events.unsubscribed` is set automatically on a 2xx from an RFC 8058 one-click POST (that endpoint does nothing else, so the response is the confirmation — decided 2026-08-06); every other path still asks in-session, because a header GET or body link can return 200 without unsubscribing. Added after the MVP's first session, prompted by wanting an "unsubscribe rate by category" metric the original schema couldn't answer.
 - Contacts carry `relation` — human framing ('your plumber') over generic categories.
 - Concepts in code, names in config (Phase 4): tier IDs renamed to concept names (untriaged/ongoing/cold); config.yaml schema v2 realizes tiers per account, nullable; containers derived as ancestors of configured folders; priority sync set = tier-derived (untriaged+active+sent+drafts), never activity-derived.
 - Drafts are a third orthogonal axis (Phase 4.5): `\Draft`-tier member ⇒ thread `drafted` status; excluded from state derivation (a draft isn't communication); never silently passed over; save-for-later flow writes real IMAP drafts finishable from any client; `draft` action in the events vocabulary.

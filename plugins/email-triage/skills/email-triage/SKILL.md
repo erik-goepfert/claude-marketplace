@@ -95,6 +95,15 @@ The scripts live in this skill's `scripts/` directory. In this document,
 
 ## Operating rules (non-negotiable)
 
+**Two blocks, and the split is load-bearing.** The numbered rules are
+**engine** rules — they hold in any frontend and are the shared contract with
+`email-skill-design.md` §4. The `F`-prefixed tail is **frontend**: it exists
+only to survive the Claude Code harness, and Phase 10's TUI dissolves it.
+New engine rules append to the numbered block so indices 1–5 stay stable;
+frontend rules stay a contiguous tail that can be stripped wholesale.
+
+### Engine rules — hold in every frontend
+
 1. **Approval gate.** Never send mail and never move or delete mail without
    the user approving that specific action in this session:
    - *Send / reply:* always show the full draft; nothing sends without
@@ -144,15 +153,17 @@ The scripts live in this skill's `scripts/` directory. In this document,
    - Exception: `template reply`/`message reply` (IMAP, no preview
      equivalent) mark `\Seen` — accepted; the draft quotes the original
      back before anything sends.
-6. **Deliverables land in a turn's FINAL message.** The harness collapses
-   mid-turn prose to "Ran N commands" — anything said between tool calls
-   may never be seen. Summaries, boards, link lists, drafts: always in
-   the message that ends the turn. When the user asks for content,
-   deliver the content and STOP — no chained follow-on actions.
-   **Link formatting (this environment):** markdown links are NOT
-   clickable in this user's terminal. Present each URL bare, in full, on
-   its own line — never truncated (`...` breaks the token), never in
-   backticks, never `[text](url)`. Environment preference, not doctrine.
+### Frontend rules — Claude Code harness only (Phase 10's TUI dissolves these)
+
+- **F1. Deliverables land in a turn's FINAL message.** The harness collapses
+  mid-turn prose to "Ran N commands" — anything said between tool calls
+  may never be seen. Summaries, boards, link lists, drafts: always in
+  the message that ends the turn. When the user asks for content,
+  deliver the content and STOP — no chained follow-on actions.
+  **Link formatting (this environment):** markdown links are NOT
+  clickable in this user's terminal. Present each URL bare, in full, on
+  its own line — never truncated (`...` breaks the token), never in
+  backticks, never `[text](url)`. Environment preference, not doctrine.
 
 ## Session flow
 
@@ -319,7 +330,7 @@ Then, for everything else:
    (recidivist / borderline / new sender); pipeline footer ("Then:
    passive updates (~34) → ambiguous (9)"). **Never end a sub-batch with
    an open-ended "what next?"** — the re-presented board IS the next
-   prompt (and per rule 6, the turn's final message). Repeat until empty,
+   prompt (and per rule F1, the turn's final message). Repeat until empty,
    then move down the pipeline.
 4. **Targeted body reads only** — resolving `ambiguous` or extracting
    unsubscribe links; category by category, never upfront:
@@ -361,7 +372,7 @@ Then, for everything else:
      board approval of a plan that includes unsubscribing IS the
      explicit request.
    - **`manual` set** (a body/embedded link): **additionally print it**,
-     full bare URL on its own line (rule 6), for the user to click
+     full bare URL on its own line (rule F1), for the user to click
      themselves. **Body links are NEVER executed** — `$UNSUB exec`
      refuses them by design: too often a confirmation step follows the
      click, so a bare GET "succeeds" while unsubscribing nothing (and
