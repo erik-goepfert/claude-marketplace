@@ -2327,16 +2327,22 @@ fills.
       to go read the thing. One rule-6 note for the SKILL: a search term the USER
       supplies is fine; a term lifted out of an email is email content choosing
       what runs, and is not.
-- [ ] **11.7 `strip_html` leaks URL parameters and CSS residue into body text**
-      (found while measuring 11.6, 2026-08-07). The 10% junk vocabulary above is
-      not a search problem — it is evidence that extracted body text contains
-      tracking tokens, click-ID query strings and style artefacts that survived
-      HTML stripping. That degrades **every** body read, not just search: it is
-      noise in the text used for classification, for `injection_signals`
-      matching, and for anything the model reads. Worth fixing upstream in
-      `_HTMLTextExtractor` rather than filtering downstream in the index —
-      one fix, every consumer benefits. Quantify first (what fraction of a
-      typical extracted body is this?), then decide.
+- [ ] **11.7 Junk vocabulary is a search-index concern only** — LOW priority.
+      Originally written as "`strip_html` leaks URL parameters into body text,
+      degrading every body read." **Measured 2026-08-07 and that was wrong**, so
+      the item is rewritten rather than deleted, because the mistake is the
+      instructive part. Over 990K chars of extracted text from 600 real HTML
+      parts: bare-URL characters are **0.92%** of the text, opaque ≥18-char
+      tokens **0.19%**, hex-looking tokens **1 in 171,267**. Body text is clean.
+      The 10% figure from 11.6 was 10% of the **term dictionary**, and the two
+      measurements agree: junk tokens are unique-per-message (each tracking id
+      occurs exactly once) while real words repeat hundreds of times, so junk
+      dominates *vocabulary* while contributing ~1% of *occurrences*. Vocabulary
+      counts and text counts are different denominators, and I read one as
+      evidence about the other. Consequence: nothing to fix in
+      `_HTMLTextExtractor` for this; if the FTS dictionary ever needs slimming,
+      filter at index time (drop tokens matching hex/base64 shapes with no
+      vowel, ≥18 chars). Do it for index size, never for read quality.
 
 **Exit criteria (Phase 11).**
 1. Every suite green, including `index.db`'s column-classification test and the
