@@ -349,12 +349,102 @@ def column_trust(paths_to_tables: dict):
     return trusted, handles
 
 
+# Trusted scalars cmd_context adds alongside the table rows: our own count and
+# our own prose. Shared with the completeness test so neither can drift.
+CONTEXT_EXTRA_TRUSTED = {"sender_stats_available", "sender_stats_hint"}
+
 CONTEXT_TABLES = {
     "session_notes": "session_notes",
     "active_rules": "rules",
     "sender_stats": "sender_stats",
     "contacts": "contacts",
 }
+
+
+# Read-only query surface (2026-08-07). Enforcement is SQLite's, not ours --
+# four layers, each verified empirically before this was written:
+#   1. file:...?mode=ro      -> "attempt to write a readonly database"
+#   2. PRAGMA query_only=ON  -> same, belt and braces
+#   3. setlimit(ATTACHED, 0) -> closes the real hole: a read-only connection can
+#                               otherwise ATTACH 'file:/anywhere?mode=rwc' and
+#                               write THERE, because the attached DB carries its
+#                               own flags. Verified: without this it SUCCEEDS.
+#   4. progress handler      -> aborts runaway queries ("interrupted")
+# Plus two properties of the driver: Python's sqlite3 has no readfile()/
+# writefile() (those are CLI extensions, so the query language cannot touch the
+# filesystem), and execute() refuses more than one statement.
+#
+# Because all of that is engine-enforced, there is deliberately NO SQL parsing
+# here. A regex blacklist over SQL is exactly the kind of control that leaks
+# (comments, CTEs wrapping DML, PRAGMA, stacked statements) and it would add
+# nothing on top of the layers above.
+QUERY_ROW_CAP = 200
+QUERY_MAX_PROGRESS_CALLBACKS = 50_000
+QUERY_PROGRESS_INTERVAL = 1_000
+
+
+def query_column_trust():
+    """(trusted, handle) bare column NAMES for an arbitrary result set.
+
+    6.5 keys trust per (table, column) because the same name differs by table --
+    `notes` is untrusted in events AND contacts, `account` is trusted only in
+    events. A join has no single table, so that keying cannot apply here.
+    Resolution: classify by bare name with **untrusted winning every tie**, and
+    unknown names untrusted by default-deny. The cost is over-wrapping a column
+    that would have been safe in its own table; the alternative cost is
+    under-wrapping one that is not. Only one of those is a security failure."""
+    untrusted_names = set().union(*UNTRUSTED_COLUMNS.values())
+    handle_names = set().union(*HANDLE_COLUMNS.values())
+    trusted_names = (set().union(*TRUSTED_COLUMNS.values())
+                     - untrusted_names - handle_names)
+    return trusted_names, handle_names
+
+
+def cmd_query(args: argparse.Namespace) -> None:
+    db_path = args.data_dir / "history.db"
+    if not db_path.exists():
+        sys.exit(f"error: {db_path} not found — run init_history_db.py first")
+    if not hasattr(sqlite3.Connection, "setlimit"):
+        sys.exit("error: needs Python 3.11+ (Connection.setlimit) to close the "
+                 "ATTACH escape; refusing to open a query surface without it")
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
+    calls = 0
+
+    def guard():
+        nonlocal calls
+        calls += 1
+        return 1 if calls > QUERY_MAX_PROGRESS_CALLBACKS else 0
+
+    conn.set_progress_handler(guard, QUERY_PROGRESS_INTERVAL)
+    try:
+        cur = conn.execute(args.sql)
+        rows = [dict(r) for r in cur.fetchmany(args.limit + 1)]
+    except (sqlite3.Error, sqlite3.Warning) as e:
+        sys.exit(f"error: {e}")
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.close()
+
+    truncated = len(rows) > args.limit
+    rows = rows[:args.limit]
+    trusted_names, handle_names = query_column_trust()
+    payload = {"rows": rows, "row_count": len(rows)}
+    if truncated:
+        payload["truncated"] = True
+        payload["hint"] = (f"stopped at --limit {args.limit}; narrow the query "
+                           "or raise the limit deliberately")
+    json.dump(
+        untrusted.apply_trust(
+            payload,
+            untrusted.under("rows", trusted_names) | {"row_count", "truncated",
+                                                      "hint"},
+            handle_fields=untrusted.under("rows", handle_names)),
+        sys.stdout, indent=2)
+    print()
 
 
 def cmd_context(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -375,23 +465,44 @@ def cmd_context(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         )
     ] if recent_sessions else []
     rules = [dict(r) for r in conn.execute("SELECT * FROM rules WHERE active = 1")]
-    stats_sql = "SELECT * FROM sender_stats"
-    params: tuple = ()
-    if args.senders:
-        addrs = [a.strip().lower() for a in args.senders.split(",") if a.strip()]
-        stats_sql += " WHERE sender_addr IN (%s)" % ",".join("?" * len(addrs))
-        params = tuple(addrs)
-    stats = [dict(r) for r in conn.execute(stats_sql, params)]
     contacts = [dict(r) for r in conn.execute("SELECT * FROM contacts")]
+
+    # sender_stats is NO LONGER prefetched (2026-08-07). Notes, rules and
+    # contacts are free-form judgement material: you cannot know which sentence
+    # in a note will matter until you meet the thread it is about, so they have
+    # to arrive up front. sender_stats is the opposite -- a keyed lookup whose
+    # keys come from `$THR list --summary`'s top_senders, i.e. AFTER this call.
+    # Dumping all 129 rows was answering questions nobody had asked, and it was
+    # ~35KB of the 40.9KB this command used to cost every single session.
+    # Ask for what you need: `--senders a,b,c`, or `$HIST query` for anything
+    # else. `--all-senders` restores the old dump.
+    stats = None
+    if args.all_senders:
+        stats = [dict(r) for r in conn.execute("SELECT * FROM sender_stats")]
+    elif args.senders:
+        addrs = [a.strip().lower() for a in args.senders.split(",") if a.strip()]
+        stats = [dict(r) for r in conn.execute(
+            "SELECT * FROM sender_stats WHERE sender_addr IN (%s)"
+            % ",".join("?" * len(addrs)), tuple(addrs))]
+
     trusted, handles = column_trust(CONTEXT_TABLES)
     # Escape + manifest, NOT a nonce envelope per value: an envelope around each
     # of ~129 sender_addr strings would bury the structure it is meant to guard.
     # Envelopes are for the body (6.3); scalars get the manifest (6.2).
+    payload = {"session_notes": notes, "active_rules": rules,
+               "contacts": contacts}
+    if stats is None:
+        (n,) = conn.execute("SELECT COUNT(*) FROM sender_stats").fetchone()
+        payload["sender_stats_available"] = n
+        payload["sender_stats_hint"] = (
+            "Not prefetched. Get the senders you actually need from `$THR list "
+            "--summary` (top_senders), then `$HIST context --senders a,b,c` -- "
+            "or `$HIST query` for anything a keyed lookup cannot answer.")
+    else:
+        payload["sender_stats"] = stats
     json.dump(
-        untrusted.apply_trust(
-            {"session_notes": notes, "active_rules": rules,
-             "sender_stats": stats, "contacts": contacts},
-            trusted, handle_fields=handles),
+        untrusted.apply_trust(payload, trusted | CONTEXT_EXTRA_TRUSTED,
+                              handle_fields=handles),
         sys.stdout,
         indent=2,
     )
@@ -472,7 +583,21 @@ def main() -> None:
 
     cx = sub.add_parser("context", help="print session-start context as JSON")
     cx.add_argument("--sessions", type=int, default=5, help="how many recent sessions of notes")
-    cx.add_argument("--senders", help="comma-separated addresses to filter sender_stats")
+    cx.add_argument("--senders", help="comma-separated addresses whose sender_stats "
+                                      "to include (not prefetched by default)")
+    cx.add_argument("--all-senders", action="store_true", dest="all_senders",
+                    help="restore the old behaviour: dump every sender_stats row. "
+                         "~35KB on a real history; prefer --senders or `query`.")
+
+    q = sub.add_parser(
+        "query",
+        help="read-only SQL over history.db -- for decisions a keyed lookup "
+             "cannot answer (sample queries: reference.md §History queries)")
+    q.add_argument("--sql", required=True, help="a single SELECT/WITH statement")
+    q.add_argument("--limit", type=int, default=QUERY_ROW_CAP,
+                   help=f"max rows returned (default {QUERY_ROW_CAP}); "
+                        "truncation is reported, never silent")
+    q.set_defaults(func=cmd_query, needs_conn=False)
     cx.set_defaults(func=cmd_context)
 
     bk = sub.add_parser(
@@ -491,6 +616,11 @@ def main() -> None:
     bk.set_defaults(func=cmd_backup)
 
     args = parser.parse_args()
+    # `query` opens its own hardened read-only connection (see cmd_query) rather
+    # than borrowing the read-write one every other subcommand uses.
+    if getattr(args, "needs_conn", True) is False:
+        args.func(args)
+        return
     conn = connect(args.data_dir)
     try:
         args.func(conn, args)

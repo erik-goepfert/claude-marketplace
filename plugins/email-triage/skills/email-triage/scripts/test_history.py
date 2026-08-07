@@ -71,7 +71,7 @@ class HistoryCliTests(unittest.TestCase):
             if notes:
                 args += ["--notes", notes]
             self.hist(*args)
-        (s,) = json.loads(self.hist("context"))["sender_stats"]
+        (s,) = json.loads(self.hist("context", "--all-senders"))["sender_stats"]
         self.assertEqual(s["sender_addr"], "news@example.com")
         self.assertEqual(s["declined_unsubs"], 2)
 
@@ -81,7 +81,9 @@ class HistoryCliTests(unittest.TestCase):
                          "--final", final, "--decided-by", decided)
 
     def _stats(self, sender):
-        rows = json.loads(self.hist("context"))["sender_stats"]
+        # --all-senders since 2026-08-07: context no longer prefetches the dump,
+        # and these tests are asserting the sender_stats view's own arithmetic.
+        rows = json.loads(self.hist("context", "--all-senders"))["sender_stats"]
         return next(r for r in rows if r["sender_addr"] == sender)
 
     def test_retired_verbs_are_rejected(self):
@@ -183,6 +185,150 @@ class HistoryCliTests(unittest.TestCase):
         self.assertEqual(c["notes"], "prefers calls")
 
 
+class QuerySurfaceTests(unittest.TestCase):
+    """`$HIST query`: read-only SQL. Enforcement is SQLite's -- there is NO SQL
+    parsing, deliberately, so these tests ARE the security boundary."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="email-triage-query-test-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)]))
+        self.run_ok(str(SCRIPTS / "init_history_db.py"), "--data-dir", str(self.tmp))
+        self.hist("log-note", "--session", "2026-08-07T00:00:00Z", "a note")
+
+    run_ok = HistoryCliTests.run_ok
+    hist = HistoryCliTests.hist
+
+    def q(self, sql, *extra):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "history.py"), "--data-dir",
+             str(self.tmp), "query", "--sql", sql, *extra],
+            capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def refused(self, sql, expect):
+        code, out, err = self.q(sql)
+        self.assertNotEqual(code, 0, f"NOT refused: {sql}")
+        self.assertIn(expect, (err + out).lower())
+
+    def test_reads_work(self):
+        code, out, _ = self.q("SELECT COUNT(*) AS n FROM session_notes")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["rows"][0]["n"], 1)
+        self.assertEqual(payload["row_count"], 1)
+
+    def test_writes_are_refused(self):
+        for sql in ("INSERT INTO session_notes (session_started_at, written_at, "
+                    "note) VALUES ('a','b','c')",
+                    "UPDATE session_notes SET note = 'x'",
+                    "DELETE FROM session_notes",
+                    "DROP TABLE events",
+                    "CREATE TABLE t(a)"):
+            with self.subTest(sql=sql[:24]):
+                self.refused(sql, "readonly")
+
+    def test_attach_escape_is_closed(self):
+        """The hole `mode=ro` does NOT close on its own: an attached database
+        carries its OWN flags, so a read-only connection can attach
+        'file:...?mode=rwc' and write THERE. Verified to succeed without
+        setlimit(SQLITE_LIMIT_ATTACHED, 0), which is why that layer exists."""
+        target = self.tmp / "evil.db"
+        self.refused(f"ATTACH DATABASE 'file:{target}?mode=rwc' AS e",
+                     "too many attached")
+        self.assertFalse(target.exists(), "ATTACH created a writable database")
+
+    def test_stacked_statements_are_refused(self):
+        # A second statement is where a blacklist-style parser leaks; the driver
+        # refuses it outright.
+        self.refused("SELECT 1; DROP TABLE events", "one statement")
+
+    def test_runaway_query_is_interrupted(self):
+        self.refused("WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x+1 "
+                     "FROM r) SELECT count(*) FROM r", "interrupted")
+
+    def test_the_database_is_actually_unchanged(self):
+        for sql in ("DELETE FROM session_notes", "DROP TABLE session_notes"):
+            self.q(sql)
+        code, out, _ = self.q("SELECT COUNT(*) AS n FROM session_notes")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["rows"][0]["n"], 1)
+
+    def test_row_cap_truncates_visibly_never_silently(self):
+        for i in range(8):
+            self.hist("log-note", "--session", "2026-08-07T00:00:00Z", f"n{i}")
+        code, out, _ = self.q("SELECT note FROM session_notes", "--limit", "3")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(len(payload["rows"]), 3)
+        self.assertTrue(payload["truncated"])
+        self.assertIn("--limit 3", payload["hint"])
+
+    def test_arbitrary_columns_are_classified_untrusted_wins_ties(self):
+        """Per-table keying cannot apply to a join, so classification is by bare
+        name with untrusted winning any tie. `account` is trusted only in events;
+        `notes` is untrusted in events AND contacts, so `notes` is untrusted
+        everywhere here."""
+        self.hist("add-contact", "pete@x.example", "--notes", "friend <b>x</b>")
+        code, out, _ = self.q("SELECT addr, notes, is_vip FROM contacts")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        declared = set(payload["_trust"]["untrusted_fields"])
+        self.assertIn("rows.notes", declared)
+        self.assertIn("rows.addr", declared)          # handle: declared...
+        self.assertNotIn("rows.is_vip", declared)     # an int, never listed
+        row = payload["rows"][0]
+        self.assertIn("&lt;b&gt;", row["notes"])      # ...prose escaped
+        self.assertEqual(row["addr"], "pete@x.example")  # ...handle unaltered
+
+    def test_unknown_column_names_default_to_untrusted(self):
+        code, out, _ = self.q("SELECT 'x' AS surprise_column FROM session_notes "
+                              "LIMIT 1")
+        self.assertEqual(code, 0)
+        self.assertIn("rows.surprise_column",
+                      json.loads(out)["_trust"]["untrusted_fields"])
+
+
+class ContextPrefetchTests(unittest.TestCase):
+    """sender_stats stopped being prefetched 2026-08-07: it is a KEYED lookup
+    whose keys come from `$THR list --summary`, i.e. after this call. Notes,
+    rules and contacts stay because they are free-form judgement material you
+    cannot know to ask for."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="email-triage-ctx-test-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)]))
+        self.run_ok(str(SCRIPTS / "init_history_db.py"), "--data-dir", str(self.tmp))
+        for addr in ("a@x.example", "b@x.example"):
+            self.hist("log-event", "--session", "2026-08-07T00:00:00Z",
+                      "--sender", addr, "--proposed", "trash", "--final", "trash",
+                      "--decided-by", "approved")
+
+    run_ok = HistoryCliTests.run_ok
+    hist = HistoryCliTests.hist
+
+    def ctx(self, *extra):
+        return json.loads(self.hist("context", *extra))
+
+    def test_sender_stats_absent_by_default_but_counted(self):
+        payload = self.ctx()
+        self.assertNotIn("sender_stats", payload)
+        self.assertEqual(payload["sender_stats_available"], 2)
+        self.assertIn("--summary", payload["sender_stats_hint"])
+        # The free-form blocks are still prefetched.
+        for key in ("session_notes", "active_rules", "contacts"):
+            self.assertIn(key, payload)
+
+    def test_senders_flag_fetches_exactly_those(self):
+        payload = self.ctx("--senders", "a@x.example")
+        self.assertEqual([r["sender_addr"] for r in payload["sender_stats"]],
+                         ["a@x.example"])
+        self.assertNotIn("sender_stats_available", payload)
+
+    def test_all_senders_restores_the_dump(self):
+        payload = self.ctx("--all-senders")
+        self.assertEqual(len(payload["sender_stats"]), 2)
+
+
 class TrustedColumnsTests(unittest.TestCase):
     """Phase 6.5: trust as a column property, per table."""
 
@@ -267,6 +413,7 @@ class ContextTrustTests(TrustedColumnsTests):
         self.seed()
         payload, trust = self.run_context()
         trusted, _handles = history.column_trust(history.CONTEXT_TABLES)
+        trusted = trusted | history.CONTEXT_EXTRA_TRUSTED
         undeclared = (untrusted.string_paths(payload) - trusted
                       - set(trust["untrusted_fields"]))
         self.assertEqual(undeclared, set())

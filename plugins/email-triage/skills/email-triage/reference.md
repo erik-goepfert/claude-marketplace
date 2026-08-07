@@ -56,6 +56,68 @@ skill's config: `icloud`/`gmail` are IMAP (reply/send only),
 `icloud-local`/`gmail-local` are Maildir pointed at
 `<maildir_path>/<account>` from `config.yaml` (all reads and flag ops).
 
+## History queries (`$HIST query`)
+
+Read-only SQL over `history.db`, for decisions a keyed lookup cannot answer.
+**`sender_stats` is no longer prefetched by `context`** (2026-08-07) — get the
+senders that matter from `$THR list --summary`'s `top_senders`, then
+`$HIST context --senders a,b,c`, and come here for everything else.
+
+**The read-only guarantee is SQLite's, not a parser's.** Four layers, each
+verified empirically: `file:…?mode=ro`; `PRAGMA query_only=ON`;
+`setlimit(SQLITE_LIMIT_ATTACHED, 0)`; and a progress handler that interrupts
+runaway queries. That third one closes a real hole — a read-only connection can
+otherwise `ATTACH 'file:/anywhere?mode=rwc'` and write *there*, because the
+attached DB carries its own flags. Two properties come from the driver: Python's
+`sqlite3` has no `readfile()`/`writefile()` (those are CLI extensions, so the
+query language cannot reach the filesystem), and `execute()` refuses stacked
+statements. **There is deliberately no SQL parsing** — a blacklist over SQL leaks
+through comments, CTEs and stacked statements, and would add nothing here.
+
+Rows cap at `--limit` (default 200) and truncation is always reported. Column
+trust is by **bare name with untrusted winning ties**, since a join has no single
+table: `notes` is untrusted in `events` and `contacts`, so `notes` is untrusted
+here; unknown names are untrusted by default-deny.
+
+```sh
+# Has this sender ever been replied to, or only cleared?
+$HIST query --sql "SELECT final_action, COUNT(*) AS n FROM events
+  WHERE sender_addr = 'someone@example.com' GROUP BY final_action"
+
+# Sender stats for one batch (cheaper than --senders when you want columns)
+$HIST query --sql "SELECT sender_addr, events_total, decisions, holds,
+  trash_rate, reply_rate, declined_unsubs FROM sender_stats
+  WHERE sender_addr IN ('a@x.com','b@x.com')"
+
+# Category mix over the last 30 days -- is the taxonomy still describing reality?
+$HIST query --sql "SELECT category, COUNT(*) AS n,
+  SUM(final_action='trash') AS trashed FROM events
+  WHERE occurred_at >= date('now','-30 days') GROUP BY category ORDER BY n DESC"
+
+# Rule-proposal fuel: chronically trashed, no rule covering them yet
+$HIST query --sql "SELECT sender_addr, COUNT(*) AS n FROM events
+  WHERE final_action='trash' GROUP BY sender_addr HAVING n >= 4 ORDER BY n DESC"
+
+# Reply debt: threads held while needs-reply, oldest concern first
+$HIST query --sql "SELECT sender_addr, subject, occurred_at FROM events
+  WHERE final_action='hold' AND thread_state='needs-reply'
+  ORDER BY occurred_at DESC"
+
+# Which rules are actually firing?
+$HIST query --sql "SELECT r.id, r.action, COUNT(e.id) AS fired FROM rules r
+  LEFT JOIN events e ON e.rule_id = r.id WHERE r.active=1
+  GROUP BY r.id ORDER BY fired DESC"
+
+# Find a past decision by token -- notes are where conventions live
+$HIST query --sql "SELECT session_started_at, note FROM session_notes
+  WHERE note LIKE '%declined-unsubscribe%' ORDER BY written_at DESC"
+```
+
+Analytics (`$ANA`) still owns the heavier derived reports (`domains`,
+`candidates`, `trends`, `sessions`) — it re-expresses these against DuckDB with
+the attach quirks handled. Use `query` for one-off questions, `$ANA` for the
+standing ones.
+
 ## Account and tool quirks (all live-verified)
 
 - **`mbsync` requires `-c ~/.config/isync/mbsyncrc` on every invocation**
@@ -206,6 +268,13 @@ index → re-index/sync; ambiguous → act manually).
 `account`, `folder`, `message_id`, `subject`, `from_addr`, `date_utc`;
 `moved` entries have `from_folder`/`to_folder` instead of `folder`;
 `flag_changed` entries add `old_flags`/`new_flags` (5.2).
+
+**`$HIST context`:** `session_notes` (last `--sessions N`, default 5),
+`active_rules`, `contacts` — the free-form judgement material you cannot know to
+ask for. **No `sender_stats`**: instead `sender_stats_available` (a count) and
+`sender_stats_hint`. Add `--senders a,b,c` for specific rows, `--all-senders` to
+restore the old dump (~35KB on a real history — it was most of the 40.9KB this
+call used to cost every session).
 
 **`$IDX index --suggest-events --session <ts>` (6.9)** adds a `suggestions`
 object: `counts` (exact, per bucket, incl. `expunged_from_trash`),

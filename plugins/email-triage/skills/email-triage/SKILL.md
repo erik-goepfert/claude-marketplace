@@ -226,9 +226,17 @@ frontend rules stay a contiguous tail that can be stripped wholesale.
    verbatim) plus each account's priority-folder fast set. If it exits 1
    with `lock: held`, a session may be live elsewhere or was abandoned —
    ask the user before `$SES unlock`, then `start` again.
-2. **Read history context:** `$HIST context [--senders ...]` — recent
-   session notes, active rules, sender stats (incl. `declined_unsubs`),
-   contacts.
+2. **Read history context:** `$HIST context` — recent session notes, active
+   rules, contacts. That is the **free-form** material: you cannot know which
+   sentence in a note will matter until you meet the thread it is about, so it
+   arrives up front.
+   **`sender_stats` is NOT prefetched** — it is a keyed lookup and you do not
+   have the keys yet. Get them from step 5's `--summary` (`top_senders`), then
+   `$HIST context --senders a,b,c` per batch. For anything a keyed lookup
+   cannot answer — "has this sender ever been replied to?", "what is the
+   category mix this month?" — use `$HIST query --sql "SELECT ..."`
+   (read-only, enforced by SQLite; sample queries in reference §History
+   queries).
 3. **Two-stage sync.** Stage 1 — priority sync, foreground (the live
    working set + Sent + Drafts; Sent is required or `waiting` derivation
    lies): pass each account's `mbsync_fast` value from `start`'s output
