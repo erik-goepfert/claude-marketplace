@@ -157,6 +157,15 @@ pass through byte-identical, and are untrusted all the same. `$THR list`
 returns `{"_trust": …, "threads": [...]}` — an object, not the bare array it
 was before 6.2.
 
+**`$THR list --scan`:** `{"scan": [...]}`, one entry per **line** (not
+`indent=2` — that was spending ~60% of the payload padding six short fields).
+Each entry: `account`, `message_id` (handle), `from_addr`, `subject`,
+`inactive_days`, `seen` (bool), `state`, `folder_tier`, plus `drafted` and
+`injection_signals` only when set. Deliberately omits everything the priority
+scan does not read. Combine with `--unseen` for the security pass: 86 unseen
+threads = 23KB, against ~60KB via `--compact`. Added 2026-08-07 — before it, the
+scan's unseen scope was unlistable, so the scan could not actually be run.
+
 **`$THR list --summary`:** counts only, no thread objects — `totals`
 (`threads`, `unseen`, `drafted`, `reconciliation_candidates`,
 `injection_signals`), `by_account`, `by_state`, `by_tier`, `top_senders[]`

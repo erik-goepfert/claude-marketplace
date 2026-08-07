@@ -296,6 +296,11 @@ frontend rules stay a contiguous tail that can be stripped wholesale.
    15 heaviest senders. This is the breakdown of step 6, and it is ~2KB
    where `--compact` over a busy mailbox is 100KB+ — verified: 167 threads
    summarized in 1.7KB after `--compact` overflowed at 105KB.
+   **Then `$THR list --scan --unseen` for the security pass**, and
+   `--scan` unscoped for the time-sensitive pass (see Triage's three passes).
+   `--scan` is one line per thread — subject, sender, age, `seen`, state,
+   message_id — and nothing else; it is the only listing that fits a whole
+   mailbox while still showing what the scan judges on.
    **Then work in slices, not one big dump.** `top_senders` is the plan:
    each heavy sender becomes a category batch via `$THR list --compact
    --sender <addr>`, which stays small. `--compact` unscoped is fine on a
@@ -369,16 +374,50 @@ Classify from thread data + history (`sender_stats`, `contacts`, `rules`)
   never count as "resolved" here** — a new arrival whose only siblings
   are trashed noise gets a fresh decision, not gravity toward Trash.
 
-**Priority scan — before the breakdown, every session.** Scope: **unseen
-only** — the thread's latest non-trash/junk member lacks `"Seen"` (the
-compact list's `latest.flags`, no extra read; works because rule 5 keeps
-`\Seen` honest). Flag:
-security notifications (new sign-in/device/key/password/MFA changes,
-suspicious activity); financial/time-boxed items (suspicious charge,
-payment method change, expiration); urgent/deadline-bound framing.
-Present these **individually, immediately**, before the breakdown. The
-proposal is usually "confirm it was you" (hold) or "here's the link to
-review" (surfaced; executed never — rule 4).
+**Priority scan — before the breakdown, every session. THREE ordered passes**
+(2026-08-07). Run them from `$THR list --scan` (one line per thread: subject,
+sender, age, `seen`, state, message_id — `--compact` carries structure the scan
+never reads and overflows past ~100 threads). Present each pass's hits
+**individually, immediately**, in this order, before the breakdown.
+
+**What `Seen` means, because the passes divide on it.** `Seen` = the user has
+had this in front of them — actually glanced at it, or been shown a triage
+summary of it. Rule 5 is what makes that true: our own reads never set the flag,
+so it is never merely "the system looked." That makes it a sound filter for
+**novelty** and a useless one for **deadlines** — reading a bill does not pay it.
+
+**Pass 1 — security. Scope: `--unseen`.** New sign-in / device / key / password
+/ MFA change, suspicious activity, suspicious charge. The proposal is usually
+"confirm it was you" (`hold`), or "here's the link to review" (surfaced;
+executed never — rule 4). Unseen-scoped on purpose: an alert the user has read
+has had its hearing, and re-interrupting on it every session is how an alarm
+gets trained away.
+
+**Pass 2 — VIPs.** Any thread whose members include a `contacts` entry with
+`is_vip = 1` (match on `addr`, never `display_name` — see spoofing below).
+Surface regardless of `seen`, state, or age. A VIP thread that is also
+`drafted` leads with the draft ("finish and send this?").
+
+**Pass 3 — time-sensitive. Scope: ALL live threads, `seen` DELIBERATELY
+IGNORED.** This is the pass that `Seen` must not filter, because the thing that
+makes these urgent is elapsed time, and reading them does not discharge them.
+**"Time-sensitive" is a judgement call, not a keyword list** — that is the
+point of putting it here rather than in a script. Shapes that qualify: a payment
+or invoice due; a subscription expiring, renewing, or already lapsed; a price
+change with an opt-out window; an appointment or RSVP; a document awaiting
+signature; anything naming a date that has nearly arrived or has passed.
+Age is aggravating, not qualifying: an 8-day-old payment reminder is worse than
+a 1-day-old one, but a 60-day-old marketing blast is still marketing.
+- Say what makes it time-sensitive in the same breath as surfacing it, so the
+  user can overrule the judgement rather than just the item.
+- If a pass-3 item is also a pass-1 or pass-2 hit, surface it once, in the
+  earlier pass.
+- Erring toward surfacing is correct here. A false positive costs one line; a
+  missed deadline is the failure this pass exists to prevent. *(It exists
+  because a `5621 W 141st Lane` payment reminder sat 8 days, `Seen`, and was
+  structurally invisible to an unseen-only scan.)*
+
+Applies to all three passes:
 - **Sender history deflates, it doesn't gate:** if history shows this
   sender's urgency is routine noise, fold it into its category with a
   deflating aside instead of interrupting.
@@ -488,10 +527,14 @@ Then, for everything else:
 `$THR` builds threads from the index's Message-ID/In-Reply-To/References
 graph plus a guarded subject fallback, and derives state directly.
 
-- `$THR list [--compact] [--account a] [--tier t ...] [--sender substr]
-  [--subject-contains substr]` — `--compact` for session assembly and
-  any broad listing; use the filters to answer "which thread is X"
-  directly; never dump-and-refilter with ad-hoc python.
+- `$THR list [--summary|--scan|--compact] [--unseen] [--account a]
+  [--tier t ...] [--sender substr] [--subject-contains substr]` — three output
+  shapes, smallest first: `--summary` (counts only, the session breakdown),
+  `--scan` (one line per thread: the priority scan's judgement fields +
+  message_id), `--compact` (full per-thread object; scope it, it overflows past
+  ~100 threads). `--unseen` restricts to threads whose latest non-trash/junk
+  member lacks `\Seen` — the security pass's scope. Use the filters to answer
+  "which thread is X" directly; never dump-and-refilter with ad-hoc python.
 - `$THR show --account <acct> --message-id <id>` — the full
   thread containing a message, any tier. Needed for reply `References`,
   reconciliation decisions, and member-level inspection; **standard
