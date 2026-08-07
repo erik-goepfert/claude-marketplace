@@ -132,6 +132,44 @@ class ActTests(unittest.TestCase):
         self.assertTrue(os.listdir(
             os.path.join(self.root, "Areas/Receipts", "cur")))
 
+    # -- Mark read on the way out of the active zone (user rule 2026-08-07) --
+
+    def test_with_seen_is_order_preserving_and_idempotent(self):
+        self.assertEqual(act.with_seen("k:2,"), "k:2,S")
+        self.assertEqual(act.with_seen("k:2,F"), "k:2,FS")
+        self.assertEqual(act.with_seen("k:2,S"), "k:2,S")     # idempotent
+        self.assertEqual(act.with_seen("k:2,FS"), "k:2,FS")
+        self.assertEqual(act.with_seen("k:2,DF"), "k:2,DFS")  # ASCII order
+        self.assertEqual(act.with_seen("k"), "k:2,S")         # no suffix yet
+
+    def test_move_marks_seen_only_when_asked(self):
+        for key, flag, want in (("s1", True, "S"), ("s2", False, "")):
+            with self.subTest(mark_seen=flag):
+                put_file(self.root, "INBOX", f"{key}:2,")
+                make_folder(self.root, "Trash")
+                self.index_row("INBOX", key, f"<{key}@x>", f"{key}:2,")
+                argv = ["move", "--db", self.db, "--maildir", self.root,
+                        "--account", "acct", "--from", "INBOX", "--to", "Trash"]
+                if flag:
+                    argv.append("--mark-seen")
+                code, out = self.run_cli(*argv, f"<{key}@x>")
+                self.assertEqual(code, 0)
+                self.assertEqual(out["moved"][0]["file"], f"{key}:2,{want}")
+                self.assertTrue(os.path.exists(
+                    os.path.join(self.root, "Trash", "cur", f"{key}:2,{want}")))
+
+    def test_marking_seen_preserves_other_flags_and_strips_uid(self):
+        # \Flagged must survive, and the ,U= strip still has to happen -- that
+        # strip is the whole reason this layer exists.
+        put_file(self.root, "INBOX", "s3,U=42:2,F")
+        make_folder(self.root, "Archive")
+        self.index_row("INBOX", "s3,U=42", "<s3@x>", "s3,U=42:2,F")
+        code, out = self.run_cli(
+            "move", "--db", self.db, "--maildir", self.root, "--account", "acct",
+            "--from", "INBOX", "--to", "Archive", "--mark-seen", "<s3@x>")
+        self.assertEqual(code, 0)
+        self.assertEqual(out["moved"][0]["file"], "s3:2,FS")
+
     # -- Phase 6.2: escape + `_trust` manifest --
 
     def test_manifest_is_complete(self):

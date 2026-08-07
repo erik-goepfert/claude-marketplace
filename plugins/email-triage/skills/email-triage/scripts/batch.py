@@ -56,6 +56,13 @@ import indexer  # noqa: E402
 import threads  # noqa: E402
 import untrusted  # noqa: E402
 
+# Actions that take a thread OUT of the active zone (untriaged/active). Those
+# get \Seen set as part of the move (user rule 2026-08-07): unread means
+# "awaiting your attention" inside the live tiers and is noise outside them.
+# `activate` is deliberately absent -- it stays in the zone, so its unread state
+# is still meaningful.
+LEAVES_ACTIVE_ZONE = {"trash", "archive"}
+
 # Destination tier -> logged action. Anything absent is not a triage
 # destination and fails pre-flight (untriaged, sent, drafts, all_mail,
 # container, unrecognized).
@@ -239,9 +246,10 @@ def act_all(conn, maildir_root: Path, prepared: list):
                 result = act.remove_one(conn, acct_root, p["account"],
                                         p["from_folder"], p["message_id"])
             else:
-                result = act.move_one(conn, acct_root, p["account"],
-                                      p["from_folder"], p["to_folder"],
-                                      p["message_id"])
+                result = act.move_one(
+                    conn, acct_root, p["account"], p["from_folder"],
+                    p["to_folder"], p["message_id"],
+                    mark_seen=p["event"]["final_action"] in LEAVES_ACTIVE_ZONE)
             result["account"] = p["account"]
             done.append((p, result))
         except act.FatalError as e:

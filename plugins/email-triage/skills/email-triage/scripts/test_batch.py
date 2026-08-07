@@ -324,6 +324,59 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(ev["final_action"], "activate")
 
 
+class ActiveZoneSeenTests(BatchTests):
+    """User rule 2026-08-07: leaving the active zone marks the mail read.
+    `\Seen` means "awaiting your attention" inside the live tiers and is noise
+    outside them -- an unread badge on something already decided."""
+
+    def unread_inbox(self, key, mid):
+        write_message(self.acct / "INBOX", key, "",   # no flags = unread
+                      msg_headers(mid, "bulk@x.example", "Some subject"))
+        self.reindex()
+        return mid
+
+    def moved_filename(self, folder, key):
+        hits = list((self.acct / folder / "cur").glob(f"{key}*"))
+        self.assertEqual(len(hits), 1, f"expected one file for {key} in {folder}")
+        return hits[0].name
+
+    def test_trash_marks_read(self):
+        mid = self.unread_inbox("z1", "z1@x")
+        code, out, _err = self.run_batch(
+            [{"account": "acct", "message_id": mid, "from_folder": "INBOX",
+              "disposition": "trash"}])
+        self.assertEqual(code, 0)
+        self.assertEqual(out["acted"]["moved"][0]["message_id"], mid)
+        self.assertIn("S", self.moved_filename("Trash", "z1").split(":2,")[1])
+
+    def test_archive_marks_read(self):
+        mid = self.unread_inbox("z2", "z2@x")
+        code, out, _err = self.run_batch(
+            [{"account": "acct", "message_id": mid, "from_folder": "INBOX",
+              "to_folder": "Archive"}])
+        self.assertEqual(code, 0)
+        self.assertEqual(out["acted"]["moved"][0]["message_id"], mid)
+        self.assertIn("S", self.moved_filename("Archive", "z2").split(":2,")[1])
+
+    def test_activate_does_NOT_mark_read(self):
+        """The distinction the rule turns on: `activate` keeps the thread in the
+        live tier, so its unread state is still a real signal about work
+        outstanding. Marking it read would erase that."""
+        mid = self.unread_inbox("z3", "z3@x")
+        code, out, _err = self.run_batch(
+            [{"account": "acct", "message_id": mid, "from_folder": "INBOX",
+              "disposition": "activate"}])
+        self.assertEqual(code, 0)
+        self.assertEqual(out["acted"]["moved"][0]["message_id"], mid)
+        self.assertNotIn("S", self.moved_filename("Active", "z3").split(":2,")[1])
+
+    def test_leaves_active_zone_set_matches_the_action_vocabulary(self):
+        # Terminal-but-in-zone is a contradiction; guard the set explicitly so a
+        # new action cannot silently default to "does not mark read".
+        self.assertEqual(batch.LEAVES_ACTIVE_ZONE, {"trash", "archive"})
+        self.assertNotIn("activate", batch.LEAVES_ACTIVE_ZONE)
+
+
 class BatchTrustTests(BatchTests):
     """Phase 6.2 on batch.py, whose allowlist is COMPOSED from indexer's."""
 

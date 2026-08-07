@@ -138,9 +138,15 @@ frontend rules stay a contiguous tail that can be stripped wholesale.
      `--preview` (a plain local read stamps `S`; reference §Quirks).
    - Mark read explicitly — `himalaya flag add -a <acct>-local -f
      <folder> <id> seen` — at the moment you present content or a summary.
-   - Exception, en route to trash: mail the user just approved for
-     trashing needs no seen-marking even if summarized. Marking read is
-     for mail that STAYS.
+   - **Leaving the active zone marks it read** (user rule, 2026-08-07).
+     `\Seen` means "awaiting your attention" only INSIDE the live tiers
+     (`untriaged`/`active`); on mail that has been resolved it is noise — an
+     unread badge for something already decided. `$BATCH` does this for you:
+     `trash` and `archive` set `\Seen` as part of the move, `activate` does
+     NOT (that thread stays in the zone, so its unread state is still a real
+     signal). `$ACT move --mark-seen` for one-offs.
+     *(This replaces the older "en route to trash needs no seen-marking"
+     exception, which left unread counts behind in Trash and Archive.)*
    - Exception: `template reply`/`message reply` (IMAP, no preview
      equivalent) mark `\Seen` — accepted; the draft quotes the original
      back before anything sends.

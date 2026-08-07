@@ -219,6 +219,17 @@ pass through byte-identical, and are untrusted all the same. `$THR list`
 returns `{"_trust": …, "threads": [...]}` — an object, not the bare array it
 was before 6.2.
 
+**Marking read on the way out (user rule 2026-08-07).** `$BATCH run` sets
+`\Seen` on every move whose derived action is in `batch.LEAVES_ACTIVE_ZONE`
+(`trash`, `archive`) — done inside `act.move_one`'s rename, so it costs no extra
+himalaya call, no id resolution and no second sync. `activate` is deliberately
+excluded: that thread stays in the live tiers where unread still means something.
+`$ACT move --mark-seen` is the one-off form; `act.with_seen()` is idempotent and
+preserves other flags in ASCII order (`k:2,F` → `k:2,FS`).
+**Known gap:** `$ACT remove` (the Gmail label-strip path) cannot do this — it
+deletes the file rather than renaming one, and the surviving All-Mail copy has
+its own flag state.
+
 **`$THR list --scan`:** `{"scan": [...]}`, one entry per **line** (not
 `indent=2` — that was spending ~60% of the payload padding six short fields).
 Each entry: `account`, `message_id` (handle), `from_addr`, `subject`,

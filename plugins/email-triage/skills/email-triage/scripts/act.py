@@ -69,8 +69,20 @@ def resolve_current_file(maildir_root: str, folder: str, maildir_key: str) -> st
     )
 
 
+# Maildir flag letters live in the filename suffix after ":2," and are kept in
+# ASCII order by convention. 'S' is \Seen.
+def with_seen(filename: str) -> str:
+    """Add the Seen flag to a Maildir filename, order preserved, idempotent."""
+    if ":2," not in filename:
+        return filename + ":2,S"
+    stem, flags = filename.split(":2,", 1)
+    if "S" in flags:
+        return filename
+    return f"{stem}:2,{''.join(sorted(set(flags + 'S')))}"
+
+
 def move_one(conn, maildir_root: str, account: str, src: str, dst: str,
-             message_id: str) -> dict:
+             message_id: str, mark_seen: bool = False) -> dict:
     rows = conn.execute(ROW_SQL, (account, message_id, src)).fetchall()
     if not rows:
         raise FatalError(
@@ -82,6 +94,13 @@ def move_one(conn, maildir_root: str, account: str, src: str, dst: str,
 
     base = os.path.basename(src_path)
     clean = UID_TOKEN.sub("", base)
+    # Mark read on the way out of the active zone (user rule, 2026-08-07).
+    # \Seen means "awaiting your attention" only INSIDE the live tiers; on mail
+    # that has been resolved it is noise -- an unread badge for something already
+    # decided. Done here, in the same rename that performs the move, so it costs
+    # no extra himalaya call, no id resolution, and no second sync.
+    if mark_seen:
+        clean = with_seen(clean)
     dst_dir = os.path.join(maildir_root, dst, "cur")
     for sub in ("cur", "new", "tmp"):
         os.makedirs(os.path.join(maildir_root, dst, sub), exist_ok=True)
@@ -148,6 +167,11 @@ def main(argv=None) -> int:
                  "ids from stdin instead (avoids shell quoting mangling ids "
                  "containing backslashes etc. — bit a live session once)")
     mv.add_argument("--to", dest="dst", required=True, help="destination folder")
+    mv.add_argument("--mark-seen", action="store_true", dest="mark_seen",
+                    help="add \\Seen to the moved file. Use when the destination "
+                         "is OUTSIDE the live tiers (trash/ongoing/cold): unread "
+                         "is a signal inside the active zone and noise outside "
+                         "it. $BATCH sets this automatically per disposition.")
     args = ap.parse_args(argv)
 
     data_dir = os.path.expanduser(
@@ -177,7 +201,8 @@ def main(argv=None) -> int:
             try:
                 if args.cmd == "move":
                     done.append(move_one(conn, args.maildir, args.account,
-                                         args.src, args.dst, mid))
+                                         args.src, args.dst, mid,
+                                         mark_seen=args.mark_seen))
                 else:
                     done.append(remove_one(conn, args.maildir, args.account,
                                            args.src, mid))
