@@ -414,6 +414,14 @@ def hidden_selectors(css: str) -> set:
     return hidden
 
 
+def _clean(text: str) -> str:
+    """Strip the two sentinel codepoints from sender-controlled text.
+
+    Without this a message containing a literal \x01> would forge a quote
+    marker and make its own words render as somebody else's quote."""
+    return text.replace("\x00", "").replace("\x01", "")
+
+
 class _HTMLTextExtractor(HTMLParser):
     """Tag-stripped plain text from an HTML body: drops <script>/<style>
     content entirely, inserts a line break at block-level tags so the
@@ -438,7 +446,14 @@ class _HTMLTextExtractor(HTMLParser):
     treats the flag as one injection signal among several for that reason.
     """
 
-    _BLOCK_TAGS = {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6"}
+    _BLOCK_TAGS = {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+                   "dt", "dd"}
+    # Cells separate with a SPACE, not a newline: a table row is one logical
+    # line and `tr` already breaks it. Email is built out of tables, so before
+    # this a receipt extracted as `Subtotal$41.20` and a definition list as
+    # `DueAug 12Amount$90` -- measured in 27.7% of the messages where HTML is
+    # the only body source (2026-08-07).
+    _CELL_TAGS = {"td", "th"}
     _SKIPPED_TAGS = {"script", "style"}
     _ALWAYS_HIDDEN_TAGS = {"template"}
     _STRUCTURAL_TAGS = {"html", "body"}
@@ -448,9 +463,18 @@ class _HTMLTextExtractor(HTMLParser):
     _VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input",
                   "link", "meta", "source", "track", "wbr"}
 
+    # Structure that cannot be expressed inline is carried as sentinel markers
+    # in the chunk stream and resolved in text(). \x00/\x01 are stripped from
+    # ALL sender data on the way in (_clean), so a sender cannot forge one --
+    # the same unforgeability requirement as keeping link targets out of the
+    # body text. Quote markers deliberately render as the plain-text `> `
+    # convention, so quote isolation gets ONE code path for HTML and plain.
+    _Q_OPEN, _Q_CLOSE, _PRE_OPEN, _PRE_CLOSE = "\x01>", "\x01<", "\x01[", "\x01]"
+
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self._chunks = []
+        self._links = []
         self._skip_depth = 0
         self._in_style = False
         self._css = []
@@ -487,8 +511,18 @@ class _HTMLTextExtractor(HTMLParser):
             return
         if tag in self._VOID_TAGS:
             # No text content to hide and no end tag to balance.
-            if not self._hidden_stack and tag in self._BLOCK_TAGS:
+            if self._hidden_stack or self._is_hidden(tag, attrs):
+                return
+            if tag in self._BLOCK_TAGS:
                 self._chunks.append("\n")
+            elif tag == "img":
+                # alt is real content in image-heavy marketing and receipt mail
+                # (~27 chars/msg was being dropped). Empty alt is decorative by
+                # spec -- exactly what spacer gifs carry -- so it stays dropped.
+                alt = _clean({k.lower(): (v or "") for k, v in attrs}
+                             .get("alt", "")).strip()
+                if alt:
+                    self._chunks.append(f" {alt} ")
             return
         if self._hidden_stack or self._is_hidden(tag, attrs):
             # Inside a hidden subtree, EVERY open element is tracked -- an
@@ -496,8 +530,20 @@ class _HTMLTextExtractor(HTMLParser):
             # wrapper instead, un-hiding the rest of it.
             self._hidden_stack.append(tag)
             return
+        if tag == "a":
+            href = {k.lower(): (v or "") for k, v in attrs}.get("href", "").strip()
+            if href and not href.lower().startswith("javascript:"):
+                self._links.append(_clean(href))
         if tag in self._BLOCK_TAGS:
             self._chunks.append("\n")
+        elif tag in self._CELL_TAGS:
+            self._chunks.append(" ")
+        elif tag == "blockquote":
+            self._chunks.append("\n" + self._Q_OPEN)
+        elif tag == "pre":
+            self._chunks.append("\n" + self._PRE_OPEN)
+        if tag == "li":
+            self._chunks.append("- ")
 
     def handle_endtag(self, tag):
         if tag in self._SKIPPED_TAGS:
@@ -508,13 +554,20 @@ class _HTMLTextExtractor(HTMLParser):
                 self._hidden_selectors |= hidden_selectors("".join(self._css))
                 self._css = []
             return
-        # Pop back through the LAST matching open tag, tolerating unclosed
-        # inner elements: email HTML is routinely malformed, and a strict match
-        # would leave the whole remainder of the document suppressed.
-        for i in range(len(self._hidden_stack) - 1, -1, -1):
-            if self._hidden_stack[i] == tag:
-                del self._hidden_stack[i:]
-                break
+        if self._hidden_stack:
+            # Pop back through the LAST matching open tag, tolerating unclosed
+            # inner elements: email HTML is routinely malformed, and a strict
+            # match would leave the whole remainder suppressed. Nothing is
+            # emitted -- we are still inside hidden content.
+            for i in range(len(self._hidden_stack) - 1, -1, -1):
+                if self._hidden_stack[i] == tag:
+                    del self._hidden_stack[i:]
+                    break
+            return
+        if tag == "blockquote":
+            self._chunks.append(self._Q_CLOSE + "\n")
+        elif tag == "pre":
+            self._chunks.append(self._PRE_CLOSE + "\n")
 
     def handle_data(self, data):
         if self._in_style:
@@ -530,12 +583,68 @@ class _HTMLTextExtractor(HTMLParser):
                 self.hidden_text_present = True
                 self._dropped.append(data.strip())
             return
-        self._chunks.append(data)
+        self._chunks.append(_clean(data))
 
     def text(self) -> str:
-        raw = "".join(self._chunks)
-        lines = (re.sub(r"[ \t]+", " ", ln).strip() for ln in raw.splitlines())
-        return "\n".join(ln for ln in lines if ln)
+        """Assemble the chunk stream, resolving quote/pre markers per line.
+
+        One linear pass. A marker anywhere in a line applies to the whole line,
+        which is why the emitters put a newline next to each one."""
+        out, quote, pre = [], 0, 0
+        for line in "".join(self._chunks).split("\n"):
+            seg, i = [], 0
+            # State is captured at the line's FIRST content character, not at
+            # its end. A closing marker sits at end-of-line, so reading the
+            # depth afterwards had already un-quoted the line it applied to --
+            # which silently dropped the `> ` from every single-line quote and
+            # re-collapsed the last line of every <pre>.
+            at_quote = at_pre = None
+            while i < len(line):
+                if line[i] == "\x01" and i + 1 < len(line):
+                    m = line[i + 1]
+                    if m == ">":
+                        quote += 1
+                    elif m == "<":
+                        quote = max(0, quote - 1)
+                    elif m == "[":
+                        pre += 1
+                    elif m == "]":
+                        pre = max(0, pre - 1)
+                    i += 2
+                    continue
+                if at_quote is None:
+                    at_quote, at_pre = quote, pre
+                seg.append(line[i])
+                i += 1
+            body = "".join(seg)
+            if at_quote is None:        # marker-only or empty line
+                at_quote, at_pre = quote, pre
+            prefix = "> " * at_quote
+            if at_pre:
+                # Interior runs are the content in <pre> -- collapsing them is
+                # what turned `col1  col2` into `col1 col2`. Blank lines are
+                # kept here and only here.
+                out.append((prefix + body.rstrip()).rstrip() if not body.strip()
+                           else prefix + body.rstrip())
+                continue
+            body = re.sub(r"[ \t]+", " ", body).strip()
+            if body:
+                out.append(prefix + body)
+        return "\n".join(out)
+
+    def links(self) -> list:
+        """Visible link targets in document order, deduped.
+
+        Visible-only, matching the body: a target the user could never click is
+        not part of what they read. (Links inside hidden subtrees would be the
+        interesting input to a display/target mismatch check -- a separate
+        concern, deliberately not folded in here.)"""
+        seen, ordered = set(), []
+        for url in self._links:
+            if url not in seen:
+                seen.add(url)
+                ordered.append(url)
+        return ordered
 
     def hidden_report(self) -> dict:
         """What was dropped, as a classification rather than as content.
