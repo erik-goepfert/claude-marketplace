@@ -2146,11 +2146,30 @@ priority scan, injection *labels* rather than a keyword verdict, and now this.
 With 11.1 and 11.2 in place, "match the recipient's register" is a SKILL
 paragraph, not a tool, and it can be argued with instead of tuned.
 
-**SEQUENCING — read before starting 11.4.** Phase 8 replaces `himalaya template
-send` with stdlib `smtplib`. Building compose-new on himalaya first means
-building it twice. 11.1–11.3 are independent of Phase 8 and can start now; 11.4
-should either follow Phase 8 or be built against a send seam that Phase 8 then
-fills.
+**SEQUENCING.** Item numbers are **identities, not an order** — they run in the
+sequence they were discovered, and 11.7/11.8 were appended from measurements
+taken after 11.1–11.6 were designed. They are cited from commit messages and
+from `SKILL.md`, so they are never renumbered to express order; this block
+expresses order instead. (Precedent: 6.8 reversed mid-phase, and `$HIST
+set-unsubscribed` landed "out of phase order" — see the note after the exit
+criteria.)
+
+Two hard constraints:
+
+- **11.8 before 11.2 and before 11.6.** It is upstream of both consumers of
+  extracted text. 11.2's tier-2 detection needs the `blockquote` marker 11.8
+  adds, and 11.6 builds an FTS index *over extracted body text* — changing
+  extraction afterwards invalidates every posting and forces a full re-walk of
+  the Maildir to rebuild, since contentless FTS cannot reconstruct what it
+  indexed. Doing 11.8 first costs nothing; doing it third costs a reindex.
+- **11.4 after Phase 8.** Phase 8 replaces `himalaya template send` with stdlib
+  `smtplib`, so building compose-new on himalaya first means building it twice.
+  11.4 should either follow Phase 8 or be built against a send seam Phase 8 then
+  fills. 11.1–11.3 and 11.8 are all independent of Phase 8 and can start now.
+
+Suggested order: **11.8 → 11.2 → 11.1 → 11.6 → 11.3 → (Phase 8) → 11.4 →
+11.5**, with 11.7 optional alongside 11.6 and 11.5 deliberately last because it
+documents whatever actually landed.
 
 - [ ] **11.1 `$IDX query` — read-only SQL over `index.db`.** The same hardened
       surface `$HIST query` already provides, pointed at `envelopes`: recipient
@@ -2171,6 +2190,7 @@ fills.
       `UNTRUSTED_COLUMNS`-classified-deliberately test so a new column fails the
       suite rather than drifting.
 - [ ] **11.2 `$THR read --no-quotes` — isolate one message's own words.**
+      **Depends on 11.8** for the `blockquote` marker tier 2 keys off.
       **The question this task exists to answer: can chain quotes be told apart
       from quotes the author deliberately included as content?** Yes, in three
       tiers of decreasing confidence, and the polarity matters more than the
@@ -2239,7 +2259,10 @@ fills.
       corpus exists: 19 sent messages to Raimund, 5 to Pete, 351 to Bonnie, and
       2,973 of 2,974 sent messages carry a usable `to_addr`.
 
-- [ ] **11.6 Body search — the piece that does not exist at all.** `index.db`
+- [ ] **11.6 Body search — the piece that does not exist at all.**
+      **Do 11.8 first** — this indexes extracted body text, and changing the
+      extractor afterwards means rebuilding every posting from scratch.
+      `index.db`
       holds **headers only** (`BytesHeaderParser`, deliberately "never the
       body"), so `--subject-contains` is the whole of full-text search today.
       "Find the email where Raimund mentioned the sprinkler company" is
