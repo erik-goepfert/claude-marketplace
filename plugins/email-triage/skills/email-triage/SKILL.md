@@ -610,6 +610,25 @@ overrides win over batch flags (full schema: reference §JSON). Pre-flight
 validates every item before anything acts. Consume `change_report.
 external` per step 4; check `sync[].ok`.
 
+**Composing a body — every draft, reply or new message alike.** Two
+conventions, both learned from sent mail:
+
+- **One logical line per paragraph. Never hard-wrap** (user preference,
+  2026-08-07). Blank line between paragraphs; let the recipient's client wrap
+  to its own viewport. Hard-wrapping at ~76 columns is the old fixed-width
+  convention and it reads badly on anything narrower, because each hard line
+  re-wraps independently and you get alternating long/short lines — which is
+  how a real sent draft got noticed. Transport safety is not a reason to wrap:
+  quoted-printable inserts its own soft breaks at the wire level and they
+  vanish on decode, so a long paragraph travels fine as one line.
+- **The user's voice, not yours.** Match their register — greeting, sign-off,
+  sentence length, how much warmth — and default to shorter than feels
+  complete. The evidence is up to ~10 of the user's own **sent** messages to
+  this recipient; finding those needs recipient-side search, which does not
+  exist yet (Phase 11.1). Until it does, `$THR list --sender <addr>` gets you
+  the other half — how *they* write to the user — which is weaker evidence but
+  better than inventing a tone.
+
 **Flags and replies are not moves, so they run the same unit by hand:**
 act (`-local` himalaya for flags, IMAP himalaya for replies) → log the
 event → `$IDX index` (a full run is cheap, ~25 s) → box-scoped push,
@@ -635,17 +654,8 @@ rerun `$IDX index` and retry.
      matched by `from_addr`/`date_utc`/`subject`.
   3. `himalaya template reply -a <acct> -f <folder> <id>` — prefills
      everything except `References:`; add it from step 1.
-  4. Write the body (quote below, reply above, the user's voice); save
-     the full template to a temp file.
-     **One logical line per paragraph — never hard-wrap** (user preference,
-     2026-08-07, after a sent draft came out ragged on a phone). Write each
-     paragraph as a single unbroken line with blank lines between paragraphs,
-     and let the recipient's client soft-wrap to its own viewport. Hard-wrapping
-     at ~76 columns is the old plain-text convention and it reads badly
-     everywhere narrower than that: each hard line re-wraps on its own, giving
-     alternating long/short lines. Nothing needs hard-wrapping for safety —
-     quoted-printable inserts its own soft breaks (`=`) at the transport layer
-     and they vanish on decode. Applies to compose-new as much as to replies.
+  4. Write the body per **Composing a body** above (quote below, reply
+     above); save the full template to a temp file.
   5. Show the complete draft. Three exits:
      - **Send** (explicit approval of that exact draft):
        `himalaya template send -a <acct> "$(cat <tmpfile>)"`.
