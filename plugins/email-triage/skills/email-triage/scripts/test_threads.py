@@ -809,6 +809,73 @@ class ReadCommandTests(unittest.TestCase):
         self.assertEqual(out["headers"]["Message-ID"], "<plain1@example.com>")
         self.assertEqual(out["file"], "INBOX/cur/k1:2,")
 
+    def test_blank_text_plain_does_not_beat_real_html(self):
+        """Regression from a live session (2026-08-07): Apple Mail writes
+        multipart/alternative drafts with a BLANK text/plain part beside the real
+        text/html one. Preferring text/plain whenever it existed reported a
+        fully-written draft as empty -- and the documented next step would have
+        been to offer to rewrite it over the top of real content."""
+        msg = EmailMessage()
+        msg["From"] = "me@example.com"
+        msg["To"] = "pete@example.com"
+        msg["Subject"] = "Re: something"
+        msg["Message-ID"] = "<kblank@example.com>"
+        msg.set_content("")          # blank text/plain, exactly as Apple Mail writes it
+        msg.add_alternative("<html><body><p>Real body text.</p></body></html>",
+                            subtype="html")
+        put_maildir_file(self.maildir_root, "INBOX", "kblank:2,", msg.as_bytes())
+        self.index_row("INBOX", "kblank", "<kblank@example.com>", "kblank:2,")
+
+        out = self.run_read("<kblank@example.com>")
+        self.assertEqual(out["source_part"], "text/html-stripped")
+        self.assertIn("Real body text.", out["body"])
+
+    def test_whitespace_only_text_plain_also_loses(self):
+        msg = EmailMessage()
+        msg["From"] = "me@example.com"
+        msg["Subject"] = "ws"
+        msg["Message-ID"] = "<kws2@example.com>"
+        msg.set_content("\n   \n\t\n")
+        msg.add_alternative("<html><body>Actual content</body></html>", subtype="html")
+        put_maildir_file(self.maildir_root, "INBOX", "kws2:2,", msg.as_bytes())
+        self.index_row("INBOX", "kws2", "<kws2@example.com>", "kws2:2,")
+        out = self.run_read("<kws2@example.com>")
+        self.assertEqual(out["source_part"], "text/html-stripped")
+        self.assertIn("Actual content", out["body"])
+
+    def test_genuinely_empty_message_still_reports_text_plain(self):
+        # Blank plain and NO html: the message really is empty. Distinguishable
+        # from "no body part at all", which returns null.
+        msg = EmailMessage()
+        msg["From"] = "me@example.com"
+        msg["Subject"] = "empty"
+        msg["Message-ID"] = "<kmt@example.com>"
+        msg.set_content("")
+        put_maildir_file(self.maildir_root, "INBOX", "kmt:2,", msg.as_bytes())
+        self.index_row("INBOX", "kmt", "<kmt@example.com>", "kmt:2,")
+        out = self.run_read("<kmt@example.com>")
+        self.assertEqual(out["source_part"], "text/plain")
+        # Still enveloped -- an empty body is contained like any other. What
+        # matters is that the enveloped payload really is empty.
+        nonce = self.trust["nonce"]
+        payload = out["body"].split(f"<untrusted-content-{nonce}>", 1)[1]
+        payload = payload.split(f"</untrusted-content-{nonce}>", 1)[0]
+        self.assertEqual(payload.strip(), "")
+
+    def test_non_blank_plain_still_wins_over_html(self):
+        # The normal case must be unchanged: a real text/plain part is preferred.
+        msg = EmailMessage()
+        msg["From"] = "a@example.com"
+        msg["Subject"] = "both"
+        msg["Message-ID"] = "<kboth@example.com>"
+        msg.set_content("Plain wins.\n")
+        msg.add_alternative("<html><body>HTML loses</body></html>", subtype="html")
+        put_maildir_file(self.maildir_root, "INBOX", "kboth:2,", msg.as_bytes())
+        self.index_row("INBOX", "kboth", "<kboth@example.com>", "kboth:2,")
+        out = self.run_read("<kboth@example.com>")
+        self.assertEqual(out["source_part"], "text/plain")
+        self.assertIn("Plain wins.", out["body"])
+
     def test_read_html_only_falls_back_automatically_without_flag(self):
         msg = EmailMessage()
         msg["From"] = "news@example.com"

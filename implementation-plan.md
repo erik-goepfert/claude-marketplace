@@ -1798,6 +1798,49 @@ raw-file-read ban now names it explicitly.
   the elapsed gap and telling the user the number; whether to log any of it at
   all is still theirs to answer.
 
+**Second live attempt 2026-08-07 — the fixes hold, and real triage happened.**
+Step 4 went 772KB -> 1.5KB; `--summary` did 170 threads in 1.5KB. Three further
+findings, two fixed:
+
+6. **The priority scan could not be run at all.** Its scope is *unseen* (86 of
+   170 threads here) and there was no way to list them: `--summary` counts,
+   `--compact` emits the whole object and overflows. **Fixed:** `$THR list`
+   gained `--scan` (one line per thread: subject, sender, age, seen, state,
+   message_id — dropping the per-thread structure the scan never reads) and
+   `--unseen`. 86 threads = 23KB vs ~60KB. Entries print one-per-line rather
+   than `indent=2`, which was spending ~60% of the payload on padding.
+7. **`extract_body` reported a written draft as EMPTY.** Apple Mail writes
+   multipart/alternative drafts with a **blank** `text/plain` beside the real
+   `text/html`, and the code preferred `text/plain` whenever it merely existed.
+   Found reviewing a real draft to a friend: the documented read path said
+   "empty", and the documented next step would have been to offer to rewrite it
+   over the top of 1,400 characters of real content. **Fixed:** prefer
+   `text/plain` only when non-blank; 4 regression tests including the exact
+   Apple Mail shape. This is the closest this project has come to destroying
+   user data, and it was a one-line condition.
+8. **`$HIST context` is 40.9KB with no summary mode** — `--sessions 2` does not
+   help because the bulk is 129 `sender_stats` rows. Every session pays ~11k
+   tokens on step 2. NOT FIXED; wants the same treatment `--summary` got.
+
+**Design decision (user, 2026-08-07): the priority scan gets three ordered
+passes.** `Seen` is trusted to mean "glanced at, or triage scanned and
+summarized it" — rule 5 already guarantees that, since our own reads never set
+it. So it is a legitimate *novelty* filter: (1) security, unseen-scoped as now;
+(2) VIPs; (3) **time-sensitive items, NOT `Seen`-scoped**, because reading a
+deadline does not discharge it. "Time-sensitive" is deliberately a judgement
+call, not a keyword list. Proven immediately: a `5621 W 141st Lane` payment
+reminder, 8 days old and `Seen`, was structurally invisible to the old scan.
+NOT YET WRITTEN INTO THE SKILL — needs the doc change plus a restart.
+
+**Also open: no edit-draft path.** Fixing three typos in a real draft took
+export -> decode QP -> patch -> re-encode -> save -> flag -> verify -> sync,
+entirely off the documented rails, through the three worst foot-guns in the
+stack (unstable Maildir ids, strand-on-move, `message save` silently writing
+EMPTY). Worth a guarded `$THR edit-draft` that takes replacement pairs, asserts
+each matches exactly once, and leaves the old draft for an approval-gated
+trash. Specced, not built — a mail-mutation script needs its own pass with
+multipart fixtures, and building it hastily is how a draft gets lost.
+
 **Exit status (2026-08-06): 4 of 5 met; criterion 4 needs a live session.**
 1. ✅ **Met.** 315 tests across 9 suites, up from 110. The structural test is
    `assert_manifest_is_complete` and its per-module equivalents: they subtract

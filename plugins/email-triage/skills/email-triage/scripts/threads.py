@@ -580,16 +580,26 @@ def extract_body(msg, force_html: bool):
     (an ambiguity the spec didn't cover; returning no body when a
     perfectly readable plain part exists would be a worse default)."""
     plain_part = find_part(msg, "plain")
-    if plain_part is not None and not force_html:
-        return decode_text_part(plain_part), "text/plain", NO_HIDDEN_TEXT
+    plain_text = decode_text_part(plain_part) if plain_part is not None else None
+
+    # An EMPTY text/plain part must not win (found live 2026-08-07, reviewing a
+    # real draft). Apple Mail writes multipart/alternative drafts with a BLANK
+    # text/plain beside the genuine text/html, so preferring text/plain whenever
+    # it merely EXISTS reported a fully-written draft as empty -- and a session
+    # following the documented read path would have told the user their draft
+    # was blank, then offered to rewrite it over the top of real content.
+    if plain_text is not None and plain_text.strip() and not force_html:
+        return plain_text, "text/plain", NO_HIDDEN_TEXT
 
     html_part = find_part(msg, "html")
     if html_part is not None:
         text, hidden = strip_html(decode_text_part(html_part))
         return text, "text/html-stripped", hidden
 
-    if plain_part is not None:
-        return decode_text_part(plain_part), "text/plain", NO_HIDDEN_TEXT
+    # Blank plain and no html at all: the message really is empty. Return it as
+    # text/plain rather than None so the caller can tell "empty" from "absent".
+    if plain_text is not None:
+        return plain_text, "text/plain", NO_HIDDEN_TEXT
 
     return None, None, NO_HIDDEN_TEXT
 
@@ -949,6 +959,40 @@ READ_ENVELOPES = {"body": "email body"}
 SUMMARY_TRUSTED = {"totals", "by_account", "by_state", "by_tier", "top_senders",
                    "signals", "tiers"}
 
+# `--scan`: one line per thread carrying ONLY what the priority scan judges on,
+# plus the message_id needed to act. Added 2026-08-07: the scan is judgement over
+# subjects, and there was no way to see subjects at mailbox scale -- `--compact`
+# emits the full object (member counts, tiers_present, folders, root ids) and
+# overflowed at ~140 threads, so the scan could not actually be performed.
+SCAN_TRUSTED = {"scan.account", "scan.state", "scan.seen", "scan.inactive_days",
+                "scan.drafted", "scan.injection_signals", "scan.folder_tier"}
+SCAN_HANDLES = {"scan.message_id"}
+
+
+def scan_line(obj: dict) -> dict:
+    """The scan's judgement fields. Deliberately omits everything the scan does
+    not read -- that omission is the point, not an oversight."""
+    latest = obj.get("latest") or {}
+    line = {
+        "account": obj["account"],
+        "message_id": latest.get("message_id"),
+        "from_addr": latest.get("from_addr"),
+        "subject": obj.get("subject"),
+        "inactive_days": obj.get("inactive_days"),
+        # `seen` is the USER's read state, protected by rule 5 -- our own reads
+        # never set it. True means they have actually had this in front of them
+        # (or been shown a summary of it), which is what makes it a legitimate
+        # novelty filter and NOT a reason to drop a deadline.
+        "seen": "Seen" in (latest.get("flags") or []),
+        "state": obj.get("state"),
+        "folder_tier": latest.get("folder_tier"),
+    }
+    if obj.get("drafted"):
+        line["drafted"] = True
+    if obj.get("injection_signals"):
+        line["injection_signals"] = obj["injection_signals"]
+    return line
+
 
 def summarize(objs: list) -> dict:
     """Counts instead of thread objects (added 2026-08-07 after the first live
@@ -1027,13 +1071,17 @@ def cmd_list(args: argparse.Namespace) -> None:
                     subject_q in (m["subject"] or "").lower() for m in mlist
                 ):
                     continue
-                if args.compact or args.summary:
+                if args.compact or args.summary or args.scan:
                     # --summary derives from the compact shape deliberately, so
                     # `latest` / `tiers_present` / the priority-scan unseen rule
                     # come from ONE implementation rather than a second copy.
                     thread_obj, sort_date = compact_thread_object(account, mlist)
                 else:
                     thread_obj, sort_date = build_thread_object(account, mlist)
+                if args.unseen:
+                    latest = thread_obj.get("latest") or {}
+                    if "Seen" in (latest.get("flags") or []):
+                        continue
                 result.append((thread_obj, sort_date))
 
         # (account asc, newest date desc): stable-sort by date desc first,
@@ -1042,6 +1090,20 @@ def cmd_list(args: argparse.Namespace) -> None:
         result.sort(key=lambda pair: pair[0]["account"])
 
         objs = [t for t, _ in result]
+        if args.scan:
+            # One entry per LINE, not indent=2. Every other emitter here
+            # pretty-prints, but this one is a dense listing whose whole purpose
+            # is fitting a whole mailbox in a readable budget -- indent=2 spent
+            # ~60% of the payload on padding around six short fields.
+            payload = untrusted.apply_trust(
+                {"scan": [scan_line(o) for o in objs]},
+                SCAN_TRUSTED, handle_fields=SCAN_HANDLES)
+            lines = ",\n    ".join(
+                json.dumps(e, sort_keys=True, separators=(",", ":"))
+                for e in payload["scan"])
+            print('{\n  "_trust": %s,\n  "scan": [\n    %s\n  ]\n}' % (
+                json.dumps(payload["_trust"], sort_keys=True), lines))
+            return
         if args.summary:
             print(json.dumps(
                 untrusted.apply_trust(
@@ -1353,6 +1415,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="only threads where some member's subject contains this "
              "(case-insensitive substring)",
     )
+    list_p.add_argument(
+        "--scan", action="store_true",
+        help="one line per thread with only the priority scan's judgement "
+             "fields (subject, sender, age, seen, state) plus message_id -- far "
+             "smaller than --compact, which carries per-thread structure the "
+             "scan never reads.")
+    list_p.add_argument(
+        "--unseen", action="store_true",
+        help="only threads whose latest non-trash/junk member lacks \\Seen -- "
+             "the security pass's scope. Combines with --scan/--compact/"
+             "--summary and the other filters.")
     list_p.add_argument(
         "--summary", action="store_true",
         help="counts only, no thread objects: totals (threads / unseen / drafted "
