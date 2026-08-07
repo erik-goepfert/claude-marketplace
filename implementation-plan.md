@@ -1841,6 +1841,44 @@ each matches exactly once, and leaves the old draft for an approval-gated
 trash. Specced, not built — a mail-mutation script needs its own pass with
 multipart fixtures, and building it hastily is how a draft gets lost.
 
+### INVESTIGATE: `flag_changed` undercounted on Gmail duplicate copies (2026-08-07)
+
+**Symptom.** After marking 10 trashed gmail messages read via `$THR flag --seen`,
+the next `$IDX index` reported `flag_changed: 0`. mbsync pushed `Far: *10`, and
+index and disk agreed all 16 were `Seen` afterwards — so nothing was lost, but 10
+flag renames produced no report entries.
+
+**Not a general break.** The same operation on 2 *icloud INBOX* messages
+immediately afterwards reported `flag_changed: 2` correctly. So the detection
+path works; something about the gmail case defeats it.
+
+**Leading hypothesis, NOT confirmed.** Gmail keeps every message in
+`[Gmail]/All Mail` as well as its label folder, so each of those threads had two
+rows. Two things follow, and either could produce the symptom:
+1. `compact_thread_object` picks `latest` from members whose tier is not in
+   `HISTORY_TIERS` (`trash`/`junk`) — an All-Mail member has tier `allmail`, so
+   it IS eligible and becomes `latest`. The "10 unread" I acted on may therefore
+   have been the **All-Mail** copies, with the Trash copies already `Seen`.
+2. `threads.resolve_message_row` orders candidate folders by `TIER_RANK`, which
+   **has no `allmail` entry at all** (deliberately — a pure-allmail message
+   resolves to `cold`). What `.get("allmail")` returns during that ordering, and
+   which copy `$THR flag` therefore renames, needs checking rather than
+   assuming.
+
+If (1) holds, the deeper bug is that a Gmail thread's `seen` in `--scan`/
+`--compact` can report the All-Mail copy's state rather than the labelled one —
+which would make the priority scan's unseen scope wrong on gmail specifically.
+
+**Why it matters beyond tidiness:** 6.9 derives `flag` events from
+`flag_changed`. An undercount there means externally-flagged gmail mail silently
+never becomes an event, which is the failure mode the whole change-report
+mechanism exists to prevent.
+
+**Where to start:** a fixture with one message in both `[Gmail]/All Mail` and a
+label folder, flag each copy independently, and assert which one `latest`,
+`resolve_message_row` and `flag_changed` each pick. `TIER_RANK` missing `allmail`
+is the first thing to check.
+
 **Exit status (2026-08-06): 4 of 5 met; criterion 4 needs a live session.**
 1. ✅ **Met.** 315 tests across 9 suites, up from 110. The structural test is
    `assert_manifest_is_complete` and its per-module equivalents: they subtract
