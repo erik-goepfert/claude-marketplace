@@ -559,6 +559,75 @@ class TrustLayerTests(ThreadsTestCase):
             self.assertNotIn("Claude", label)
             self.assertNotIn("user about", label)
 
+    def test_summary_mode_replaces_thread_objects_with_counts(self):
+        """Added 2026-08-07 after the first live session: --compact still emits
+        one object per thread and overflowed at ~141 threads (105KB), so the
+        SKILL's own remedy for oversized output was what overflowed."""
+        self.insert(message_id="S1", folder="INBOX", folder_tier="untriaged",
+                    account="ic", subject="a", from_addr="bulk@x.com",
+                    date_utc=days_ago(1), flags=["Seen"])
+        self.insert(message_id="S2", folder="INBOX", folder_tier="untriaged",
+                    account="ic", subject="b", from_addr="bulk@x.com",
+                    date_utc=days_ago(2))
+        self.insert(message_id="S3", folder="Active", folder_tier="active",
+                    account="ic", subject="c", from_addr="pete@x.com",
+                    date_utc=days_ago(3), is_flagged=1)
+        parser = threads.build_parser()
+        args = parser.parse_args(["list", "--db", str(self.db_path), "--summary"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            threads.cmd_list(args)
+        payload, trust = unwrap_trust(buf.getvalue())
+        self.assertNotIn("threads", payload)  # counts, not objects
+        self.assertEqual(payload["totals"]["threads"], 3)
+        self.assertEqual(payload["by_state"], {"holding": 2, "needs-reply": 1})
+        self.assertEqual(payload["by_tier"], {"untriaged": 2, "active": 1})
+        # Priority-scan scope: unseen only.
+        self.assertEqual(payload["totals"]["unseen"], 2)
+        # Senders are handles -- they go straight back into `list --sender`.
+        top = {e["sender"]: e["threads"] for e in payload["top_senders"]}
+        self.assertEqual(top["bulk@x.com"], 2)
+        self.assertIn("top_senders.sender", trust["untrusted_fields"])
+
+    def test_summary_counts_reconciliation_candidates(self):
+        # untriaged + a RESOLVED tier is the reconciliation signal; a trashed
+        # sibling must not count as resolved.
+        self.insert(message_id="R1", folder="INBOX", folder_tier="untriaged",
+                    account="ic", subject="Recon", from_addr="a@x.com",
+                    date_utc=days_ago(1))
+        self.insert(message_id="R2", folder="Areas/Taxes", folder_tier="ongoing",
+                    account="ic", in_reply_to="R1", references_chain=["R1"],
+                    subject="Re: Recon", from_addr="a@x.com", date_utc=days_ago(5))
+        self.insert(message_id="T1", folder="INBOX", folder_tier="untriaged",
+                    account="ic", subject="Trashy", from_addr="b@x.com",
+                    date_utc=days_ago(1))
+        self.insert(message_id="T2", folder="Trash", folder_tier="trash",
+                    account="ic", in_reply_to="T1", references_chain=["T1"],
+                    subject="Re: Trashy", from_addr="b@x.com", date_utc=days_ago(6))
+        parser = threads.build_parser()
+        args = parser.parse_args(["list", "--db", str(self.db_path), "--summary"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            threads.cmd_list(args)
+        payload, _trust = unwrap_trust(buf.getvalue())
+        self.assertEqual(payload["totals"]["reconciliation_candidates"], 1)
+
+    def test_summary_is_dramatically_smaller_than_compact(self):
+        for i in range(40):
+            self.insert(message_id=f"B{i:03d}", folder="INBOX",
+                        folder_tier="untriaged", account="ic",
+                        subject=f"Bulk message number {i}",
+                        from_addr=f"s{i}@bulk.example", date_utc=days_ago(1))
+        parser = threads.build_parser()
+        buf_c, buf_s = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf_c):
+            threads.cmd_list(parser.parse_args(
+                ["list", "--db", str(self.db_path), "--compact"]))
+        with contextlib.redirect_stdout(buf_s):
+            threads.cmd_list(parser.parse_args(
+                ["list", "--db", str(self.db_path), "--summary"]))
+        self.assertLess(len(buf_s.getvalue()), len(buf_c.getvalue()) / 5)
+
     def test_nonce_differs_between_invocations(self):
         self.insert_hostile_thread()
         self.run_list(tier=["untriaged"])

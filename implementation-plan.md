@@ -1747,6 +1747,57 @@ emitter):
 5. The 6.8 posture decision is recorded with its rationale, and 6.6's rule
    text matches the posture actually chosen.
 
+**Criterion 4 attempted 2026-08-07 — ABORTED at step 5, and it earned its
+place in this list twice over.** A real session opened, synced, indexed and
+assembled, then stopped without triaging because the flow does not survive a
+six-week backlog. Nothing was acted on and no events were logged; the session
+note carries the detail. Five findings, all now fixed:
+
+1. **`--suggest-events` emitted 772 KB** — unreadable, with the actionable
+   `suggestions` block at the *end* so reaching it needed blind-offset reads.
+   Cause: the flag ADDED derived buckets while still shipping the raw
+   per-entry arrays they were derived from. Fix: with the flag on, the raw
+   arrays collapse to `change_counts`, lists cap at 20 per bucket with a
+   `*_truncated` count, `counts` stays exact, and `log_file` keeps the
+   complete set. Run without the flag for raw entries.
+2. **Regression I introduced in 6.9:** every `deleted` entry routed to
+   `needs_confirmation`, including trash/junk expunges. The pre-6.9 prose rule
+   called those "a non-event (no log, no mention)" and a live session had
+   already recorded **822** of them. I implemented the task's wording
+   literally and lost the rule's judgment — the sharpest lesson of the
+   session: mechanizing prose means carrying the judgment in it, not just the
+   procedure. Fix: `counts.expunged_from_trash`, counted and never listed.
+3. **`suggested_events` over-claimed `decided_by=manual`** on All-Mail→Trash
+   moves that were the Substack `server_rules` filter doing its job. A message
+   whose only home was All Mail was never in a triage tier, so it was never in
+   front of the user. Fix: All-Mail-only sources route to
+   `needs_confirmation`; genuine tier transitions still become events.
+4. **`$THR list --compact` also overflowed** (105 KB, ~141 threads) — and
+   `--compact` is what the SKILL prescribes *as the remedy* for oversized
+   output, so the remedy was the thing overflowing. Even the Read tool
+   truncates it. Fix: `--summary` emits counts only (totals incl. the
+   unseen/priority-scan scope, by account/state/tier, 15 heaviest senders):
+   **167 threads in 1.7 KB.** `top_senders` is the session plan — each heavy
+   sender becomes a batch via `--compact --sender <addr>`, which stays small.
+5. **Plain `index` silently discards the derivation** and the deltas are not
+   replayable. I hit this myself running one for a diagnostic. Fix: the output
+   now says so.
+
+Also fixed: `suggestions.log_file` holds deliberately-unescaped clean text, and
+nothing stopped a model reading it instead of passing it to `log-events` —
+which would bypass the escaping under a friendlier filename. Rule 6's
+raw-file-read ban now names it explicitly.
+
+**Two findings left as open questions, not fixed** (they need the user):
+- **The priority scan is `Seen`-scoped**, so a `5621 W 141st Lane` payment
+  reminder eight days old could not interrupt because it had been glanced at
+  on a phone. Time-critical items may need a path in that ignores `Seen`.
+- **The historical backlog should probably never be logged as `manual`
+  events.** Hundreds of proposals after a long gap is mailbox drift, not
+  decisions the user made. The SKILL now requires checking the count against
+  the elapsed gap and telling the user the number; whether to log any of it at
+  all is still theirs to answer.
+
 **Exit status (2026-08-06): 4 of 5 met; criterion 4 needs a live session.**
 1. ✅ **Met.** 315 tests across 9 suites, up from 110. The structural test is
    `assert_manifest_is_complete` and its per-module equivalents: they subtract

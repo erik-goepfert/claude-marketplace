@@ -157,6 +157,16 @@ pass through byte-identical, and are untrusted all the same. `$THR list`
 returns `{"_trust": …, "threads": [...]}` — an object, not the bare array it
 was before 6.2.
 
+**`$THR list --summary`:** counts only, no thread objects — `totals`
+(`threads`, `unseen`, `drafted`, `reconciliation_candidates`,
+`injection_signals`), `by_account`, `by_state`, `by_tier`, `top_senders[]`
+(`sender`, `threads`; 15 heaviest, and `sender` is a handle you feed back to
+`--sender`). Derived from the compact shape, so `unseen` is exactly the
+priority-scan scope. **This is the session-start breakdown**: 167 threads
+summarize to 1.7KB where `--compact` was 105KB and overflowed. Added
+2026-08-07 — `--compact` was the documented remedy for oversized output and
+was itself what overflowed.
+
 **`$THR list` / `show` thread object:** `account`, `root_message_id`,
 `state` (`needs-reply` | `waiting` | `holding`), `drafted` (bool),
 `inactive_days`, `member_count`, `subject`, `members[]` sorted
@@ -189,10 +199,28 @@ index → re-index/sync; ambiguous → act manually).
 `flag_changed` entries add `old_flags`/`new_flags` (5.2).
 
 **`$IDX index --suggest-events --session <ts>` (6.9)** adds a `suggestions`
-object: `suggested_events[]` (ready for `$HIST log-events`),
-`needs_confirmation[]`, `unresolved[]` (each with a `reason`),
-`self_echo_absorbed[]` (each with the `logged_action` it matched), `log_file`,
-`note`.
+object: `counts` (exact, per bucket, incl. `expunged_from_trash`),
+`by_action`, then the buckets themselves — `suggested_events[]` (ready for
+`$HIST log-events`), `needs_confirmation[]`, `unresolved[]` (each with a
+`reason`), `self_echo_absorbed[]` (each with the `logged_action` it matched) —
+plus `log_file` and `note`.
+
+**Scale controls, added 2026-08-07 after the first live run emitted 772KB on a
+six-week backlog.** With the flag on, the raw per-entry arrays (`new`, `moved`,
+`deleted`, `flag_changed`) collapse to `change_counts`: the suggestions are
+their consumption, so shipping both doubled the payload for nothing. Lists cap
+at 20 per bucket with a `<bucket>_truncated` count; `counts` stays exact and
+`log_file` always holds the complete `suggested_events`. Run without the flag
+to get raw entries back for debugging — but that run **consumes the deltas and
+discards the derivation**, and says so in a `note`.
+
+**Two classifications that are not decisions.** Deletions from trash/junk are
+provider auto-purge: `counts.expunged_from_trash` only, never listed (routing
+them to `needs_confirmation` turned 822 auto-purges into 822 questions).
+And a move whose source is All-Mail-only goes to `needs_confirmation`, not
+`suggested_events` — such a message was never in a triage tier, so it was
+never in front of the user, and `decided_by=manual` would be a false claim
+that they acted (usually it is a `server_rules` filter).
 
 It is a **flag on `index`, not its own subcommand**, because the change report
 is ephemeral — a second index run reports nothing, so suggestions must come

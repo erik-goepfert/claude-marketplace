@@ -946,6 +946,59 @@ READ_ENVELOPES = {"body": "email body"}
 # --------------------------------------------------------------------------
 
 
+SUMMARY_TRUSTED = {"totals", "by_account", "by_state", "by_tier", "top_senders",
+                   "signals", "tiers"}
+
+
+def summarize(objs: list) -> dict:
+    """Counts instead of thread objects (added 2026-08-07 after the first live
+    session: `--compact` over a busy mailbox still emitted 105KB / ~141 threads,
+    and the SKILL prescribes --compact as the remedy for oversized output, so the
+    remedy was what overflowed).
+
+    Carries exactly what the breakdown step needs to plan the session and
+    nothing per-thread: totals, the lifecycle split, the priority-scan scope
+    (unseen), drafted and reconciliation counts, and the heaviest senders --
+    which is what turns a 141-thread inbox into a handful of category batches
+    worked through `--sender`."""
+    by_account: dict = {}
+    by_state: dict = {}
+    by_tier: dict = {}
+    senders: dict = {}
+    unseen = drafted = reconcile = signals = 0
+    for obj in objs:
+        by_account[obj["account"]] = by_account.get(obj["account"], 0) + 1
+        by_state[obj["state"]] = by_state.get(obj["state"], 0) + 1
+        latest = obj.get("latest") or {}
+        tier = latest.get("folder_tier")
+        if tier:
+            by_tier[tier] = by_tier.get(tier, 0) + 1
+        if "Seen" not in (latest.get("flags") or []):
+            unseen += 1
+        if obj.get("drafted"):
+            drafted += 1
+        present = set(obj.get("tiers_present") or [])
+        if "untriaged" in present and present & {"ongoing", "cold"}:
+            reconcile += 1
+        if obj.get("injection_signals"):
+            signals += 1
+        addr = (latest.get("from_addr") or "").lower()
+        if addr:
+            senders[addr] = senders.get(addr, 0) + 1
+    top = sorted(senders.items(), key=lambda kv: (-kv[1], kv[0]))[:15]
+    return {
+        "totals": {"threads": len(objs), "unseen": unseen, "drafted": drafted,
+                   "reconciliation_candidates": reconcile,
+                   "injection_signals": signals},
+        "by_account": by_account,
+        "by_state": by_state,
+        "by_tier": by_tier,
+        # sender is a HANDLE: the model feeds it straight back into
+        # `list --sender <addr>` to build each category batch.
+        "top_senders": [{"sender": a, "threads": n} for a, n in top],
+    }
+
+
 def cmd_list(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
@@ -974,7 +1027,10 @@ def cmd_list(args: argparse.Namespace) -> None:
                     subject_q in (m["subject"] or "").lower() for m in mlist
                 ):
                     continue
-                if args.compact:
+                if args.compact or args.summary:
+                    # --summary derives from the compact shape deliberately, so
+                    # `latest` / `tiers_present` / the priority-scan unseen rule
+                    # come from ONE implementation rather than a second copy.
                     thread_obj, sort_date = compact_thread_object(account, mlist)
                 else:
                     thread_obj, sort_date = build_thread_object(account, mlist)
@@ -985,10 +1041,18 @@ def cmd_list(args: argparse.Namespace) -> None:
         result.sort(key=lambda pair: pair[1], reverse=True)
         result.sort(key=lambda pair: pair[0]["account"])
 
+        objs = [t for t, _ in result]
+        if args.summary:
+            print(json.dumps(
+                untrusted.apply_trust(
+                    summarize(objs), SUMMARY_TRUSTED,
+                    handle_fields={"top_senders.sender"}),
+                indent=2, sort_keys=True))
+            return
         # An object, not the bare array this printed before 6.2: an array has
         # nowhere to carry the `_trust` manifest.
         print(json.dumps(
-            untrusted.apply_trust({"threads": [t for t, _ in result]},
+            untrusted.apply_trust({"threads": objs},
                                   LIST_TRUSTED, handle_fields=LIST_HANDLES),
             indent=2, sort_keys=True))
     finally:
@@ -1289,6 +1353,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="only threads where some member's subject contains this "
              "(case-insensitive substring)",
     )
+    list_p.add_argument(
+        "--summary", action="store_true",
+        help="counts only, no thread objects: totals (threads / unseen / drafted "
+             "/ reconciliation candidates / injection signals), by account, by "
+             "state, by tier, and the 15 heaviest senders. Use this for the "
+             "session-start breakdown on a busy mailbox -- --compact still "
+             "emits one object per thread and overflows past ~100 threads.")
     list_p.add_argument(
         "--compact", action="store_true",
         help="classification-sized summaries (no members array): state, "

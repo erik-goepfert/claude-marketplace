@@ -617,8 +617,14 @@ TIER_TO_ACTION = {
 }
 
 # unrecognized_folders holds folder names, which no sender can choose.
-INDEX_TRUSTED = change_report_trusted() | {"unrecognized_folders"}
+INDEX_TRUSTED = change_report_trusted() | {"unrecognized_folders", "note", "change_counts"}
 INDEX_HANDLES = change_report_handles()
+
+# Per-bucket cap on the suggestion lists (2026-08-07, from the first live run:
+# a six-week backlog produced 772KB of JSON, which no session can read). Counts
+# are always exact; the full `suggested_events` set is always in log_file, so
+# capping loses nothing actionable.
+SUGGEST_LIST_CAP = 20
 
 # 6.9's suggestion layer. sender_addr is a HANDLE, matching history.py's column
 # classification -- it is the key `--senders` and rule predicates match on, so
@@ -631,6 +637,7 @@ SUGGEST_EVENT_HANDLES = {"message_id", "thread_root_id", "sender_addr"}
 _SUG = "suggestions"
 SUGGEST_TRUSTED = (
     {f"{_SUG}.log_file", f"{_SUG}.note"}
+    | untrusted.under(_SUG, {"counts", "by_action"})
     | untrusted.under(f"{_SUG}.suggested_events", SUGGEST_EVENT_TRUSTED)
     | untrusted.under(f"{_SUG}.needs_confirmation",
                       {"account", "folder", "reason", "folder_tier", "date_utc"})
@@ -951,6 +958,19 @@ def suggest_events(conn, report: dict, tier_maps: dict, account_emails: dict,
     for entry in report["moved"]:
         if absorbed_echo(entry):
             continue
+        src_tier = tier_of(entry["account"], entry["from_folder"])
+        # A message whose only home was All Mail was never in a triage tier, so
+        # it was never in front of the user in a session. Calling a label change
+        # on it a *decision* attributes to them what was almost certainly a
+        # server-side filter or a client's own cleanup -- and `decided_by=manual`
+        # is a factual claim that they acted. Route it for review instead.
+        if src_tier == "allmail":
+            needs_confirmation.append(ref(
+                entry, folder=entry["from_folder"], folder_tier=src_tier,
+                reason="label churn on an All-Mail-only message: never in a "
+                       "triage tier, so not a session decision (server-side "
+                       "filter or client cleanup) -- confirm before logging"))
+            continue
         tier = tier_of(entry["account"], entry["to_folder"])
         action = TIER_TO_ACTION.get(tier)
         if action is None:
@@ -997,22 +1017,30 @@ def suggest_events(conn, report: dict, tier_maps: dict, account_emails: dict,
         row["sender_addr"] = addr
         suggested.append(row)
 
+    expunged = 0
     for entry in report["deleted"]:
         if absorbed_echo(entry):
             continue
         tier = tier_of(entry["account"], entry["folder"])
+        if tier in ("trash", "junk"):
+            # COUNTED, never listed. Provider auto-purge (~30 days on both
+            # accounts) is a non-event: no log, no mention. Listing them as
+            # things to confirm turned 822 auto-purges into 822 questions in a
+            # live session -- the pre-6.9 prose rule had this right and the
+            # first mechanized version lost it.
+            expunged += 1
+            continue
         needs_confirmation.append(ref(
             entry, folder=entry["folder"], folder_tier=tier,
-            reason=("expunged from trash/junk -- cleanup, probably not a triage "
-                    "decision" if tier in ("trash", "junk") else
-                    f"file vanished from a {tier!r} folder without reappearing "
-                    "elsewhere -- confirm this was intended")))
+            reason=f"file vanished from a {tier!r} folder without reappearing "
+                   "elsewhere -- confirm this was intended"))
 
     return {
         "suggested_events": suggested,
         "needs_confirmation": needs_confirmation,
         "unresolved": unresolved,
         "self_echo_absorbed": absorbed,
+        "expunged_from_trash": expunged,
     }
 
 
@@ -1094,16 +1122,54 @@ def cmd_index(args: argparse.Namespace) -> None:
         # `$UNSUB exec --link N`.
         log_file = Path(args.data_dir) / "suggested-events.json"
         log_file.write_text(json.dumps(suggestions["suggested_events"], indent=2))
-        report["suggestions"] = suggestions | {
+
+        counts = {k: len(v) if isinstance(v, list) else v
+                  for k, v in suggestions.items()}
+        by_action: dict = {}
+        for row in suggestions["suggested_events"]:
+            by_action[row["final_action"]] = by_action.get(row["final_action"], 0) + 1
+
+        capped = {}
+        for key, value in suggestions.items():
+            if not isinstance(value, list):
+                continue
+            capped[key] = value[:SUGGEST_LIST_CAP]
+            if len(value) > SUGGEST_LIST_CAP:
+                capped[f"{key}_truncated"] = len(value) - SUGGEST_LIST_CAP
+
+        report["suggestions"] = capped | {
+            "counts": counts,
+            "by_action": by_action,
             "log_file": str(log_file),
-            "note": ("PROPOSALS, nothing was logged. Review these, then log the "
-                     "ones you accept with `$HIST log-events --file "
-                     f"{log_file}` -- pass the FILE, do not retype the rows "
-                     "(the copy shown here is entity-escaped for display). "
-                     "Edit the file to drop any you reject."),
+            "note": ("PROPOSALS, nothing was logged. `counts` is exact; lists "
+                     f"are capped at {SUGGEST_LIST_CAP} per bucket and the "
+                     "COMPLETE suggested_events set is in log_file. Log what "
+                     f"you accept with `$HIST log-events --file {log_file}` -- "
+                     "pass the FILE, never retype the rows: the copy here is "
+                     "entity-escaped for display, and that file is deliberately "
+                     "NOT escaped, so do not read it either. Edit it to drop "
+                     "any you reject. A large suggested_events count after a "
+                     "long gap is mailbox drift, not a session's worth of "
+                     "decisions -- confirm the volume with the user before "
+                     "logging it as theirs."),
         }
-        trusted = trusted | SUGGEST_TRUSTED
-        handles = handles | SUGGEST_HANDLES
+        # With --suggest-events the per-entry arrays are what the suggestions
+        # were DERIVED FROM, so shipping both doubles the payload for no gain --
+        # that redundancy is most of what made the first live run 772KB. Counts
+        # keep the scale visible; run without the flag to see raw entries.
+        report["change_counts"] = {kind: len(report.pop(kind))
+                                   for kind in CHANGE_REPORT_KINDS}
+        trusted = (trusted - change_report_trusted()) | SUGGEST_TRUSTED
+        handles = (handles - change_report_handles()) | SUGGEST_HANDLES
+    if not args.suggest_events:
+        # Running plain `index` consumes the deltas and discards the one chance
+        # to derive events from them -- the report is not replayable. Say so
+        # rather than letting a silent omission look like a clean run.
+        report["note"] = ("No --suggest-events: these deltas were consumed "
+                          "WITHOUT deriving proposed events, and a second index "
+                          "run will not show them again. Intentional only for "
+                          "diagnostics; the session flow passes "
+                          "--suggest-events --session <ts> on every index.")
     print(json.dumps(untrusted.apply_trust(report, trusted,
                                            handle_fields=handles),
                      indent=2, sort_keys=True))

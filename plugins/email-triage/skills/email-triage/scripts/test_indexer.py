@@ -785,18 +785,96 @@ class SuggestEventsTests(unittest.TestCase):
 
     # -- deletions --
 
-    def test_deleted_routes_by_tier_and_never_emits_an_event(self):
+    def test_trash_expunge_is_counted_never_listed(self):
+        """Regression, found in the first live run (2026-08-07): routing every
+        deletion to needs_confirmation turned hundreds of provider auto-purges
+        into one-by-one questions. The pre-6.9 prose rule called trash/junk
+        deletions non-events -- no log, no mention -- and the first mechanized
+        version lost that judgement."""
         self.put("INBOX", "kd", "md@x")
         self.put("Deleted Messages", "kt", "mt@x")
         self.run_index(suggest=False)
         for folder, key in (("INBOX", "kd"), ("Deleted Messages", "kt")):
             next((self.maildir_root / "icloud" / folder / "cur").glob(f"{key}*")).unlink()
         payload, _t = self.run_index()
-        self.assertEqual(payload["suggestions"]["suggested_events"], [])
-        by_tier = {e["folder_tier"]: e["reason"]
-                   for e in payload["suggestions"]["needs_confirmation"]}
-        self.assertIn("cleanup", by_tier["trash"])
-        self.assertIn("confirm this was intended", by_tier["untriaged"])
+        sug = payload["suggestions"]
+        self.assertEqual(sug["suggested_events"], [])
+        # The trash one is a COUNT ...
+        self.assertEqual(sug["counts"]["expunged_from_trash"], 1)
+        # ... and the untriaged one still asks.
+        tiers = [e["folder_tier"] for e in sug["needs_confirmation"]]
+        self.assertEqual(tiers, ["untriaged"])
+        self.assertIn("confirm this was intended",
+                      sug["needs_confirmation"][0]["reason"])
+
+    def test_all_mail_label_churn_is_not_a_decision(self):
+        """Also from the live run: All Mail -> Trash moves were proposed as
+        `decided_by=manual`, i.e. as the USER's decisions -- but many were the
+        Substack server-side filter. A message whose only home was All Mail was
+        never in a triage tier, so it was never in front of the user."""
+        for sub in ("cur", "new", "tmp"):
+            (self.maildir_root / "icloud" / "All Mail" / sub).mkdir(parents=True,
+                                                                    exist_ok=True)
+        cfg = self.config.read_text().replace(
+            "      junk: Junk\n", "      junk: Junk\n      all_mail: All Mail\n")
+        self.config.write_text(cfg)
+        self.put("All Mail", "kam", "mam@x")
+        self.run_index(suggest=False)
+        self.move_file("All Mail", "Deleted Messages", "kam")
+        payload, _t = self.run_index()
+        sug = payload["suggestions"]
+        self.assertEqual(sug["suggested_events"], [])
+        self.assertEqual(len(sug["needs_confirmation"]), 1)
+        self.assertIn("label churn", sug["needs_confirmation"][0]["reason"])
+        self.assertEqual(sug["needs_confirmation"][0]["folder_tier"], "allmail")
+
+    def test_real_tier_transitions_still_become_events(self):
+        # The all_mail guard must not swallow genuine triage moves.
+        self.put("INBOX", "kok", "mok@x")
+        self.run_index(suggest=False)
+        self.move_file("INBOX", "Archive", "kok")
+        payload, _t = self.run_index()
+        rows = payload["suggestions"]["suggested_events"]
+        self.assertEqual([r["final_action"] for r in rows], ["archive"])
+
+    def test_raw_arrays_collapse_to_counts_under_suggest_events(self):
+        """The 772KB problem: shipping the per-entry arrays AND the suggestions
+        derived from them doubles the payload for no gain."""
+        self.put("INBOX", "kc1", "mc1@x")
+        self.put("INBOX", "kc2", "mc2@x")
+        payload, _t = self.run_index()
+        for kind in indexer.CHANGE_REPORT_KINDS:
+            self.assertNotIn(kind, payload, f"{kind} should be a count, not a list")
+        self.assertEqual(payload["change_counts"]["new"], 2)
+        # And without the flag, raw entries are still available for debugging.
+        payload2, _t2 = self.run_index(suggest=False)
+        self.assertIn("new", payload2)
+        self.assertNotIn("change_counts", payload2)
+
+    def test_lists_are_capped_but_counts_are_exact(self):
+        # Zero-padded: `kk1*` would glob-collide with kk10..kk14.
+        for i in range(indexer.SUGGEST_LIST_CAP + 5):
+            self.put("INBOX", f"kk{i:03d}", f"mk{i}@x")
+        self.run_index(suggest=False)
+        for i in range(indexer.SUGGEST_LIST_CAP + 5):
+            self.move_file("INBOX", "Archive", f"kk{i:03d}")
+        payload, _t = self.run_index()
+        sug = payload["suggestions"]
+        total = indexer.SUGGEST_LIST_CAP + 5
+        self.assertEqual(sug["counts"]["suggested_events"], total)
+        self.assertEqual(len(sug["suggested_events"]), indexer.SUGGEST_LIST_CAP)
+        self.assertEqual(sug["suggested_events_truncated"], 5)
+        self.assertEqual(sug["by_action"], {"archive": total})
+        # Nothing is lost: the file holds the COMPLETE set.
+        on_disk = json.loads(Path(sug["log_file"]).read_text())
+        self.assertEqual(len(on_disk), total)
+
+    def test_plain_index_warns_that_derivation_was_skipped(self):
+        self.put("INBOX", "kw", "mw@x")
+        payload, _t = self.run_index(suggest=False)
+        self.assertIn("without deriving proposed events", payload["note"].lower())
+        payload2, _t2 = self.run_index()
+        self.assertNotIn("note", payload2)
 
     # -- self-echo --
 
