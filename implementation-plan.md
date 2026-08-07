@@ -2235,39 +2235,101 @@ fills.
 - [ ] **11.6 Body search — the piece that does not exist at all.** `index.db`
       holds **headers only** (`BytesHeaderParser`, deliberately "never the
       body"), so `--subject-contains` is the whole of full-text search today.
-      "Find the email where Raimund mentioned the sprinkler company" is currently
+      "Find the email where Raimund mentioned the sprinkler company" is
       unanswerable, and the user's ask — *"search everywhere for raimund"* —
       needs this.
 
       **Grepping the Maildir is the obvious move and it is wrong.** Measured over
       399 random live messages (2026-08-07): a raw grep for a word that genuinely
-      appears in the decoded body finds it in only **86%** of cases — it would
-      **silently miss ~14%**. Three structural causes: base64 parts are opaque
+      appears in the decoded body finds it in only **86%** of cases — it
+      **silently misses ~14%**. Three structural causes: base64 parts are opaque
       (36 of ~700 sampled text parts), quoted-printable soft line breaks split
       words mid-token, and HTML interleaves markup between letters. A search that
       reports "no such email" one time in seven is worse than no search, because
-      the answer is indistinguishable from the truth. Rule 6 bans the model
-      grepping Maildir files anyway; a *script* reading them and returning wrapped
-      results is the sanctioned shape.
+      the wrong answer is indistinguishable from the true one. Rule 6 bans the
+      model grepping Maildir files anyway; a *script* reading them and returning
+      wrapped results is the sanctioned shape.
 
-      **Do it as SQLite FTS5 over DECODED bodies, populated during indexing.**
-      FTS5 is built into SQLite, so §14's stdlib-only property survives. Reuse the
-      existing `extract_body`/`strip_html` pipeline — the same decode path
-      `$THR read` uses — so search sees exactly the text a read would show.
-      Populate incrementally on the (folder, maildir_key)-changed test the upsert
-      pass already performs, so steady-state cost stays near zero.
+      **Build it as CONTENTLESS SQLite FTS5 over decoded bodies** — `fts5(body,
+      content='', contentless_delete=1)` — populated during indexing. FTS5 is
+      built into SQLite, so §14's stdlib-only property survives. Reuse the
+      existing `extract_body`/`strip_html` pipeline so search sees exactly the
+      text a read would show.
+
+      *How it works, since the name misleads.* FTS5 keeps two things: a **term
+      dictionary** (every distinct token, normalised — lowercased,
+      punctuation-split, so `Raimund` and `raimund,` are one entry) and, per
+      term, a **posting list** of the rows containing it plus positions within
+      them. Matching consults only those; the stored copy of the original text
+      exists solely to serve `snippet()`/`highlight()`. `content=''` drops that
+      copy. Verified on 389 real messages: `sprinkler`, `unsubscribe`, the phrase
+      `"credit score"` and the prefix `deliver*` all return **identical hit sets**
+      contentless vs. text-storing, and `bm25()` ranking works (it scores from
+      index statistics, not from text).
+
+      *Measured on real mail (389 messages, 0.76 MB of body text):*
+
+      | | size |
+      |---|---|
+      | FTS storing the text | 1.45 MB |
+      | **FTS contentless** | **0.55 MB** |
+
+      Contentless is 2.6× smaller and smaller than the text it indexes — which is
+      the giveaway that it is not keeping it. Extrapolated to 16,744 messages:
+      roughly **24 MB vs 63 MB**, against a 12.1 MB index today. The 24 MB is a
+      linear estimate and should come in **under** it, because vocabulary grows
+      sub-linearly — doubling the corpus added only ~1.5× the terms (3,019 → 4,809
+      → 7,855 → 11,320 at 50/100/200/389 messages). Posting lists are what grow
+      linearly.
+
+      *The tradeoff, and why this is the right side.* Contentless cannot produce
+      snippets — `snippet()` fails, `SELECT body` returns NULL. Search returns
+      "these message-ids match", ranked, and you `$THR read` the ones you want.
+      That costs one extra call, and buys two things worth more: a snippet column
+      would be a **second door for sender-controlled prose** to reach the model,
+      needing its own escape/manifest path independent of `$THR read` — and Phase
+      6 spent most of its effort reducing the number of such doors and proving
+      each one wraps correctly. It would also create a **second at-rest copy** of
+      body text to keep consistent with the Maildir, weakening 6.5's "at rest it
+      is clean, the read path wraps".
+
+      *Prerequisite, load-bearing not incidental:* `contentless_delete=1` needs
+      **SQLite 3.43+** (this machine is on 3.53.3). Without it, deleting a row
+      from a contentless index requires re-supplying the original text — which by
+      construction we do not have. Mail is moved and expunged constantly, so
+      without that flag the index would drift permanently out of sync.
+
+      *Junk tokens — measured, decide rather than discover:* **1,178 of 11,320
+      terms (10%)** are long hex/base64-looking strings (`eyjbcmdzijp7iknvbw11…`)
+      — tracking tokens, click-IDs and CSS residue that a tokeniser cannot help
+      treating as words. They cost index size and nothing else: nobody searches
+      for them and they cannot collide with English, so they produce no false
+      hits. Options are a cheap filter (skip tokens >20 chars that are pure hex
+      or vowel-free) or simply paying the 10%. Measure the filter against the
+      complexity before adding it.
+
       **Accepted cost, stated rather than discovered:** a full rebuild goes from
-      ~25 s to minutes, because it must decode ~17k bodies instead of parsing
-      headers. `index.db` stays disposable, just slower to regenerate. Consider
-      FTS5 external-content mode to avoid storing a second copy of every body.
+      ~25 s to minutes, because it must decode 16,744 bodies instead of parsing
+      headers. `index.db` stays disposable, just no longer *casually*
+      regenerable — re-read §9's "if the index is ever rebuilt from scratch" note
+      with that in mind.
 
       **Then one operation over all three stores:** `$SEARCH <term>` returning
-      envelope hits (subject/from/to), body hits with escaped snippets, and
+      envelope hits (subject/from/to), body hits as ranked message-ids, and
       `history.db` hits (notes, rules, contacts) — each with the id or key needed
-      to go read the thing. Snippets are sender prose: escaped, manifested, and
-      named in `_trust.untrusted_fields` like any other body-derived text. One
-      rule-6 note for the SKILL: a search term the USER supplies is fine; a term
-      lifted out of an email is email content choosing what runs, and is not.
+      to go read the thing. One rule-6 note for the SKILL: a search term the USER
+      supplies is fine; a term lifted out of an email is email content choosing
+      what runs, and is not.
+- [ ] **11.7 `strip_html` leaks URL parameters and CSS residue into body text**
+      (found while measuring 11.6, 2026-08-07). The 10% junk vocabulary above is
+      not a search problem — it is evidence that extracted body text contains
+      tracking tokens, click-ID query strings and style artefacts that survived
+      HTML stripping. That degrades **every** body read, not just search: it is
+      noise in the text used for classification, for `injection_signals`
+      matching, and for anything the model reads. Worth fixing upstream in
+      `_HTMLTextExtractor` rather than filtering downstream in the index —
+      one fix, every consumer benefits. Quantify first (what fraction of a
+      typical extracted body is this?), then decide.
 
 **Exit criteria (Phase 11).**
 1. Every suite green, including `index.db`'s column-classification test and the
@@ -2285,6 +2347,12 @@ fills.
    **base64** part, and another inside a **quoted-printable soft-wrapped word** —
    the two cases that make grep silently wrong. Verified against real mail, not a
    fixture, since that is where the 14% figure came from.
+6. Contentless FTS returns the **same hit set** as a text-storing FTS for a
+   single term, a phrase and a prefix query — asserted in tests, because the
+   whole design rests on matching never needing the stored text.
+7. A message deleted from the Maildir disappears from search results without the
+   indexer having to re-supply its body (i.e. `contentless_delete` is actually
+   working, not silently leaving orphaned postings).
 
 **Also landed 2026-08-07 (small, out of phase order):** `$HIST set-unsubscribed
 --session --senders`. SKILL step 5 assumes unsubscribe confirmation precedes
