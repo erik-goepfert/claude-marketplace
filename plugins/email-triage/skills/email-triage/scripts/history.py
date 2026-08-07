@@ -179,6 +179,43 @@ def cmd_log_note(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     print("note logged")
 
 
+def cmd_set_unsubscribed(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Record a manual unsubscribe confirmed AFTER its event was logged.
+
+    SKILL step 5 assumes confirmation precedes logging, which holds for the
+    automated path -- an RFC 8058 2xx IS the confirmation, so `unsubscribed` can
+    be set at log time. Manual links break that assumption: the user clicks them
+    later, sometimes after the session has closed. Without a way to amend,
+    `events.unsubscribed` permanently understates reality and every unsubscribe
+    rate derived from it is wrong (added 2026-08-07, after exactly that).
+
+    Deliberately narrow. It sets ONE boolean column, scoped to one session and an
+    explicit sender list, and reports how many rows changed. It is not a general
+    UPDATE surface -- `query` is read-only precisely so that arbitrary mutation
+    of an irreplaceable DB is never one typo away."""
+    addrs = [a.strip().lower() for a in args.senders.split(",") if a.strip()]
+    if not addrs:
+        sys.exit("error: --senders is empty")
+    placeholders = ",".join("?" * len(addrs))
+    cur = conn.execute(
+        f"UPDATE events SET unsubscribed = 1 WHERE session_started_at = ? "
+        f"AND sender_addr IN ({placeholders}) AND unsubscribed = 0",
+        (args.session, *addrs))
+    conn.commit()
+    matched = conn.execute(
+        f"SELECT sender_addr, COUNT(*) AS n FROM events "
+        f"WHERE session_started_at = ? AND sender_addr IN ({placeholders}) "
+        f"GROUP BY sender_addr",
+        (args.session, *addrs)).fetchall()
+    print(json.dumps(untrusted.apply_trust(
+        {"updated": cur.rowcount,
+         "per_sender": [{"sender_addr": r["sender_addr"], "events": r["n"]}
+                        for r in matched]},
+        {"updated"} | untrusted.under("per_sender", {"events"}),
+        handle_fields=untrusted.under("per_sender", {"sender_addr"})),
+        indent=2, sort_keys=True))
+
+
 def cmd_add_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     """Rules are history turned into behavior (§9). Since 5.5 the action
     vocabulary is wider than the event enum: alongside plain actions
@@ -588,6 +625,16 @@ def main() -> None:
     cx.add_argument("--all-senders", action="store_true", dest="all_senders",
                     help="restore the old behaviour: dump every sender_stats row. "
                          "~35KB on a real history; prefer --senders or `query`.")
+
+    su = sub.add_parser(
+        "set-unsubscribed",
+        help="mark already-logged events as unsubscribed, for a MANUAL link the "
+             "user confirmed clicking after the fact")
+    su.add_argument("--session", required=True,
+                    help="session_started_at the events were logged under")
+    su.add_argument("--senders", required=True,
+                    help="comma-separated sender addresses to amend")
+    su.set_defaults(func=cmd_set_unsubscribed)
 
     q = sub.add_parser(
         "query",

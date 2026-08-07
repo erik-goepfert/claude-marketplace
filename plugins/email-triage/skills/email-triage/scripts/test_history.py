@@ -185,6 +185,68 @@ class HistoryCliTests(unittest.TestCase):
         self.assertEqual(c["notes"], "prefers calls")
 
 
+class SetUnsubscribedTests(unittest.TestCase):
+    """Amending `unsubscribed` after the fact. Needed because SKILL step 5
+    assumes confirmation precedes logging -- true for the automated one-click
+    path (a 2xx IS the confirmation), false for manual links the user clicks
+    later, sometimes after the session closed."""
+
+    SESSION = "2026-08-07T00:00:00Z"
+    OTHER = "2026-07-01T00:00:00Z"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="email-triage-unsub-test-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)]))
+        self.run_ok(str(SCRIPTS / "init_history_db.py"), "--data-dir", str(self.tmp))
+        for session, addr in ((self.SESSION, "a@x.example"),
+                              (self.SESSION, "a@x.example"),
+                              (self.SESSION, "b@x.example"),
+                              (self.OTHER,   "a@x.example")):
+            self.hist("log-event", "--session", session, "--sender", addr,
+                      "--proposed", "trash", "--final", "trash",
+                      "--decided-by", "approved")
+
+    run_ok = HistoryCliTests.run_ok
+    hist = HistoryCliTests.hist
+
+    def flags(self):
+        conn = sqlite3.connect(self.tmp / "history.db")
+        try:
+            return conn.execute(
+                "SELECT session_started_at, sender_addr, unsubscribed "
+                "FROM events ORDER BY id").fetchall()
+        finally:
+            conn.close()
+
+    def test_amends_only_the_named_session_and_senders(self):
+        out = json.loads(self.hist("set-unsubscribed", "--session", self.SESSION,
+                                   "--senders", "a@x.example"))
+        self.assertEqual(out["updated"], 2)
+        rows = self.flags()
+        # this session's a@ -> set; this session's b@ -> untouched;
+        # the OTHER session's a@ -> untouched.
+        self.assertEqual([r[2] for r in rows], [1, 1, 0, 0])
+
+    def test_is_idempotent(self):
+        self.hist("set-unsubscribed", "--session", self.SESSION,
+                  "--senders", "a@x.example")
+        out = json.loads(self.hist("set-unsubscribed", "--session", self.SESSION,
+                                   "--senders", "a@x.example"))
+        self.assertEqual(out["updated"], 0)   # already 1, nothing left to change
+
+    def test_addresses_are_lowercased_to_match_stored_form(self):
+        out = json.loads(self.hist("set-unsubscribed", "--session", self.SESSION,
+                                   "--senders", "A@X.Example"))
+        self.assertEqual(out["updated"], 2)
+
+    def test_unknown_sender_changes_nothing(self):
+        out = json.loads(self.hist("set-unsubscribed", "--session", self.SESSION,
+                                   "--senders", "nobody@x.example"))
+        self.assertEqual(out["updated"], 0)
+        self.assertEqual(out["per_sender"], [])
+        self.assertEqual([r[2] for r in self.flags()], [0, 0, 0, 0])
+
+
 class QuerySurfaceTests(unittest.TestCase):
     """`$HIST query`: read-only SQL. Enforcement is SQLite's -- there is NO SQL
     parsing, deliberately, so these tests ARE the security boundary."""
