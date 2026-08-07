@@ -2232,6 +2232,43 @@ fills.
       corpus exists: 19 sent messages to Raimund, 5 to Pete, 351 to Bonnie, and
       2,973 of 2,974 sent messages carry a usable `to_addr`.
 
+- [ ] **11.6 Body search — the piece that does not exist at all.** `index.db`
+      holds **headers only** (`BytesHeaderParser`, deliberately "never the
+      body"), so `--subject-contains` is the whole of full-text search today.
+      "Find the email where Raimund mentioned the sprinkler company" is currently
+      unanswerable, and the user's ask — *"search everywhere for raimund"* —
+      needs this.
+
+      **Grepping the Maildir is the obvious move and it is wrong.** Measured over
+      399 random live messages (2026-08-07): a raw grep for a word that genuinely
+      appears in the decoded body finds it in only **86%** of cases — it would
+      **silently miss ~14%**. Three structural causes: base64 parts are opaque
+      (36 of ~700 sampled text parts), quoted-printable soft line breaks split
+      words mid-token, and HTML interleaves markup between letters. A search that
+      reports "no such email" one time in seven is worse than no search, because
+      the answer is indistinguishable from the truth. Rule 6 bans the model
+      grepping Maildir files anyway; a *script* reading them and returning wrapped
+      results is the sanctioned shape.
+
+      **Do it as SQLite FTS5 over DECODED bodies, populated during indexing.**
+      FTS5 is built into SQLite, so §14's stdlib-only property survives. Reuse the
+      existing `extract_body`/`strip_html` pipeline — the same decode path
+      `$THR read` uses — so search sees exactly the text a read would show.
+      Populate incrementally on the (folder, maildir_key)-changed test the upsert
+      pass already performs, so steady-state cost stays near zero.
+      **Accepted cost, stated rather than discovered:** a full rebuild goes from
+      ~25 s to minutes, because it must decode ~17k bodies instead of parsing
+      headers. `index.db` stays disposable, just slower to regenerate. Consider
+      FTS5 external-content mode to avoid storing a second copy of every body.
+
+      **Then one operation over all three stores:** `$SEARCH <term>` returning
+      envelope hits (subject/from/to), body hits with escaped snippets, and
+      `history.db` hits (notes, rules, contacts) — each with the id or key needed
+      to go read the thing. Snippets are sender prose: escaped, manifested, and
+      named in `_trust.untrusted_fields` like any other body-derived text. One
+      rule-6 note for the SKILL: a search term the USER supplies is fine; a term
+      lifted out of an email is email content choosing what runs, and is not.
+
 **Exit criteria (Phase 11).**
 1. Every suite green, including `index.db`'s column-classification test and the
    quote-isolation fixtures for all six shapes above.
@@ -2244,3 +2281,17 @@ fills.
 4. One real draft authored end to end — voice pulled from prior sent mail,
    composed, saved, edited, sent — with no step improvised outside the
    documented flow. That is the criterion the Raimund message failed.
+5. Body search finds a message whose only occurrence of the term is inside a
+   **base64** part, and another inside a **quoted-printable soft-wrapped word** —
+   the two cases that make grep silently wrong. Verified against real mail, not a
+   fixture, since that is where the 14% figure came from.
+
+**Also landed 2026-08-07 (small, out of phase order):** `$HIST set-unsubscribed
+--session --senders`. SKILL step 5 assumes unsubscribe confirmation precedes
+logging — true for the automated path (an RFC 8058 2xx *is* the confirmation),
+false for manual links the user clicks later, as happened with three senders this
+session AFTER it had closed. Without an amend path `events.unsubscribed`
+permanently understates reality and every rate derived from it is wrong.
+Deliberately narrow: one boolean, scoped to a session and an explicit sender
+list, idempotent, reporting rows changed. `query` stays read-only so arbitrary
+mutation of an irreplaceable DB is never one typo away.
