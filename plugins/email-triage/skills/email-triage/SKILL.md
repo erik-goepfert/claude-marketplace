@@ -623,11 +623,11 @@ conventions, both learned from sent mail:
   vanish on decode, so a long paragraph travels fine as one line.
 - **The user's voice, not yours.** Match their register — greeting, sign-off,
   sentence length, how much warmth — and default to shorter than feels
-  complete. The evidence is up to ~10 of the user's own **sent** messages to
-  this recipient; finding those needs recipient-side search, which does not
-  exist yet (Phase 11.1). Until it does, `$THR list --sender <addr>` gets you
-  the other half — how *they* write to the user — which is weaker evidence but
-  better than inventing a tone.
+  complete. The best evidence is up to ~10 of the user's own **sent** messages
+  to this recipient. Note that `$THR list --sender <addr>` matches the
+  *sender*, so it finds that person's mail TO the user, not the user's to them:
+  useful, but second-best evidence. Say which one you used when you show the
+  draft, so the user can weigh the tone against how it was chosen.
 
 **Flags and replies are not moves, so they run the same unit by hand:**
 act (`-local` himalaya for flags, IMAP himalaya for replies) → log the

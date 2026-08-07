@@ -2259,6 +2259,33 @@ documents whatever actually landed.
       corpus exists: 19 sent messages to Raimund, 5 to Pete, 351 to Bonnie, and
       2,973 of 2,974 sent messages carry a usable `to_addr`.
 
+      **Also in 11.5: strip development references out of the shipped files.**
+      Raised 2026-08-07 — "after we finish initial development I wouldn't expect
+      the skill to reference a development doc." Verified: the installed plugin
+      contains only `plugin.json`, `SKILL.md`, `reference.md` and `scripts/`, so
+      **every** path reference to a repo doc dangles for anyone who installs it.
+      Two different faults, and they want different fixes:
+      - **Dangling paths** (`SKILL.md:15` and `:91` → `email-skill-design.md`,
+        `email-folder-taxonomy.md`; `reference.md:51` →
+        `implementation-plan.md`). Either state that these live in the source
+        repo and are not installed, or drop the pointer and inline the one
+        sentence of rationale that made it worth citing. Do not leave a bare
+        filename that resolves to nothing.
+      - **Phase-number provenance** (`reference.md:8` "Phase 6.8",
+        `reference.md:227` "Phase 6.2", `SKILL.md:92` and `:214` "Phase 10's
+        TUI"). A phase number means nothing to a reader without the plan.
+        **Keep the date, drop the number** — dates never dangle and carry the
+        same "this was decided, not assumed" weight. For the Phase 10 ones,
+        describe the condition instead of the phase: the frontend rules exist
+        because this is a chat harness, and they go away under a real UI,
+        which is sayable without a roadmap reference.
+      The already-fixed instance is the pattern to follow: the voice bullet said
+      recipient search "does not exist yet (Phase 11.1)", which was both a
+      dangling citation and a **transient claim that would silently become
+      false**. Rewritten to describe what `--sender` actually does — a permanent
+      property of the flag — so it stays true whether or not 11.1 ever lands.
+      Runtime docs describe present capability; roadmaps belong in the plan.
+
 - [ ] **11.6 Body search — the piece that does not exist at all.**
       **Do 11.8 first** — this indexes extracted body text, and changing the
       extractor afterwards means rebuilding every posting from scratch.
