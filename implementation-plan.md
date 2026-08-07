@@ -2118,3 +2118,129 @@ Tasks (draft — firm up after Phase 9):
       (`email-triage-session`, `email-triage-batch`, ...) installed via
       `uv tool install`/pipx — unique names, versioned installs, callable
       from any shell. The skill keeps its `$VAR` convention regardless.
+
+---
+
+## Phase 11 — Draft authoring: search primitives, quote isolation, draft mutation (added 2026-08-07, from the first two live sessions)
+
+Four gaps surfaced in one sitting, and they are the same gap wearing four hats:
+**the skill can read and file mail well, and can barely author it.**
+
+1. **No message-level search.** `$THR list` is thread-oriented, so `--sender`
+   matches "any member's `from_addr`" — which accidentally works for people who
+   have written to you and fails completely for a first-time recipient. There is
+   no way to ask "the last 5 emails I sent to X."
+2. **No way to isolate one message's own words.** Every reply carries a copy of
+   what it answers. Reading Pete's message meant reading his quote of nothing;
+   reading a sent message means reading the recipient's prose back.
+3. **No edit-draft path.** Fixing three typos in a real draft took export →
+   decode QP → patch → re-encode → save → flag → verify → sync, entirely
+   off the documented rails, through the three worst foot-guns in the stack.
+4. **No compose-new flow.** The SKILL documents Reply only; the Raimund message
+   was a hand-built RFC822 sent through the reply flow's last step.
+
+**Rejected: a `$THR voice` operation** (proposed and withdrawn same day). Tone
+matching is a judgement, and this project has now three times chosen to put
+judgement in the SKILL and primitives in the scripts — time-sensitivity in the
+priority scan, injection *labels* rather than a keyword verdict, and now this.
+With 11.1 and 11.2 in place, "match the recipient's register" is a SKILL
+paragraph, not a tool, and it can be argued with instead of tuned.
+
+**SEQUENCING — read before starting 11.4.** Phase 8 replaces `himalaya template
+send` with stdlib `smtplib`. Building compose-new on himalaya first means
+building it twice. 11.1–11.3 are independent of Phase 8 and can start now; 11.4
+should either follow Phase 8 or be built against a send seam that Phase 8 then
+fills.
+
+- [ ] **11.1 `$IDX query` — read-only SQL over `index.db`.** The same hardened
+      surface `$HIST query` already provides, pointed at `envelopes`: recipient
+      search, sender search, subject, date ranges, folder, flags, and
+      combinations, with no new flags to invent. Reuse the four verified layers
+      (`mode=ro`, `PRAGMA query_only`, `setlimit(SQLITE_LIMIT_ATTACHED, 0)`,
+      progress-handler interrupt), the row cap with visible truncation, and the
+      no-SQL-parsing decision — factor them out of `history.py` rather than
+      copying, since a second copy of a security boundary is a second thing to
+      get wrong. Register a `REGEXP` function (`create_function`); Python's
+      `sqlite3` has no regex operator, and the user asked for pattern matching.
+      **Load-bearing sub-task: `index.db` has NO per-column trust map.** Phase
+      6.5 built one for `history.db` and stopped there. Adding it is most of the
+      work and is worth doing whether or not search ships: `subject`/`from_addr`/
+      `to_addr` untrusted prose; `message_id`/`in_reply_to`/`references_chain`
+      handles; `folder`/`maildir_key`/`maildir_file`/`date_utc`/`flags`/
+      `account`/`indexed_at`/`folder_tier` trusted. Same
+      `UNTRUSTED_COLUMNS`-classified-deliberately test so a new column fails the
+      suite rather than drifting.
+- [ ] **11.2 `$THR read --no-quotes` — isolate one message's own words.**
+      **The question this task exists to answer: can chain quotes be told apart
+      from quotes the author deliberately included as content?** Yes, in three
+      tiers of decreasing confidence, and the polarity matters more than the
+      mechanism:
+      1. **Verified chain (strip).** The quoted text matches the body of an
+         indexed **ancestor** of this message. This is not a heuristic — it is a
+         comparison against ground truth, and it is available only because we
+         hold the thread locally, which is a genuine advantage over any mail
+         client. Match against ALL ancestors, not just the `In-Reply-To` parent:
+         people quote earlier messages in a thread, not only the last one.
+      2. **Structurally marked (strip, and say so).** An attribution line
+         immediately above (`On <date>, X wrote:`; Outlook's
+         `-----Original Message-----`; `Begin forwarded message:`) or a
+         client-specific container (`<blockquote type="cite">` for Apple Mail,
+         `div.gmail_quote`/`blockquote.gmail_quote` for Gmail). Reliable per
+         client, and the **forward** case needs this tier because a forwarded
+         chain is not an ancestor — the live `Fwd: Package` message carried a
+         Becky Corbin → Melanie Chavez chain that appears nowhere in the thread.
+      3. **Unattributed quote (KEEP).** `>` lines or a bare `<blockquote>` with
+         no attribution and no ancestor match. Treat as the author's content:
+         losing a deliberate quotation is worse than leaving a stray one, and
+         that is the same failure-direction reasoning used for pass-3 surfacing
+         and for over-wrapping in the trust allowlists.
+      **Report, never silently transform** — emit `quoted_removed: [{basis:
+      "matched-ancestor"|"attribution-line"|"client-container", chars: N}]`, the
+      same way `injection_signals` and `hidden_text_reasons` report. The full
+      body stays available without the flag; a "show me less" mode must never
+      become the only way to read something.
+      Known case to decide explicitly: **interleaved point-by-point replies**
+      leave the author's text as fragments. Keep them in order and label the
+      elisions, so gaps read as removed quotes rather than truncation.
+      Tests want real fixtures: Apple Mail QP+HTML, Gmail, Outlook, a forward,
+      an interleaved reply, and a message quoting an article (tier 3, must
+      survive).
+- [ ] **11.3 `$THR edit-draft` — guarded draft mutation.** Encapsulate the eight
+      manual steps: resolve the draft, export raw, apply caller-supplied
+      replacements to the DECODED part (QP/base64 handled), **assert each
+      matches exactly once** so a partial fix can never be saved, re-encode,
+      save, flag `\Draft`+`\Seen`, verify by reading the new draft back, and
+      report the new `message_id`. Mints a fresh Message-ID (a re-saved draft is
+      a new message) and **leaves the predecessor in place** — trashing it is a
+      rule-1 move and belongs to the caller, which also means the safe half can
+      never destroy the good copy. That ordering is not a detail; it is what made
+      the manual attempt acceptable to run at all.
+- [ ] **11.4 Compose-new flow.** Document and mechanize what is currently
+      improvised: build an RFC822 from scratch (To/Cc/Subject/Date/Message-ID,
+      LF endings, UTF-8), then either save to drafts or send. **See the
+      sequencing note above — the send half belongs after Phase 8.** The
+      save-to-drafts half is independent and can land with 11.3.
+- [ ] **11.5 SKILL + reference alignment.** The Acting section gains compose-new
+      beside Reply. Thread assembly documents `$IDX query` as the message-level
+      search surface and says plainly that `$THR list` is thread-level. And the
+      voice paragraph, which is the whole point of 11.1+11.2 existing:
+      *before drafting to a recipient, pull their last ≤5 messages FROM YOU
+      (`$IDX query`, `folder_tier='sent'`, by `to_addr`, newest first), read them
+      `--no-quotes`, and match greeting form, sign-off, length, and
+      contraction/exclamation habits. No history → say so and use
+      neutral-professional rather than inventing a register.* Data confirms the
+      corpus exists: 19 sent messages to Raimund, 5 to Pete, 351 to Bonnie, and
+      2,973 of 2,974 sent messages carry a usable `to_addr`.
+
+**Exit criteria (Phase 11).**
+1. Every suite green, including `index.db`'s column-classification test and the
+   quote-isolation fixtures for all six shapes above.
+2. `$IDX query` refuses writes, `ATTACH`, stacked statements and runaway
+   queries — probed directly, as `$HIST query`'s tests do, because the tests
+   ARE the boundary when there is no SQL parsing.
+3. A tier-3 quote (author quoting an article) **survives** `--no-quotes`, and a
+   forwarded chain does not. The first is the one that matters: it is the
+   failure that silently deletes the user's own words.
+4. One real draft authored end to end — voice pulled from prior sent mail,
+   composed, saved, edited, sent — with no step improvised outside the
+   documented flow. That is the criterion the Raimund message failed.
