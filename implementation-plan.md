@@ -2344,6 +2344,78 @@ fills.
       filter at index time (drop tokens matching hex/base64 shapes with no
       vowel, ≥18 chars). Do it for index size, never for read quality.
 
+- [ ] **11.8 `_HTMLTextExtractor`: restore structure, never emit markup**
+      (measured 2026-08-07, from the question "is there an html-to-markdown
+      utility and would it be useful?"). Today's extractor is a tag-stripper:
+      it breaks lines at nine block tags and discards everything else. Scope it
+      honestly first — `extract_body` prefers `text/plain`, and over 800 real
+      messages the split is **86.1% text/plain vs 13.1% `strip_html`** (76% ship
+      both; 13.1% are HTML-only). So this is a quality fix on roughly 2,200 of
+      16,744 messages plus every `--html-text`/`--force-html` read, not a
+      core-path rewrite. Defect rates over the 300-message HTML-only subset:
+      `<td>` 66.7%, `<a>` 76.3%, `<img>` 65.7%, `<pre>` 10.3%, `<li>` 8.7%,
+      `<blockquote>` 7.0%; **cell-fusion shapes in 27.7% of outputs**, ~10 link
+      targets dropped per message, ~27 chars of `alt` text dropped per message.
+      Observed live: `Subtotal$41.20`, `DueAug 12Amount$90`, and a payment button
+      rendering as bare `Pay now`.
+
+      **Decision (a): no third-party converter.** html2text, markdownify, pandoc
+      and `lynx -dump` all exist and none is installed; every import in every
+      script is stdlib or ours. But the dependency policy is not the blocking
+      reason — **6.4's hidden-text detection lives inside this parser.** A
+      general converter has no concept of CSS-hidden text and would render a
+      `display:none` injection div as ordinary visible prose, destroying
+      `hidden_text_suspicious` (0 of 583 real messages, the signal 6.7 keys off
+      precisely because `present` fires on 82%). Any converter adopted later must
+      reproduce that first, or the trade is a net security loss dressed as a
+      formatting win.
+
+      **Decision (b): structure yes, markdown syntax no.** `untrusted.escape()`
+      entity-escapes `<>&` so a sender cannot fake markup; emitting markdown
+      would hand back the capability through a side door. `[text](url)` is
+      *literally* a display/target mismatch primitive — the phishing shape — so
+      generating it from sender-controlled input builds a masking tool and aims
+      it at the model. Emit plain text with structure, no inline syntax.
+
+      Work, cheapest and highest-yield first:
+      1. **`td`/`th` → single-space separator, not a newline** (a table row is one
+         logical line; `tr` already breaks). Fixes the 27.7%.
+      2. **`img` `alt` → inline text**, only when non-empty — `alt=""` is
+         decorative by spec, which is exactly what spacer gifs carry. Sender
+         text, so it escapes like any other.
+      3. **`li` → `- ` marker**; skip `ol` numbering, not worth the state.
+      4. **`pre` → suspend whitespace collapsing.** Note the collapse happens in
+         `text()`, globally, so this needs protected spans rather than a flag.
+      5. **`blockquote` → a marker.** **Sequencing: 11.2's tier-2
+         client-container detection needs this**, so 11.8 lands before or with
+         11.2. (7.0% here — the small case; plain-text `>` is 11.2's main work.)
+      6. `h1`–`h6` levels: ~5%, optional, do last or not at all.
+      7. **`a href` → a separate `links: [{n, url}]` field, NOT appended to the
+         body text.** Anchor text stays inline where it was; the target goes in
+         its own field, deduped, capped ~20 with a truncation count (the
+         `--suggest-events` volume lesson). **Separate field, not an appended
+         reference list, and the reason is injection:** a list rendered *into*
+         the body puts our framing inside sender-controlled text, where a sender
+         can forge extra `[4] https://...` entries that read as ours. A JSON
+         field cannot be forged from inside the body, and it lets the trust
+         manifest classify `links[].url` as a **handle** — unescaped so it stays
+         usable as a key, and still never fetched (rules 4 and 6 unchanged).
+
+      **New capability this unlocks, worth its own follow-up:** a display/target
+      mismatch check. Anchor text naming one domain while `href` points at
+      another is the classic phishing tell and today it is *invisible to us*,
+      because `href` is discarded before anything can look at it. Report it
+      alongside `injection_signals`; never let it block a read.
+
+      Tests: the ten synthetic shapes probed 2026-08-07 (receipt table,
+      definition list, nested cells, list, headings, blockquote, `pre`, `img
+      alt`, button link, plain link) as fixtures, **plus a regression asserting
+      `hidden_text_suspicious` still fires afterwards** — the structural work
+      must not weaken 6.4, and that is the one way this item could do real harm.
+      Then re-run 6.4's word-retention measurement (median 0.99) to confirm no
+      legitimate content was lost; separators can only add characters, so `pre`
+      handling and `alt` inclusion are the only places output can regress.
+
 **Exit criteria (Phase 11).**
 1. Every suite green, including `index.db`'s column-classification test and the
    quote-isolation fixtures for all six shapes above.
@@ -2366,6 +2438,10 @@ fills.
 7. A message deleted from the Maildir disappears from search results without the
    indexer having to re-supply its body (i.e. `contentless_delete` is actually
    working, not silently leaving orphaned postings).
+8. A receipt table extracts with its cells separated (`Subtotal $41.20`, not
+   `Subtotal$41.20`), and `hidden_text_suspicious` still fires on the 6.4
+   fixtures afterwards. The second half is the real criterion: 11.8 touches the
+   parser that carries the injection signal.
 
 **Also landed 2026-08-07 (small, out of phase order):** `$HIST set-unsubscribed
 --session --senders`. SKILL step 5 assumes unsubscribe confirmation precedes
