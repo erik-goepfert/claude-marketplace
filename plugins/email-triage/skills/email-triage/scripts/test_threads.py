@@ -751,8 +751,13 @@ def put_maildir_file(root, folder, name, raw_bytes: bytes) -> str:
     return path
 
 
-class ReadCommandTests(unittest.TestCase):
-    """Tests for the `read` subcommand (Phase 5.1 / review §4). Own setUp
+class ReadFixture(unittest.TestCase):
+    """Maildir + index.db fixture for the `read` subcommand. Defines NO tests of
+    its own: subclassing a TestCase that has tests re-runs every one of them
+    under the subclass's name, which inflates the suite and reports each failure
+    twice. Fixture-only base, tests in the subclasses.
+
+    Own setUp
     (rather than reusing ThreadsTestCase's) because these need a real
     Maildir tree on disk in addition to index.db -- same shape as
     test_act.py's fixtures, matching how `read` actually resolves a
@@ -789,6 +794,10 @@ class ReadCommandTests(unittest.TestCase):
             threads.cmd_read(args)
         payload, self.trust = unwrap_trust(buf.getvalue())
         return payload
+
+
+class ReadCommandTests(ReadFixture):
+    """Tests for the `read` subcommand (Phase 5.1 / review §4)."""
 
     def test_read_default_returns_text_plain_body(self):
         msg = EmailMessage()
@@ -1388,6 +1397,88 @@ class HtmlStructureTests(unittest.TestCase):
         for word in ("Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta",
                      "Eta", "Theta"):
             self.assertIn(word, text)
+
+
+class ReadLinksTests(ReadFixture):
+    """Phase 11.8 — link targets as their own field.
+
+    Inherits ReadCommandTests' Maildir fixture: these assert on the shape and
+    trust classification of the payload, so they must go through cmd_read."""
+
+    def html_message(self, message_id, html, key="lk"):
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "me@example.com"
+        msg["Subject"] = "Links"
+        msg["Date"] = "Mon, 1 Jan 2026 00:00:00 +0000"
+        msg["Message-ID"] = message_id
+        msg.set_content(html, subtype="html")
+        put_maildir_file(self.maildir_root, "INBOX", f"{key}:2,", msg.as_bytes())
+        self.index_row("INBOX", key, message_id, f"{key}:2,")
+        return self.run_read(message_id)
+
+    def test_links_are_numbered_and_the_body_keeps_only_anchor_text(self):
+        out = self.html_message(
+            "<lk1@x>", '<p>Order shipped. '
+            '<a href="https://ex.com/track?id=99&z=1">Track it</a></p>')
+        self.assertEqual(out["links"], [
+            {"n": 1, "url": "https://ex.com/track?id=99&z=1"}])
+        self.assertIn("Track it", out["body"])
+        self.assertNotIn("ex.com", out["body"])
+        self.assertEqual(out["links_truncated"], 0)
+
+    def test_link_url_is_a_handle_so_it_survives_unescaped(self):
+        """A URL that came back entity-escaped would no longer resolve, which is
+        the whole reason handles exist. Being readable is not being trusted --
+        rules 4 and 6 still forbid fetching it."""
+        out = self.html_message(
+            "<lk2@x>", '<a href="https://ex.com/a?b=1&c=%3C2">go</a>')
+        self.assertEqual(out["links"][0]["url"], "https://ex.com/a?b=1&c=%3C2")
+        self.assertIn("links.url", self.trust["untrusted_fields"])
+
+    def test_links_are_capped_and_the_overflow_is_counted(self):
+        html = "".join(f'<a href="https://ex.com/{i}">L{i}</a>' for i in range(30))
+        out = self.html_message("<lk3@x>", html)
+        self.assertEqual(len(out["links"]), threads.LINK_CAP)
+        self.assertEqual(out["links_truncated"], 30 - threads.LINK_CAP)
+        self.assertEqual([l["n"] for l in out["links"]],
+                         list(range(1, threads.LINK_CAP + 1)))
+
+    def test_text_plain_read_has_no_link_list(self):
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["Subject"] = "Plain"
+        msg["Date"] = "Mon, 1 Jan 2026 00:00:00 +0000"
+        msg["Message-ID"] = "<lk4@x>"
+        msg.set_content("See https://ex.com/inline for details.\n")
+        put_maildir_file(self.maildir_root, "INBOX", "lk4:2,", msg.as_bytes())
+        self.index_row("INBOX", "lk4", "<lk4@x>", "lk4:2,")
+        out = self.run_read("<lk4@x>")
+        self.assertEqual(out["source_part"], "text/plain")
+        self.assertEqual(out["links"], [])
+        # The URL is still readable -- it was already inline in the body.
+        self.assertIn("https://ex.com/inline", out["body"])
+
+    def test_headers_only_read_has_no_link_list(self):
+        out = self.html_message("<lk5@x>", '<a href="https://ex.com/x">x</a>')
+        msg_out = self.run_read("<lk5@x>", extra_args=("--headers-only",))
+        self.assertEqual(msg_out["links"], [])
+        self.assertEqual(msg_out["links_truncated"], 0)
+        self.assertEqual(out["links"][0]["n"], 1)
+
+    def test_every_string_in_the_payload_is_classified(self):
+        """Default-deny check, same form as act.py's: a new field that nobody
+        classified must show up as untrusted rather than slip through as
+        trusted-by-omission."""
+        out = self.html_message(
+            "<lk6@x>", '<p>hi <a href="https://ex.com/q">q</a></p>')
+        paths = untrusted.string_paths(out)
+        undeclared = (paths
+                      - {p for p in paths if p.startswith("_trust")}
+                      - set(threads.READ_TRUSTED)
+                      - set(threads.READ_ENVELOPES)
+                      - set(self.trust["untrusted_fields"]))
+        self.assertEqual(undeclared, set())
 
 
 if __name__ == "__main__":

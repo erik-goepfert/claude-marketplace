@@ -2394,7 +2394,25 @@ documents whatever actually landed.
       filter at index time (drop tokens matching hex/base64 shapes with no
       vowel, ≥18 chars). Do it for index size, never for read quality.
 
-- [ ] **11.8 `_HTMLTextExtractor`: restore structure, never emit markup**
+- [x] **11.8 `_HTMLTextExtractor`: restore structure, never emit markup** —
+      **DONE 2026-08-07** (`f61831f` structure, then the `links[]` payload).
+      Landed all seven work items except heading levels, which the item itself
+      called optional and which stay unimplemented at ~5% incidence. Verified old
+      vs new over 600 real HTML parts: **zero messages lost words** (min
+      retention 1.0000, mean 1.0144 from recovered `alt` text) and hidden-text
+      `present`/`suspicious` identical at 109/109 and 0/0, so 6.4's signal is
+      untouched. Of 15 residual fusion-shape matches, 11 are in messages with no
+      `<td>` at all and cannot be cell fusion. 25 tests added; suite 361 → 386.
+      Two bugs found by probing before writing tests, both one root cause: line
+      state was read after the scan, but closing markers sit at end-of-line, so
+      the depth had already decremented — which silently dropped the `> ` from
+      every single-line quote and re-collapsed the last line of every `<pre>`.
+      **Blockquote renders as the plain-text `> ` convention**, so 11.2 gets one
+      quote-parsing path for both HTML and plain text.
+      **Still open, deliberately:** the display/target mismatch check this
+      unlocked is a follow-up, not part of 11.8 — `links[]` is the prerequisite
+      and now exists.
+      **Original write-up follows.**
       (measured 2026-08-07, from the question "is there an html-to-markdown
       utility and would it be useful?"). Today's extractor is a tag-stripper:
       it breaks lines at nine block tags and discards everything else. Scope it
@@ -2457,6 +2475,13 @@ documents whatever actually landed.
       because `href` is discarded before anything can look at it. Report it
       alongside `injection_signals`; never let it block a read.
 
+      **Method note worth keeping.** The first headline metric was a regex proxy
+      for cell fusion, and it moved only 48.3% → 44.8%, which read as failure.
+      Decomposing it showed the number was dominated by `[a-z]\d`, which matches
+      ordinary text ("COVID19", "mp3", "Q4") and was never fusion. The
+      fusion-specific shapes moved 3→1 and 33→14. A proxy metric has to be
+      validated before its residual is interpreted, or you tune against noise.
+
       Tests: the ten synthetic shapes probed 2026-08-07 (receipt table,
       definition list, nested cells, list, headings, blockquote, `pre`, `img
       alt`, button link, plain link) as fixtures, **plus a regression asserting
@@ -2465,6 +2490,17 @@ documents whatever actually landed.
       Then re-run 6.4's word-retention measurement (median 0.99) to confirm no
       legitimate content was lost; separators can only add characters, so `pre`
       handling and `alt` inclusion are the only places output can regress.
+
+- [ ] **11.9 Test classes that inherit a TestCase with tests re-run all of
+      them** (found 2026-08-07 while adding 11.8's tests). `TrustLayerTests`
+      subclasses `ThreadsTestCase`, which defines **18 tests of its own**, so
+      those 18 run twice under two names — the suite count is inflated and any
+      failure is reported twice, from a class that did not cause it. My own
+      `ReadLinksTests` reproduced the flaw exactly (154 tests where 118 was
+      right) and is fixed by splitting `ReadFixture` out of `ReadCommandTests`;
+      that split is the pattern to apply. Audit every `class X(YTests)` in the
+      suite for the same shape. Cheap, and it makes the test count mean
+      something. LOW priority, zero behaviour risk.
 
 **Exit criteria (Phase 11).**
 1. Every suite green, including `index.db`'s column-classification test and the

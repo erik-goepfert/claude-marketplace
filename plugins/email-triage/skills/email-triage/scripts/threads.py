@@ -670,12 +670,18 @@ class _HTMLTextExtractor(HTMLParser):
 NO_HIDDEN_TEXT = {"present": False, "suspicious": False, "reasons": []}
 
 
+# Link targets are capped for the same reason `--suggest-events` buckets are:
+# a marketing message carries dozens, and an uncapped list is how output volume
+# gets away from you. The count of what was dropped still travels.
+LINK_CAP = 20
+
+
 def strip_html(html_text: str):
-    """Returns (text, hidden_report) -- see _HTMLTextExtractor.hidden_report."""
+    """Returns (text, hidden_report, links) -- see _HTMLTextExtractor."""
     parser = _HTMLTextExtractor()
     parser.feed(html_text)
     parser.close()
-    return parser.text(), parser.hidden_report()
+    return parser.text(), parser.hidden_report(), parser.links()
 
 
 def extract_body(msg, force_html: bool):
@@ -697,20 +703,22 @@ def extract_body(msg, force_html: bool):
     # it merely EXISTS reported a fully-written draft as empty -- and a session
     # following the documented read path would have told the user their draft
     # was blank, then offered to rewrite it over the top of real content.
+    # No link list for text/plain: a plain-text body already shows its URLs
+    # inline, so there is nothing to recover and nothing to separate.
     if plain_text is not None and plain_text.strip() and not force_html:
-        return plain_text, "text/plain", NO_HIDDEN_TEXT
+        return plain_text, "text/plain", NO_HIDDEN_TEXT, []
 
     html_part = find_part(msg, "html")
     if html_part is not None:
-        text, hidden = strip_html(decode_text_part(html_part))
-        return text, "text/html-stripped", hidden
+        text, hidden, links = strip_html(decode_text_part(html_part))
+        return text, "text/html-stripped", hidden, links
 
     # Blank plain and no html at all: the message really is empty. Return it as
     # text/plain rather than None so the caller can tell "empty" from "absent".
     if plain_text is not None:
-        return plain_text, "text/plain", NO_HIDDEN_TEXT
+        return plain_text, "text/plain", NO_HIDDEN_TEXT, []
 
-    return None, None, NO_HIDDEN_TEXT
+    return None, None, NO_HIDDEN_TEXT, []
 
 
 def load_account_members(conn: sqlite3.Connection, account: str) -> dict:
@@ -1053,7 +1061,10 @@ FLAG_HANDLES = untrusted.under("actions", {"message_id"})
 # hidden_text_reasons is a list of OUR OWN labels, not sender text -- the one
 # place in this script where a string array is genuinely pipeline-generated.
 READ_TRUSTED = {"source_part", "file", "hidden_text_reasons"} | SIGNAL_FIELDS
-READ_HANDLES = {"headers.Message-ID", "headers.In-Reply-To"}
+# `links.url` is sender-chosen and must stay unescaped to remain a usable key,
+# which is exactly what a handle is. `links.n` and `links_truncated` are ints,
+# and the manifest only classifies strings, so they need no entry.
+READ_HANDLES = {"headers.Message-ID", "headers.In-Reply-To", "links.url"}
 # The one full nonce envelope in this script: the body is long free text with
 # room for an injection to work, and it is where recency-bias framing earns
 # its keep (UC §5a, invariant 2).
@@ -1469,10 +1480,13 @@ def cmd_read(args: argparse.Namespace) -> None:
             "hidden_text_suspicious": False,
             "hidden_text_reasons": [],
             "injection_signals": [],
+            "links": [],
+            "links_truncated": 0,
             "file": rel_file,
         }
     else:
-        body, source_part, hidden = extract_body(msg, force_html=args.html_text)
+        body, source_part, hidden, links = extract_body(
+            msg, force_html=args.html_text)
         result = {
             "headers": selected_message_headers(msg),
             "body": body,
@@ -1489,6 +1503,16 @@ def cmd_read(args: argparse.Namespace) -> None:
             # the assistant directly". Separate from the hidden-text reasons
             # because where the text was hidden is itself part of the signal.
             "injection_signals": untrusted.injection_signals(body or ""),
+            # 11.8: link targets as their OWN field, never appended to the body.
+            # A reference list rendered into the body would put our numbering
+            # inside sender-controlled text, where a sender can forge extra
+            # entries that read as ours. A sibling field cannot be reached from
+            # inside the body at all, and it lets the URLs be classified as
+            # handles -- unescaped so they stay usable as keys, and still never
+            # fetched (rules 4 and 6 are unchanged by having them visible).
+            "links": [{"n": i, "url": u}
+                      for i, u in enumerate(links[:LINK_CAP], start=1)],
+            "links_truncated": max(0, len(links) - LINK_CAP),
             "file": rel_file,
         }
     # 6.3: the body gets the full nonce envelope, built inside apply_trust so
