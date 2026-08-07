@@ -2217,7 +2217,14 @@ fills.
       the manual attempt acceptable to run at all.
 - [ ] **11.4 Compose-new flow.** Document and mechanize what is currently
       improvised: build an RFC822 from scratch (To/Cc/Subject/Date/Message-ID,
-      LF endings, UTF-8), then either save to drafts or send. **See the
+      LF endings, UTF-8), then either save to drafts or send.
+      **Body wrapping: one logical line per paragraph, never hard-wrapped**
+      (user preference 2026-08-07, caught on a real sent message — the
+      hand-built Raimund draft was wrapped at 73–76 columns and came out ragged
+      on a phone, since each hard line re-wraps on its own). Whatever builds the
+      body should make this structural rather than leaving it to whoever writes
+      the prose; a test asserting no paragraph contains an internal newline is
+      cheap and catches the regression permanently. **See the
       sequencing note above — the send half belongs after Phase 8.** The
       save-to-drafts half is independent and can land with 11.3.
 - [ ] **11.5 SKILL + reference alignment.** The Acting section gains compose-new

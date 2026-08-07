@@ -637,6 +637,15 @@ rerun `$IDX index` and retry.
      everything except `References:`; add it from step 1.
   4. Write the body (quote below, reply above, the user's voice); save
      the full template to a temp file.
+     **One logical line per paragraph — never hard-wrap** (user preference,
+     2026-08-07, after a sent draft came out ragged on a phone). Write each
+     paragraph as a single unbroken line with blank lines between paragraphs,
+     and let the recipient's client soft-wrap to its own viewport. Hard-wrapping
+     at ~76 columns is the old plain-text convention and it reads badly
+     everywhere narrower than that: each hard line re-wraps on its own, giving
+     alternating long/short lines. Nothing needs hard-wrapping for safety —
+     quoted-printable inserts its own soft breaks (`=`) at the transport layer
+     and they vanish on decode. Applies to compose-new as much as to replies.
   5. Show the complete draft. Three exits:
      - **Send** (explicit approval of that exact draft):
        `himalaya template send -a <acct> "$(cat <tmpfile>)"`.

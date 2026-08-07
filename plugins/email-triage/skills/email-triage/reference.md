@@ -56,6 +56,22 @@ skill's config: `icloud`/`gmail` are IMAP (reply/send only),
 `icloud-local`/`gmail-local` are Maildir pointed at
 `<maildir_path>/<account>` from `config.yaml` (all reads and flag ops).
 
+## Composing bodies
+
+**One logical line per paragraph. Never hard-wrap** (user preference,
+2026-08-07). Blank line between paragraphs; let the recipient's client wrap to
+its viewport. Hard wraps at ~76 columns re-wrap independently on any narrower
+screen, producing alternating long/short lines — which is how a real sent draft
+was noticed. Transport safety is not a reason to wrap: quoted-printable adds
+soft breaks (`=` at end of line) that are removed on decode, so a 400-character
+paragraph travels fine as one line.
+
+Python's `set_content` emits `text/plain; charset=utf-8` with **no**
+`format=flowed` parameter. RFC 3676 flowed text is the other way to have both
+(hard-wrap, but mark the breaks as soft with trailing spaces) — not used here,
+because plain unwrapped paragraphs achieve the same result in every modern
+client with none of the trailing-whitespace fragility.
+
 ## History queries (`$HIST query`)
 
 Read-only SQL over `history.db`, for decisions a keyed lookup cannot answer.
