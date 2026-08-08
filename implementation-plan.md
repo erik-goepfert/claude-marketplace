@@ -2397,7 +2397,12 @@ documents whatever actually landed.
       linearly.
 
       *The tradeoff, and why this is the right side.* Contentless cannot produce
-      snippets — `snippet()` fails, `SELECT body` returns NULL. Search returns
+      snippets. **Correction (verified on SQLite 3.53.3, 2026-08-07):** an
+      earlier draft of this item said `snippet()` *fails*. It does not — it
+      returns **NULL, silently**, as does `highlight()`, and `SELECT body`
+      returns NULL too. That is worth knowing precisely, because a future caller
+      who adds a snippet column gets empty output and no error explaining why,
+      which is harder to diagnose than an exception. Pinned by a test. Search returns
       "these message-ids match", ranked, and you `$THR read` the ones you want.
       That costs one extra call, and buys two things worth more: a snippet column
       would be a **second door for sender-controlled prose** to reach the model,

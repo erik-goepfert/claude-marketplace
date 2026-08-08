@@ -754,7 +754,8 @@ def _sort_key_moved(e: dict):
 # --------------------------------------------------------------------------
 
 
-def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list, tier_maps: dict) -> dict:
+def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list,
+              tier_maps: dict, index_bodies: bool = True) -> dict:
     placeholders = ",".join("?" * len(accounts))
     existing_rows = conn.execute(
         f"SELECT id, account, folder, maildir_key, maildir_file, message_id, subject, from_addr, date_utc "
@@ -786,6 +787,8 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list, tier
     new_entries = {}  # (account, folder, message_id) -> report entry
     flag_changed_entries = []
     parse_errors = 0
+    bodies_indexed = 0
+    index_bodies = index_bodies and fts_available()
 
     # Pass 2: upsert (all folders, before any deletions are processed).
     for (account, folder, key), (filename, path, _mtime) in snapshot.items():
@@ -797,6 +800,13 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list, tier
                 parse_errors += 1
                 continue
             new_id = insert_row(cur, fields)
+            if index_bodies:
+                # Only NEW rows decode a body. A flag change re-derives from the
+                # filename suffix and never re-reads the file, so steady-state
+                # sessions pay for arrivals only -- the minutes-long cost is the
+                # one-off backfill, not every index.
+                if index_body(cur, new_id, path):
+                    bodies_indexed += 1
             rec = {
                 "id": new_id,
                 "account": account,
@@ -849,6 +859,8 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list, tier
             # silently: drop the provisional "new" entry and the stale row.
             new_entries.pop((account, folder, row["message_id"]), None)
             cur.execute("DELETE FROM envelopes WHERE id = ?", (row["id"],))
+            if index_bodies:
+                unindex_body(cur, row["id"])
             continue
         candidates = [r for r in current_by_msgid.get((account, row["message_id"]), []) if r["folder"] != folder]
         if candidates:
@@ -868,6 +880,8 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list, tier
         else:
             deleted_entries.append(envelope_report_entry(account, folder, row))
         cur.execute("DELETE FROM envelopes WHERE id = ?", (row["id"],))
+        if index_bodies:
+            unindex_body(cur, row["id"])
 
     unrecognized_folders = sorted({folder for (_account, folder), tier in folders_seen.items() if tier == "unrecognized"})
 
@@ -877,6 +891,7 @@ def run_index(conn: sqlite3.Connection, maildir_root: Path, accounts: list, tier
         "deleted": sorted(deleted_entries, key=_sort_key_simple),
         "flag_changed": sorted(flag_changed_entries, key=_sort_key_simple),
         "parse_errors": parse_errors,
+        "bodies_indexed": bodies_indexed,
         "unrecognized_folders": unrecognized_folders,
     }
 
@@ -1131,12 +1146,78 @@ def default_config_path() -> Path:
     return DEFAULT_DATA_DIR / "config.yaml"
 
 
+# Body search (11.6). CONTENTLESS FTS5: the term dictionary and posting lists
+# are kept, the copy of the original text is not (`content=''`). Matching only
+# ever consults the dictionary and postings, so search works fine without it --
+# measured on 389 real messages, identical hit sets to a text-storing index for a
+# term, a phrase and a prefix, and 0.55 MB against 1.45 MB.
+#
+# Deliberately no snippet column. It would be a SECOND door for sender prose to
+# reach the model, needing its own escape/manifest path independent of
+# `$THR read`, and a second at-rest copy of body text to keep consistent with the
+# Maildir. Search returns ranked message-ids; you read the ones you want.
+#
+# `contentless_delete=1` needs SQLite 3.43+. Without it, deleting a row from a
+# contentless index requires re-supplying the original text, which by
+# construction we do not have -- and mail is moved and expunged constantly, so
+# the index would drift permanently out of sync. rowid is `envelopes.id`.
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5(
+    body,
+    content='',
+    contentless_delete=1,
+    tokenize='unicode61'
+);
+"""
+FTS_MIN_SQLITE = (3, 43)
+
+
+def fts_available() -> bool:
+    v = tuple(int(x) for x in sqlite3.sqlite_version.split(".")[:2])
+    return v >= FTS_MIN_SQLITE
+
+
 def init_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    if fts_available():
+        conn.executescript(FTS_SCHEMA)
     conn.commit()
     return conn
+
+
+def extract_body_text(path: Path):
+    """The exact text a `$THR read` would show, or None.
+
+    Reuses threads.extract_body rather than re-deriving, so search can never
+    match on text a read would not display. Imported here rather than at module
+    scope to keep `indexer.py` usable when only headers are wanted."""
+    import threads
+    try:
+        msg = threads.load_raw_message(str(path))
+        return threads.extract_body(msg, force_html=False).text
+    except Exception:
+        return None
+
+
+def index_body(cur: sqlite3.Cursor, rowid: int, path: Path) -> bool:
+    """Add one message's decoded body to the FTS index. Returns whether it did.
+
+    A body that will not decode is skipped rather than raised: a message missing
+    from body search is a degraded search, while an aborted index run is a broken
+    session."""
+    text = extract_body_text(path)
+    if not text or not text.strip():
+        return False
+    cur.execute("INSERT INTO body_fts (rowid, body) VALUES (?, ?)",
+                (rowid, text))
+    return True
+
+
+def unindex_body(cur: sqlite3.Cursor, rowid: int) -> None:
+    """Drop a message from the FTS index. Safe when it was never added."""
+    cur.execute("DELETE FROM body_fts WHERE rowid = ?", (rowid,))
 
 
 def resolve_accounts(maildir_root: Path, requested) -> list:
@@ -1155,6 +1236,109 @@ def resolve_accounts(maildir_root: Path, requested) -> list:
     return accounts
 
 
+BACKFILL_SQL = """SELECT e.id, e.account, e.folder, e.maildir_key, e.maildir_file
+                  FROM envelopes e
+                  LEFT JOIN body_fts f ON f.rowid = e.id
+                  WHERE f.rowid IS NULL"""
+
+
+def cmd_backfill_bodies(args: argparse.Namespace) -> int:
+    """One-off: add bodies for rows indexed before body search existed.
+
+    Separate from `index` because it is genuinely slow -- it decodes every
+    message rather than the arrivals -- and because a session should never
+    silently pay for it. `index` keeps the FTS current from here on."""
+    if not fts_available():
+        print(f"error: body search needs SQLite {'.'.join(map(str, FTS_MIN_SQLITE))}+"
+              f" for contentless_delete; this is {sqlite3.sqlite_version}",
+              file=sys.stderr)
+        return 1
+    if not args.db.exists():
+        print(f"fatal: no such db: {args.db}", file=sys.stderr)
+        return 1
+    conn = init_db(args.db)
+    cur = conn.cursor()
+    rows = cur.execute(BACKFILL_SQL).fetchall()
+    done = skipped = 0
+    for i, (rowid, account, folder, _key, filename) in enumerate(rows, 1):
+        path = args.maildir / account / folder / "cur" / filename
+        if not path.exists():
+            path = args.maildir / account / folder / "new" / filename
+        if not path.exists():
+            skipped += 1
+            continue
+        if index_body(cur, rowid, path):
+            done += 1
+        else:
+            skipped += 1
+        if i % 500 == 0:
+            conn.commit()
+            print(f"  {i}/{len(rows)} ...", file=sys.stderr)
+    conn.commit()
+    conn.close()
+    json.dump({"candidates": len(rows), "bodies_indexed": done,
+               "skipped": skipped,
+               "note": "skipped = no body, undecodable, or file gone since "
+                       "indexing; a missing body degrades search, never the index"},
+              sys.stdout, indent=2, sort_keys=True)
+    print()
+    return 0
+
+
+SEARCH_SQL = """SELECT e.account, e.message_id, e.folder, e.folder_tier,
+                       e.date_utc, e.subject, e.from_addr,
+                       bm25(body_fts) AS rank
+                FROM body_fts
+                JOIN envelopes e ON e.id = body_fts.rowid
+                WHERE body_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?"""
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """Ranked body search. Returns message-ids to go read, never snippets."""
+    if not args.db.exists():
+        print(f"fatal: no such db: {args.db}", file=sys.stderr)
+        return 1
+    try:
+        conn = roquery.connect(args.db)
+    except roquery.QueryError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    try:
+        try:
+            rows = [dict(r) for r in conn.execute(
+                SEARCH_SQL, (args.term, args.limit + 1))]
+        except sqlite3.OperationalError as e:
+            msg = str(e)
+            if "no such table" in msg:
+                print("error: no body index yet — run "
+                      "`indexer.py backfill-bodies` once", file=sys.stderr)
+            else:
+                # FTS5 has its own query syntax; an unbalanced quote or a bare
+                # operator is a user error, not a crash.
+                print(f"error: bad search query: {msg}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+    truncated = len(rows) > args.limit
+    rows = rows[:args.limit]
+    trusted_names, handle_names = query_column_trust()
+    payload = {"hits": rows, "hit_count": len(rows)}
+    if truncated:
+        payload["truncated"] = True
+        payload["hint"] = (f"stopped at --limit {args.limit}; narrow the term "
+                           "or raise the limit deliberately")
+    json.dump(untrusted.apply_trust(
+        payload,
+        untrusted.under("hits", trusted_names | {"rank"})
+        | {"hit_count", "truncated", "hint"},
+        handle_fields=untrusted.under("hits", handle_names)),
+        sys.stdout, indent=2, sort_keys=True)
+    print()
+    return 0
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     conn = init_db(args.db)
     conn.close()
@@ -1168,7 +1352,8 @@ def cmd_index(args: argparse.Namespace) -> None:
     conn = init_db(args.db)
     try:
         try:
-            report = run_index(conn, args.maildir, accounts, tier_maps)
+            report = run_index(conn, args.maildir, accounts, tier_maps,
+                               index_bodies=not getattr(args, "no_bodies", False))
         except sqlite3.Error as e:
             conn.rollback()
             raise FatalError(f"database error: {e}") from e
@@ -1330,6 +1515,12 @@ def main() -> None:
     idx_p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
                        help="holds history.db (for self-echo) and receives "
                             "suggested-events.json")
+    idx_p.add_argument(
+        "--no-bodies", action="store_true", dest="no_bodies",
+        help="skip body-search indexing for this run. Arrivals normally cost "
+             "one body decode each, which is seconds; this exists for a fast "
+             "header-only rebuild, and leaves body search stale until the next "
+             "`backfill-bodies`")
     idx_p.set_defaults(func=cmd_index)
 
     pf_p = sub.add_parser(
@@ -1364,6 +1555,26 @@ def main() -> None:
                      help=f"max rows returned (default {roquery.ROW_CAP}); "
                           "truncation is reported, never silent")
     q_p.set_defaults(func=cmd_query)
+
+    bf_p = sub.add_parser(
+        "backfill-bodies",
+        help="one-off: populate the body search index for already-indexed mail "
+             "(slow — decodes every message; `index` keeps it current after)")
+    bf_p.add_argument("--db", type=Path, default=DEFAULT_DATA_DIR / "index.db")
+    bf_p.add_argument("--maildir", type=Path, default=DEFAULT_DATA_DIR / "mail")
+    bf_p.set_defaults(func=cmd_backfill_bodies)
+
+    s_p = sub.add_parser(
+        "search",
+        help="ranked full-text search over decoded message BODIES",
+        description="Contentless FTS5, so results are ranked message-ids to go "
+                    "read -- there are no snippets by design. FTS5 query "
+                    "syntax: bare terms AND together, \"quoted phrase\" is a "
+                    "phrase, trailing * is a prefix.")
+    s_p.add_argument("--term", required=True, help="FTS5 query")
+    s_p.add_argument("--db", type=Path, default=DEFAULT_DATA_DIR / "index.db")
+    s_p.add_argument("--limit", type=int, default=50)
+    s_p.set_defaults(func=cmd_search)
 
     args = parser.parse_args()
     try:

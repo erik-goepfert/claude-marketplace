@@ -1158,5 +1158,242 @@ class IndexQueryTests(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class BodySearchTests(unittest.TestCase):
+    """Phase 11.6 — contentless FTS5 over decoded bodies.
+
+    The point of the whole item is that grepping the Maildir silently misses
+    ~14% of matches, so the base64 and quoted-printable cases below are the
+    tests that matter: those are the encodings a grep cannot see through."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.maildir = self.root / "mail"
+        self.db = self.root / "index.db"
+        for sub in ("cur", "new", "tmp"):
+            (self.maildir / "acct" / "INBOX" / sub).mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def put(self, key, body, cte="7bit", subject="s", frm="a@example.com"):
+        from email.message import EmailMessage
+        m = EmailMessage()
+        m["From"] = frm
+        m["To"] = "me@example.com"
+        m["Subject"] = subject
+        m["Date"] = "Mon, 4 Aug 2026 09:00:00 +0000"
+        m["Message-ID"] = f"<{key}@x>"
+        m.set_content(body, cte=cte)
+        path = self.maildir / "acct" / "INBOX" / "cur" / f"{key}:2,S"
+        path.write_bytes(m.as_bytes())
+        return path
+
+    def do_index(self, no_bodies=False):
+        ns = argparse.Namespace(
+            maildir=self.maildir, db=self.db, account=None, config=None,
+            suggest_events=False, session=None, no_bodies=no_bodies)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            indexer.cmd_index(ns)
+        return json.loads(buf.getvalue())
+
+    def search(self, term, limit=50):
+        ns = argparse.Namespace(db=self.db, term=term, limit=limit)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = indexer.cmd_search(ns)
+        return code, (json.loads(buf.getvalue()) if buf.getvalue() else None)
+
+    def ids(self, term):
+        _code, out = self.search(term)
+        return sorted(h["message_id"] for h in out["hits"])
+
+    # -- the encodings a grep cannot see through ----------------------------
+
+    def test_base64_body_is_searchable(self):
+        """base64 parts are opaque to grep -- 36 of ~700 sampled live text parts.
+        This is the single strongest reason the index exists."""
+        self.put("b64", "Raimund mentioned the sprinkler contractor.",
+                 cte="base64")
+        report = self.do_index()
+        self.assertEqual(report["bodies_indexed"], 1)
+        raw = (self.maildir / "acct/INBOX/cur/b64:2,S").read_bytes()
+        self.assertNotIn(b"sprinkler", raw)      # grep genuinely cannot see it
+        self.assertEqual(self.ids("sprinkler"), ["b64@x"])
+
+    def test_quoted_printable_body_is_searchable(self):
+        self.put("qp", "Confirm the sprinkler schedule. Cost \N{EURO SIGN}90.",
+                 cte="quoted-printable")
+        self.do_index()
+        self.assertEqual(self.ids("sprinkler"), ["qp@x"])
+
+    def test_html_only_body_is_searchable_through_the_extractor(self):
+        """Search must see exactly the text a read would show, which is why this
+        reuses extract_body rather than re-deriving."""
+        from email.message import EmailMessage
+        m = EmailMessage()
+        m["From"] = "h@example.com"
+        m["To"] = "me@example.com"
+        m["Subject"] = "html"
+        m["Date"] = "Mon, 4 Aug 2026 09:00:00 +0000"
+        m["Message-ID"] = "<html@x>"
+        m.set_content("<html><body><p>The <b>sprinkler</b> valve leaked.</p>"
+                      "</body></html>", subtype="html")
+        (self.maildir / "acct/INBOX/cur/html:2,S").write_bytes(m.as_bytes())
+        self.do_index()
+        self.assertEqual(self.ids("sprinkler"), ["html@x"])
+
+    # -- FTS5 query forms ---------------------------------------------------
+
+    def test_term_phrase_prefix_and_implicit_and(self):
+        self.put("m1", "The sprinkler company is coming Tuesday.")
+        self.put("m2", "Raimund mentioned the sprinkler contractor.")
+        self.do_index()
+        self.assertEqual(len(self.ids("sprinkler")), 2)
+        self.assertEqual(self.ids('"sprinkler company"'), ["m1@x"])
+        self.assertEqual(len(self.ids("sprink*")), 2)
+        self.assertEqual(self.ids("raimund sprinkler"), ["m2@x"])
+
+    def test_hits_are_ranked(self):
+        self.put("lots", "sprinkler sprinkler sprinkler valve")
+        self.put("one", "a single sprinkler mention among many other words here")
+        self.do_index()
+        _code, out = self.search("sprinkler")
+        self.assertEqual(len(out["hits"]), 2)
+        # bm25 returns negative scores, best first; ORDER BY rank ascending.
+        self.assertLessEqual(out["hits"][0]["rank"], out["hits"][1]["rank"])
+
+    def test_bad_query_syntax_is_reported_not_crashed(self):
+        self.put("m1", "hello")
+        self.do_index()
+        code, _out = self.search('"unbalanced')
+        self.assertEqual(code, 1)
+
+    # -- staying in sync ----------------------------------------------------
+
+    def test_deleted_message_leaves_the_index(self):
+        """contentless_delete=1 is why this works: deleting from a contentless
+        index otherwise needs the original text re-supplied, which we do not
+        have. Without it the index would drift permanently."""
+        self.put("gone", "the sprinkler broke")
+        self.put("stays", "the sprinkler works")
+        self.do_index()
+        self.assertEqual(len(self.ids("sprinkler")), 2)
+        (self.maildir / "acct/INBOX/cur/gone:2,S").unlink()
+        self.do_index()
+        self.assertEqual(self.ids("sprinkler"), ["stays@x"])
+
+    def test_flag_change_does_not_duplicate_or_lose_the_body(self):
+        """A flag change re-derives from the filename suffix and never re-reads
+        the file, so it must neither re-index nor drop the body."""
+        self.put("m1", "the sprinkler is fine")
+        self.do_index()
+        old = self.maildir / "acct/INBOX/cur/m1:2,S"
+        old.rename(self.maildir / "acct/INBOX/cur/m1:2,FS")
+        report = self.do_index()
+        self.assertEqual(report["bodies_indexed"], 0)
+        self.assertEqual(self.ids("sprinkler"), ["m1@x"])
+
+    def test_reindex_is_idempotent(self):
+        self.put("m1", "sprinkler")
+        self.do_index()
+        self.do_index()
+        self.assertEqual(len(self.ids("sprinkler")), 1)
+
+    def test_no_bodies_flag_skips_indexing(self):
+        self.put("m1", "sprinkler")
+        report = self.do_index(no_bodies=True)
+        self.assertEqual(report["bodies_indexed"], 0)
+        self.assertEqual(self.ids("sprinkler"), [])
+
+    def test_backfill_populates_what_no_bodies_skipped(self):
+        self.put("m1", "sprinkler")
+        self.put("m2", "hose")
+        self.do_index(no_bodies=True)
+        ns = argparse.Namespace(db=self.db, maildir=self.maildir)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = indexer.cmd_backfill_bodies(ns)
+        self.assertEqual(code, 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["bodies_indexed"], 2)
+        self.assertEqual(self.ids("sprinkler"), ["m1@x"])
+
+    def test_backfill_is_idempotent(self):
+        self.put("m1", "sprinkler")
+        self.do_index()
+        ns = argparse.Namespace(db=self.db, maildir=self.maildir)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            indexer.cmd_backfill_bodies(ns)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["candidates"], 0)   # nothing left to do
+        self.assertEqual(len(self.ids("sprinkler")), 1)
+
+    def test_undecodable_body_degrades_search_not_the_index(self):
+        path = self.maildir / "acct/INBOX/cur/bad:2,S"
+        path.write_bytes(b"Message-ID: <bad@x>\nSubject: x\n\n")
+        self.put("good", "sprinkler")
+        report = self.do_index()
+        self.assertEqual(report["parse_errors"], 0)
+        self.assertEqual(self.ids("sprinkler"), ["good@x"])
+
+    # -- the contentless tradeoff, asserted rather than assumed -------------
+
+    def test_the_index_does_not_store_the_body(self):
+        """The reason there are no snippets: no second at-rest copy of sender
+        prose, and no second door for it to reach the model."""
+        self.put("m1", "a very distinctive sprinkler phrase")
+        self.do_index()
+        conn = sqlite3.connect(self.db)
+        try:
+            row = conn.execute("SELECT body FROM body_fts").fetchone()
+            self.assertIsNone(row[0])
+            # snippet()/highlight() do NOT raise -- they return NULL, silently.
+            # Verified on SQLite 3.53.3, correcting an earlier note that said
+            # they fail. Worth pinning: a future caller adding a snippet column
+            # gets empty output with no error explaining why, which is a harder
+            # bug to read than an exception would have been.
+            for fn in ("snippet(body_fts, 0, '[', ']', '', 8)",
+                       "highlight(body_fts, 0, '[', ']')"):
+                got = conn.execute(
+                    f"SELECT {fn} FROM body_fts WHERE body_fts MATCH "
+                    "'sprinkler'").fetchall()
+                self.assertEqual(got, [(None,)])
+        finally:
+            conn.close()
+
+    # -- trust --------------------------------------------------------------
+
+    def test_sender_prose_in_hits_is_escaped_and_declared(self):
+        self.put("m1", "sprinkler", subject="Re: <urgent> & fast",
+                 frm="Bob <bob@example.com>")
+        self.do_index()
+        _code, out = self.search("sprinkler")
+        declared = set(out["_trust"]["untrusted_fields"])
+        self.assertIn("hits.subject", declared)
+        self.assertIn("hits.from_addr", declared)
+        self.assertIn("&lt;urgent&gt;", out["hits"][0]["subject"])
+        self.assertNotIn("<urgent>", out["hits"][0]["subject"])
+
+    def test_message_id_handle_and_rank_are_usable(self):
+        self.put("m1", "sprinkler")
+        self.do_index()
+        _code, out = self.search("sprinkler")
+        self.assertEqual(out["hits"][0]["message_id"], "m1@x")
+        self.assertIn("hits.message_id", out["_trust"]["untrusted_fields"])
+        self.assertNotIn("hits.rank", out["_trust"]["untrusted_fields"])
+
+    def test_truncation_is_reported(self):
+        for i in range(5):
+            self.put(f"m{i}", "sprinkler")
+        self.do_index()
+        _code, out = self.search("sprinkler", limit=3)
+        self.assertEqual(len(out["hits"]), 3)
+        self.assertTrue(out["truncated"])
+        self.assertIn("hint", out)
+
+
 if __name__ == "__main__":
     unittest.main()
