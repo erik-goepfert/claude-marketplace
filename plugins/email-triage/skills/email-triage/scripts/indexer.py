@@ -58,6 +58,7 @@ from email.parser import BytesHeaderParser
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from pathlib import Path
 
+import roquery
 import untrusted
 
 # --------------------------------------------------------------------------
@@ -589,6 +590,81 @@ CHANGE_ENTRY_TRUSTED = {"account", "folder", "from_folder", "to_folder",
 CHANGE_ENTRY_HANDLES = {"message_id"}
 # `subject` and `from_addr` are absent from both on purpose -- sender prose,
 # escaped and declared by default-deny.
+
+
+# --------------------------------------------------------------------------
+# Per-column trust for index.db (11.1). Phase 6.5 built this for history.db and
+# stopped there; `$IDX query` cannot classify a result set without it. Keyed per
+# table like 6.5's, even though `envelopes` is currently the only writable one,
+# so a second table does not have to reshape the map.
+# --------------------------------------------------------------------------
+
+TRUSTED_COLUMNS = {
+    # Ours or the filesystem's, none of it sender text: folder names come from
+    # config.yaml, maildir_key/maildir_file are the filenames mbsync generated,
+    # date_utc is a normalized header, flags are the letters in the filename
+    # suffix, folder_tier is our own vocabulary, indexed_at is our clock.
+    "envelopes": {"id", "folder", "maildir_key", "maildir_file", "date_utc",
+                  "flags", "is_flagged", "is_answered", "account", "indexed_at",
+                  "folder_tier"},
+    # The view derives account/message_id from envelopes and tier from our own
+    # CASE expression.
+    "message_tiers": {"account", "tier"},
+}
+
+# Handles: sender-valued, but the model feeds them straight back into $THR show /
+# $ACT / $BATCH, which match by exact string equality. Escaping would break the
+# lookup, which is the whole reason this category exists.
+HANDLE_COLUMNS = {
+    "envelopes": {"message_id", "in_reply_to", "references_chain"},
+    "message_tiers": {"message_id"},
+}
+
+# Deliberately untrusted. Runtime does not consult this set -- default-deny
+# already covers anything unlisted. It exists so the test can tell "we looked at
+# this column and it holds sender-derived prose" apart from "nobody has looked at
+# this column yet", and so a NEW column fails the suite instead of drifting in
+# silently as merely-wrapped.
+UNTRUSTED_COLUMNS = {
+    # subject is a raw header. to_addr is the raw To header -- unparsed, so
+    # display names and multiple recipients ride along. from_addr is
+    # parseaddr()'d to a bare address, which makes escaping a NO-OP in the normal
+    # case (an addr-spec contains no <, > or &) and correct in the abnormal one:
+    # parseaddr falls back to the raw header string when it cannot parse, and
+    # that fallback is arbitrary sender prose. Same call the change report
+    # already makes for these two columns.
+    "envelopes": {"subject", "from_addr", "to_addr"},
+    "message_tiers": set(),
+}
+
+
+def query_column_trust():
+    """(trusted, handle) bare column names -- see roquery.bare_name_trust."""
+    return roquery.bare_name_trust(TRUSTED_COLUMNS, HANDLE_COLUMNS,
+                                   UNTRUSTED_COLUMNS)
+
+
+def cmd_query(args) -> int:
+    """Read-only SQL over index.db. Hardening lives in roquery (11.1)."""
+    db_path = args.db
+    if not os.path.isfile(db_path):
+        print(f"fatal: no such db: {db_path}", file=sys.stderr)
+        return 1
+    try:
+        conn = roquery.connect(db_path)
+        try:
+            rows, truncated = roquery.run(conn, args.sql, args.limit)
+        finally:
+            conn.close()
+    except roquery.QueryError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    trusted_names, handle_names = query_column_trust()
+    json.dump(roquery.payload(rows, truncated, args.limit, trusted_names,
+                              handle_names),
+              sys.stdout, indent=2, sort_keys=True)
+    print()
+    return 0
 
 
 def change_report_trusted(prefix: str = "") -> set:
@@ -1269,9 +1345,30 @@ def main() -> None:
     )
     pf_p.set_defaults(func=cmd_priority_folders)
 
+    q_p = sub.add_parser(
+        "query",
+        help="read-only SQL over index.db (message-level search: recipient, "
+             "sender, subject, date range, folder, flags, and combinations)",
+        description="Read-only SQL over index.db. The connection cannot write, "
+                    "cannot ATTACH, and is aborted if it runs away. GLOB and "
+                    "LIKE are native; REGEXP is registered for patterns they "
+                    "cannot express, e.g. "
+                    "WHERE to_addr REGEXP '(?i)raimund'.",
+    )
+    # --sql, not positional: `$HIST query` already spells it this way, and two
+    # copies of the same surface with different invocations is how one gets
+    # called wrong.
+    q_p.add_argument("--sql", required=True, help="a single SELECT statement")
+    q_p.add_argument("--db", type=Path, default=DEFAULT_DATA_DIR / "index.db")
+    q_p.add_argument("--limit", type=int, default=roquery.ROW_CAP,
+                     help=f"max rows returned (default {roquery.ROW_CAP}); "
+                          "truncation is reported, never silent")
+    q_p.set_defaults(func=cmd_query)
+
     args = parser.parse_args()
     try:
-        args.func(args)
+        # Subcommands that report failure return a code; the rest return None.
+        sys.exit(args.func(args) or 0)
     except FatalError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)

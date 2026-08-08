@@ -623,11 +623,16 @@ conventions, both learned from sent mail:
   vanish on decode, so a long paragraph travels fine as one line.
 - **The user's voice, not yours.** Match their register — greeting, sign-off,
   sentence length, how much warmth — and default to shorter than feels
-  complete. The best evidence is up to ~10 of the user's own **sent** messages
-  to this recipient. Note that `$THR list --sender <addr>` matches the
-  *sender*, so it finds that person's mail TO the user, not the user's to them:
-  useful, but second-best evidence. Say which one you used when you show the
-  draft, so the user can weigh the tone against how it was chosen.
+  complete. The evidence is up to ~10 of the user's own **sent** messages to
+  this recipient:
+  ```sh
+  <scripts-dir>/indexer.py query --sql "SELECT message_id, date_utc FROM envelopes WHERE folder_tier='sent' AND to_addr REGEXP '(?i)<name-or-addr>' ORDER BY date_utc DESC LIMIT 10"
+  ```
+  then read each one with `$THR read --no-quotes` so you get their words and not
+  the chain they answered. `$THR list --sender <addr>` is the other direction —
+  it matches the *sender*, so it finds that person's mail TO the user. Useful,
+  but second-best evidence for how the user writes. No history at all → say so
+  and use neutral-professional rather than inventing a register.
 
 **Flags and replies are not moves, so they run the same unit by hand:**
 act (`-local` himalaya for flags, IMAP himalaya for replies) → log the

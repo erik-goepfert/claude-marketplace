@@ -72,6 +72,32 @@ Python's `set_content` emits `text/plain; charset=utf-8` with **no**
 because plain unwrapped paragraphs achieve the same result in every modern
 client with none of the trailing-whitespace fragility.
 
+## Message-level search (`$IDX query`)
+
+Read-only SQL over `index.db`, same hardened surface and same invocation as
+`$HIST query` — `--sql`, `--limit`, truncation reported rather than silent. Both
+share one implementation (`roquery.py`), because a second copy of a security
+boundary is a second thing to get wrong.
+
+Answers what `$THR list` structurally cannot: `$THR list --sender` matches the
+**sender**, so it can never answer *what has the user written to X*. `$IDX
+query` reads `to_addr`, so it can.
+
+`GLOB` and `LIKE` are native; `REGEXP` is registered for what they cannot
+express (`WHERE to_addr REGEXP '(?i)raimund'`). Case-insensitive matching wants
+`(?i)` — `LIKE` is only case-insensitive for ASCII.
+
+Trust: `subject`/`from_addr`/`to_addr` come back entity-escaped and declared
+untrusted; `message_id`/`in_reply_to`/`references_chain` are handles, passed
+through unaltered so they still work as lookup keys. Everything else in
+`envelopes` is ours. An unrecognized column name is untrusted by default-deny,
+and on a join **untrusted wins every tie** — over-wrapping is cosmetic,
+under-wrapping is a security failure.
+
+The connection cannot write, cannot `ATTACH`, refuses stacked statements, and is
+aborted if it runs away. There is deliberately no SQL parsing — enforcement is
+the engine's, and `test_roquery.py` is where that boundary is demonstrated.
+
 ## History queries (`$HIST query`)
 
 Read-only SQL over `history.db`, for decisions a keyed lookup cannot answer.

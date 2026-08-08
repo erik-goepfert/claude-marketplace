@@ -2171,7 +2171,40 @@ Suggested order: **11.8 → 11.2 → 11.1 → 11.6 → 11.3 → (Phase 8) → 11
 11.5**, with 11.7 optional alongside 11.6 and 11.5 deliberately last because it
 documents whatever actually landed.
 
-- [ ] **11.1 `$IDX query` — read-only SQL over `index.db`.** The same hardened
+- [x] **11.1 `$IDX query` — read-only SQL over `index.db`** — **DONE
+      2026-08-07.** Recipient-side search now exists and is verified against the
+      live index (the last 5 messages the user sent to Raimund, which no existing
+      command could answer). The four layers became **five**: registering
+      `REGEXP` opened a hole underneath the progress handler, which counts SQLite
+      VM steps — and no VM steps occur while a Python callback runs, so a
+      catastrophically backtracking pattern would hang forever under it. A
+      wall-clock `SIGALRM` ceiling closes that, and REGEXP does not ship without
+      it.
+      Factored into **`roquery.py`** rather than copied, per the item, and
+      `history.py` now consumes it — its 41 tests passing unchanged is the
+      evidence the extraction preserved the boundary. `test_roquery.py` adds 17
+      probes that assert on OUTCOME (no file created, no row changed), not on
+      error strings.
+      Probed live against `index.db`: writes, `DELETE`, `DROP`, `ALTER`, a CTE
+      wrapping DML, `ATTACH` to a `mode=rwc` path, stacked statements,
+      `readfile`/`writefile`, `PRAGMA journal_mode=WAL`, `PRAGMA user_version=42`
+      — all refused, and the ATTACH target was never created.
+      `PRAGMA writable_schema=ON` **succeeds**, and is unreachable anyway: it
+      only permits writing to `sqlite_master`, one statement runs per connection,
+      and each invocation opens a fresh one — so nothing can follow it. Worth
+      knowing rather than being surprised by later.
+      Two things fixed while wiring it up: `--sql` rather than a positional
+      argument, because `$HIST query` already spells it that way and two copies
+      of one surface with different invocations is how one gets called wrong; and
+      sqlite3 collapses every user-function exception into "user-defined function
+      raised exception", so the real regex error is carried out of band or an
+      unbalanced paren is indistinguishable from a crash.
+      Column map: `subject`/`from_addr`/`to_addr` untrusted — `to_addr` is the
+      RAW To header (display names, multiple recipients) and `from_addr` is
+      `parseaddr`'d, which makes escaping a no-op on a well-formed addr-spec and
+      correct on parseaddr's raw-string fallback. Completeness test compares the
+      map against `PRAGMA table_info` so a new column fails the suite.
+      **Original write-up follows.** The same hardened
       surface `$HIST query` already provides, pointed at `envelopes`: recipient
       search, sender search, subject, date ranges, folder, flags, and
       combinations, with no new flags to invent. Reuse the four verified layers

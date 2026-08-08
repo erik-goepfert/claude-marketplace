@@ -19,7 +19,10 @@ Covers:
     each stage
 """
 
+import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import shutil
 import sqlite3
@@ -35,6 +38,7 @@ _spec.loader.exec_module(indexer)
 
 import sys  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import roquery  # noqa: E402
 import untrusted  # noqa: E402
 
 
@@ -1032,6 +1036,126 @@ class PriorityFoldersTest(unittest.TestCase):
         self.assertEqual(set(result.keys()), {"icloud", "gmail"})
         self.assertEqual(result["icloud"]["fast"], ["INBOX", "Active", "Sent Messages", "Drafts"])
         self.assertEqual(result["gmail"]["fast"], ["INBOX", "Active", "[Gmail]/Sent Mail", "[Gmail]/Drafts"])
+
+
+class IndexColumnTrustTests(unittest.TestCase):
+    """Phase 11.1 — index.db's per-column trust map.
+
+    6.5 built this for history.db and stopped there. The completeness test is
+    the point: a column added to the schema later must FAIL the suite rather
+    than drift in silently as merely-wrapped."""
+
+    ALL = ("TRUSTED_COLUMNS", "HANDLE_COLUMNS", "UNTRUSTED_COLUMNS")
+
+    def test_every_envelopes_column_is_classified_exactly_once(self):
+        import tempfile, sqlite3 as s3
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "index.db"
+            indexer.init_db(path).close()
+            conn = s3.connect(path)
+            actual = {r[1] for r in conn.execute("PRAGMA table_info(envelopes)")}
+            conn.close()
+        classified = [set(getattr(indexer, n)["envelopes"]) for n in self.ALL]
+        union = set().union(*classified)
+        self.assertEqual(union, actual,
+                         "index.db schema and the trust map have diverged")
+        for i, a in enumerate(classified):
+            for b in classified[i + 1:]:
+                self.assertEqual(a & b, set(),
+                                 "a column is classified twice")
+
+    def test_sender_prose_columns_are_untrusted(self):
+        for col in ("subject", "from_addr", "to_addr"):
+            with self.subTest(col=col):
+                self.assertIn(col, indexer.UNTRUSTED_COLUMNS["envelopes"])
+                self.assertNotIn(col, indexer.TRUSTED_COLUMNS["envelopes"])
+                self.assertNotIn(col, indexer.HANDLE_COLUMNS["envelopes"])
+
+    def test_lookup_keys_are_handles(self):
+        """These are fed straight back into $THR show / $ACT / $BATCH, which
+        match by exact string equality -- escaping would break the lookup."""
+        for col in ("message_id", "in_reply_to", "references_chain"):
+            with self.subTest(col=col):
+                self.assertIn(col, indexer.HANDLE_COLUMNS["envelopes"])
+
+    def test_query_column_trust_excludes_untrusted_names(self):
+        trusted, handles = indexer.query_column_trust()
+        for col in ("subject", "from_addr", "to_addr"):
+            self.assertNotIn(col, trusted)
+            self.assertNotIn(col, handles)
+        self.assertIn("folder", trusted)
+        self.assertIn("message_id", handles)
+
+
+class IndexQueryTests(unittest.TestCase):
+    """`$IDX query` end to end. The boundary itself is covered by
+    test_roquery.py; these check that indexer wires it up and classifies."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "index.db"
+        conn = indexer.init_db(self.db)
+        conn.execute(
+            """INSERT INTO envelopes (message_id, folder, maildir_key,
+               maildir_file, account, folder_tier, subject, from_addr, to_addr,
+               date_utc)
+               VALUES ('<m1@x>', 'Sent', 'k1', 'k1:2,S', 'icloud', 'sent',
+                       'Package pickup', 'me@x.com',
+                       'Raimund <raimund@example.com>', '2026-05-05T15:39:11Z')""")
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_query(self, sql, limit=roquery.ROW_CAP):
+        ns = argparse.Namespace(db=str(self.db), sql=sql, limit=limit)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = indexer.cmd_query(ns)
+        return code, buf.getvalue()
+
+    def test_recipient_search_finds_a_sent_message(self):
+        """The capability 11.1 exists for: `$THR list --sender` matches the
+        SENDER, so it can never answer "what has the user written to X"."""
+        code, out = self.run_query(
+            "SELECT date_utc, folder_tier FROM envelopes "
+            "WHERE folder_tier='sent' AND to_addr REGEXP '(?i)raimund'")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["row_count"], 1)
+        self.assertEqual(payload["rows"][0]["folder_tier"], "sent")
+
+    def test_sender_prose_comes_back_escaped_and_declared(self):
+        code, out = self.run_query("SELECT to_addr, subject FROM envelopes")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        declared = set(payload["_trust"]["untrusted_fields"])
+        self.assertIn("rows.to_addr", declared)
+        self.assertIn("rows.subject", declared)
+        # The raw To header carries a display name and angle brackets; those
+        # must arrive as entities so they cannot read as markup.
+        self.assertIn("&lt;", payload["rows"][0]["to_addr"])
+        self.assertNotIn("<raimund", payload["rows"][0]["to_addr"])
+
+    def test_message_id_handle_survives_unaltered(self):
+        code, out = self.run_query("SELECT message_id FROM envelopes")
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["rows"][0]["message_id"], "<m1@x>")
+
+    def test_writes_are_refused_with_a_nonzero_exit(self):
+        code, _out = self.run_query("DELETE FROM envelopes")
+        self.assertEqual(code, 1)
+        conn = sqlite3.connect(self.db)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM envelopes").fetchone()[0], 1)
+        conn.close()
+
+    def test_missing_db_exits_nonzero(self):
+        code = indexer.cmd_query(argparse.Namespace(
+            db=str(Path(self._tmp.name) / "nope.db"), sql="SELECT 1", limit=10))
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":

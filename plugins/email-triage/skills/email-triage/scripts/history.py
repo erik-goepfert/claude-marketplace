@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import roquery
 import untrusted  # noqa: E402
 
 DEFAULT_DATA_DIR = Path(os.environ.get("EMAIL_TRIAGE_DATA_DIR", "~/.local/share/email-triage")).expanduser()
@@ -398,89 +399,34 @@ CONTEXT_TABLES = {
 }
 
 
-# Read-only query surface (2026-08-07). Enforcement is SQLite's, not ours --
-# four layers, each verified empirically before this was written:
-#   1. file:...?mode=ro      -> "attempt to write a readonly database"
-#   2. PRAGMA query_only=ON  -> same, belt and braces
-#   3. setlimit(ATTACHED, 0) -> closes the real hole: a read-only connection can
-#                               otherwise ATTACH 'file:/anywhere?mode=rwc' and
-#                               write THERE, because the attached DB carries its
-#                               own flags. Verified: without this it SUCCEEDS.
-#   4. progress handler      -> aborts runaway queries ("interrupted")
-# Plus two properties of the driver: Python's sqlite3 has no readfile()/
-# writefile() (those are CLI extensions, so the query language cannot touch the
-# filesystem), and execute() refuses more than one statement.
-#
-# Because all of that is engine-enforced, there is deliberately NO SQL parsing
-# here. A regex blacklist over SQL is exactly the kind of control that leaks
-# (comments, CTEs wrapping DML, PRAGMA, stacked statements) and it would add
-# nothing on top of the layers above.
-QUERY_ROW_CAP = 200
-QUERY_MAX_PROGRESS_CALLBACKS = 50_000
-QUERY_PROGRESS_INTERVAL = 1_000
+# Read-only query surface. The five hardening layers, the row cap and the
+# no-SQL-parsing decision all live in roquery.py -- extracted 2026-08-07 when
+# 11.1 needed the same surface over index.db, because a second copy of a
+# security boundary is a second thing to get wrong.
+QUERY_ROW_CAP = roquery.ROW_CAP
 
 
 def query_column_trust():
-    """(trusted, handle) bare column NAMES for an arbitrary result set.
-
-    6.5 keys trust per (table, column) because the same name differs by table --
-    `notes` is untrusted in events AND contacts, `account` is trusted only in
-    events. A join has no single table, so that keying cannot apply here.
-    Resolution: classify by bare name with **untrusted winning every tie**, and
-    unknown names untrusted by default-deny. The cost is over-wrapping a column
-    that would have been safe in its own table; the alternative cost is
-    under-wrapping one that is not. Only one of those is a security failure."""
-    untrusted_names = set().union(*UNTRUSTED_COLUMNS.values())
-    handle_names = set().union(*HANDLE_COLUMNS.values())
-    trusted_names = (set().union(*TRUSTED_COLUMNS.values())
-                     - untrusted_names - handle_names)
-    return trusted_names, handle_names
+    """(trusted, handle) bare column names -- see roquery.bare_name_trust."""
+    return roquery.bare_name_trust(TRUSTED_COLUMNS, HANDLE_COLUMNS,
+                                   UNTRUSTED_COLUMNS)
 
 
 def cmd_query(args: argparse.Namespace) -> None:
     db_path = args.data_dir / "history.db"
     if not db_path.exists():
         sys.exit(f"error: {db_path} not found — run init_history_db.py first")
-    if not hasattr(sqlite3.Connection, "setlimit"):
-        sys.exit("error: needs Python 3.11+ (Connection.setlimit) to close the "
-                 "ATTACH escape; refusing to open a query surface without it")
-
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only = ON")
-    conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
-    calls = 0
-
-    def guard():
-        nonlocal calls
-        calls += 1
-        return 1 if calls > QUERY_MAX_PROGRESS_CALLBACKS else 0
-
-    conn.set_progress_handler(guard, QUERY_PROGRESS_INTERVAL)
     try:
-        cur = conn.execute(args.sql)
-        rows = [dict(r) for r in cur.fetchmany(args.limit + 1)]
-    except (sqlite3.Error, sqlite3.Warning) as e:
+        conn = roquery.connect(db_path)
+        try:
+            rows, truncated = roquery.run(conn, args.sql, args.limit)
+        finally:
+            conn.close()
+    except roquery.QueryError as e:
         sys.exit(f"error: {e}")
-    finally:
-        conn.set_progress_handler(None, 0)
-        conn.close()
-
-    truncated = len(rows) > args.limit
-    rows = rows[:args.limit]
     trusted_names, handle_names = query_column_trust()
-    payload = {"rows": rows, "row_count": len(rows)}
-    if truncated:
-        payload["truncated"] = True
-        payload["hint"] = (f"stopped at --limit {args.limit}; narrow the query "
-                           "or raise the limit deliberately")
-    json.dump(
-        untrusted.apply_trust(
-            payload,
-            untrusted.under("rows", trusted_names) | {"row_count", "truncated",
-                                                      "hint"},
-            handle_fields=untrusted.under("rows", handle_names)),
-        sys.stdout, indent=2)
+    json.dump(roquery.payload(rows, truncated, args.limit, trusted_names,
+                              handle_names), sys.stdout, indent=2)
     print()
 
 
