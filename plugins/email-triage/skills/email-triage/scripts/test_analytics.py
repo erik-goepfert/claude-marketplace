@@ -118,7 +118,12 @@ def insert_envelope(conn: sqlite3.Connection, *, key: str, from_addr: str, date_
 
 
 @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed -- analytics.py is an optional Phase 3 helper")
-class AnalyticsTest(unittest.TestCase):
+class AnalyticsTestFixture(unittest.TestCase):
+    """Fixture only — defines NO tests. Subclassing a TestCase that has
+    tests re-runs every one of them under the subclass's name, which
+    inflates the suite and reports each failure twice, from a class that
+    did not cause it."""
+
     S1 = "2026-01-01T00:00:00Z"
     S2 = "2026-01-08T00:00:00Z"
 
@@ -279,6 +284,10 @@ class AnalyticsTest(unittest.TestCase):
 
     # -- categories: rates math, incl. the unsubscribe-rate metric --------
 
+
+class AnalyticsTest(AnalyticsTestFixture):
+    """Tests over AnalyticsTestFixture's fixture."""
+
     def test_categories_rates_math(self):
         result = analytics.cmd_categories(self.con, self.ns())
         marketing = self.by_key(result["categories"], "category", "marketing")
@@ -434,7 +443,7 @@ class AnalyticsTest(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed -- analytics.py is an optional Phase 3 helper")
-class AnalyticsTrustTests(AnalyticsTest):
+class AnalyticsTrustTests(AnalyticsTestFixture):
     """Phase 6.2 on analytics.py. Aggregates are not automatically safe: a
     COUNT is, but the GROUP BY key it came from is usually sender text."""
 

@@ -2602,8 +2602,23 @@ documents whatever actually landed.
       legitimate content was lost; separators can only add characters, so `pre`
       handling and `alt` inclusion are the only places output can regress.
 
-- [ ] **11.9 Test classes that inherit a TestCase with tests re-run all of
-      them** (found 2026-08-07 while adding 11.8's tests). `TrustLayerTests`
+- [x] **11.9 Test classes that inherit a TestCase with tests re-run all of
+      them** — **DONE 2026-08-07.** Six instances across five files were
+      re-running **70 duplicate tests**: analytics 12, batch 22 (two subclasses
+      × 11), history 5, threads 18, unsub 13. All five bases split into
+      `<Name>Fixture` (fixture only, no tests) plus the original class holding
+      the tests, with subclasses repointed. Suite reads 412 real tests where it
+      read 482, and the drop matches the predicted duplicate count exactly — so
+      nothing was lost, only stopped being counted twice.
+      Every base split cleanly at one boundary because in all five, fixture
+      methods already preceded test methods; that was checked before rewriting
+      rather than assumed.
+      Also fixed the one latent `SyntaxWarning` in the suite: a docstring
+      containing `\Seen` needed to be raw. All 22 modules now parse with zero
+      warnings under `-W error::SyntaxWarning`. Python will eventually make that
+      an error.
+      **Original write-up follows.** (found 2026-08-07 while adding 11.8's
+      tests). `TrustLayerTests`
       subclasses `ThreadsTestCase`, which defines **18 tests of its own**, so
       those 18 run twice under two names — the suite count is inflated and any
       failure is reported twice, from a class that did not cause it. My own

@@ -391,7 +391,12 @@ class ContextPrefetchTests(unittest.TestCase):
         self.assertEqual(len(payload["sender_stats"]), 2)
 
 
-class TrustedColumnsTests(unittest.TestCase):
+class TrustedColumnsTestsFixture(unittest.TestCase):
+    """Fixture only — defines NO tests. Subclassing a TestCase that has
+    tests re-runs every one of them under the subclass's name, which
+    inflates the suite and reports each failure twice, from a class that
+    did not cause it."""
+
     """Phase 6.5: trust as a column property, per table."""
 
     def setUp(self):
@@ -407,6 +412,10 @@ class TrustedColumnsTests(unittest.TestCase):
 
     def real_columns(self, name):
         return {row[1] for row in self.conn.execute(f"PRAGMA table_info({name})")}
+
+
+class TrustedColumnsTests(TrustedColumnsTestsFixture):
+    """Tests over TrustedColumnsTestsFixture's fixture."""
 
     def test_every_real_column_is_classified(self):
         """The drift guard the plan asks for: an UNCLASSIFIED new column fails
@@ -455,7 +464,7 @@ class TrustedColumnsTests(unittest.TestCase):
         self.assertNotIn("untrusted-content", stored)
 
 
-class ContextTrustTests(TrustedColumnsTests):
+class ContextTrustTests(TrustedColumnsTestsFixture):
     """`$HIST context` is the DB->model door."""
 
     def run_context(self):

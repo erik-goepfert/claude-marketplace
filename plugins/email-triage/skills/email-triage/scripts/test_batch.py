@@ -66,7 +66,12 @@ def msg_headers(mid: str, sender: str, subject: str):
     }
 
 
-class BatchTests(unittest.TestCase):
+class BatchTestsFixture(unittest.TestCase):
+    """Fixture only — defines NO tests. Subclassing a TestCase that has
+    tests re-runs every one of them under the subclass's name, which
+    inflates the suite and reports each failure twice, from a class that
+    did not cause it."""
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="email-triage-batch-test-"))
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)]))
@@ -141,6 +146,10 @@ class BatchTests(unittest.TestCase):
             return [dict(r) for r in conn.execute("SELECT * FROM events ORDER BY id")]
         finally:
             conn.close()
+
+
+class BatchTests(BatchTestsFixture):
+    """Tests over BatchTestsFixture's fixture."""
 
     def test_end_to_end_move_batch(self):
         # An external arrival dropped in before the batch runs must surface
@@ -324,8 +333,8 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(ev["final_action"], "activate")
 
 
-class ActiveZoneSeenTests(BatchTests):
-    """User rule 2026-08-07: leaving the active zone marks the mail read.
+class ActiveZoneSeenTests(BatchTestsFixture):
+    r"""User rule 2026-08-07: leaving the active zone marks the mail read.
     `\Seen` means "awaiting your attention" inside the live tiers and is noise
     outside them -- an unread badge on something already decided."""
 
@@ -377,7 +386,7 @@ class ActiveZoneSeenTests(BatchTests):
         self.assertNotIn("activate", batch.LEAVES_ACTIVE_ZONE)
 
 
-class BatchTrustTests(BatchTests):
+class BatchTrustTests(BatchTestsFixture):
     """Phase 6.2 on batch.py, whose allowlist is COMPOSED from indexer's."""
 
     def hostile_inbox_message(self, key="kh", mid="hostile&1@x"):

@@ -39,7 +39,12 @@ def put_maildir_file(root, folder, name, raw_bytes: bytes) -> str:
     return path
 
 
-class UnsubTestCase(unittest.TestCase):
+class UnsubTestCaseFixture(unittest.TestCase):
+    """Fixture only — defines NO tests. Subclassing a TestCase that has
+    tests re-runs every one of them under the subclass's name, which
+    inflates the suite and reports each failure twice, from a class that
+    did not cause it."""
+
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
         self.maildir_root = os.path.join(self._tmpdir.name, "acct")
@@ -158,6 +163,10 @@ class UnsubTestCase(unittest.TestCase):
         return msg
 
     # -- links --
+
+
+class UnsubTestCase(UnsubTestCaseFixture):
+    """Tests over UnsubTestCaseFixture's fixture."""
 
     def test_links_no_unsubscribe_anything(self):
         msg = self._no_unsub_message()
@@ -309,7 +318,7 @@ class UnsubTestCase(unittest.TestCase):
         self.assertIn("interactive page", result["note"])
 
 
-class TrustAndIndexedLinkTests(UnsubTestCase):
+class TrustAndIndexedLinkTests(UnsubTestCaseFixture):
     """Phase 6.2 on unsub.py: URLs are handles, and `exec --link N` removes the
     round-trip that escaping them would have broken."""
 

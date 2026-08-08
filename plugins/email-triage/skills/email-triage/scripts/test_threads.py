@@ -51,7 +51,12 @@ def days_ago(n: int) -> str:
     return iso(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=n))
 
 
-class ThreadsTestCase(unittest.TestCase):
+class ThreadsTestCaseFixture(unittest.TestCase):
+    """Fixture only — defines NO tests. Subclassing a TestCase that has
+    tests re-runs every one of them under the subclass's name, which
+    inflates the suite and reports each failure twice, from a class that
+    did not cause it."""
+
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
         self.db_path = Path(self._tmpdir.name) / "index.db"
@@ -128,6 +133,10 @@ class ThreadsTestCase(unittest.TestCase):
                 threads.cmd_show(args)
         self.assertEqual(cm.exception.code, 1)
         return err.getvalue()
+
+
+class ThreadsTestCase(ThreadsTestCaseFixture):
+    """Tests over ThreadsTestCaseFixture's fixture."""
 
     # (a) 3-message In-Reply-To chain assembles as one thread.
     def test_in_reply_to_chain_assembles_one_thread(self):
@@ -410,7 +419,7 @@ class ThreadsTestCase(unittest.TestCase):
         self.assertEqual(out, {"residue": [], "threads": 0, "messages": 0})
 
 
-class TrustLayerTests(ThreadsTestCase):
+class TrustLayerTests(ThreadsTestCaseFixture):
     """Phase 6.2 on threads.py: escape + `_trust` manifest at every emitter.
 
     The load-bearing test is assert_manifest_is_complete, which compares the
@@ -671,7 +680,7 @@ class FlagCommandTests(unittest.TestCase):
         os.environ["HIMA_DATA"] = str(self.hima_data)
 
     def insert(self, **kw):
-        ThreadsTestCase.insert(self, **kw)
+        ThreadsTestCaseFixture.insert(self, **kw)
 
     def run_flag(self, message_id, mode):
         parser = threads.build_parser()
