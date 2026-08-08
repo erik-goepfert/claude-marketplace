@@ -2340,7 +2340,20 @@ documents whatever actually landed.
       corpus exists: 19 sent messages to Raimund, 5 to Pete, 351 to Bonnie, and
       2,973 of 2,974 sent messages carry a usable `to_addr`.
 
-      **Also in 11.5: strip development references out of the shipped files.**
+      **Also in 11.5: strip development references out of the shipped files** —
+      **DONE 2026-08-07.** Seven sites, one more than the six first counted: a
+      `§9` citation inside reference.md's Analytics section was missed on the
+      first pass because the audit grepped for "Phase" and filenames, not for
+      design-doc section marks. Every phase number is gone from both shipped
+      files; the two surviving filename pointers now say explicitly that those
+      docs live in the source repository and are not installed, so a reader who
+      lacks them knows that rather than chasing a dead path. `email-skill-design
+      §4` and `§9` were replaced by the one sentence of rationale that made each
+      worth citing. Verified afterwards that every remaining `§X` reference
+      resolves to a heading inside the shipped SKILL/reference pair.
+      **Still open in 11.5:** the compose-new documentation, which waits on 11.4.
+
+      **Original sub-task write-up follows.**
       Raised 2026-08-07 — "after we finish initial development I wouldn't expect
       the skill to reference a development doc." Verified: the installed plugin
       contains only `plugin.json`, `SKILL.md`, `reference.md` and `scripts/`, so

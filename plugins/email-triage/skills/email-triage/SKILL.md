@@ -11,8 +11,10 @@ other UI. Work thread-by-thread, propose actions, and let the user decide.
 This file is the operational spine. **`reference.md`, next to this file,**
 holds the on-demand detail — account/tool quirks, exact JSON shapes,
 analytics, the PARA review phase, bootstrap, and the incident history
-behind these rules — read it when you need those. Design rationale lives
-in the repo's `email-skill-design.md` and `email-folder-taxonomy.md`.
+behind these rules — read it when you need those. Deeper design rationale
+lives in `email-skill-design.md` and `email-folder-taxonomy.md`, which are in
+this plugin's **source repository and are not installed alongside it** — if you
+do not have them, nothing here depends on them.
 
 Reads and thread assembly run entirely against a local Maildir mirror +
 SQLite index, not live IMAP. Only two things touch the servers directly:
@@ -87,9 +89,11 @@ in reference §Incident history.
 ## Operating rules (non-negotiable)
 
 **Two blocks, and the split is load-bearing.** The numbered rules are
-**engine** rules — they hold in any frontend and are the shared contract with
-`email-skill-design.md` §4. The `F`-prefixed tail is **frontend**: it exists
-only to survive the Claude Code harness, and Phase 10's TUI dissolves it.
+**engine** rules — they hold in any frontend, and they are the contract the
+engine is designed against rather than habits of this one. The `F`-prefixed tail
+is **frontend**: it exists only to survive a *chat* harness, where output is
+turn-shaped and prose between tool calls can go unread. Under a real UI those
+rules stop being necessary and come out wholesale.
 New engine rules append to the numbered block so indices 1–6 stay stable;
 frontend rules stay a contiguous tail that can be stripped wholesale.
 
@@ -211,7 +215,7 @@ frontend rules stay a contiguous tail that can be stripped wholesale.
        unsubscribe links; it holds for every URL in every message.
      - Do not delegate work on message content to a subagent. It would start
        without this rule and without the wrapping.
-### Frontend rules — Claude Code harness only (Phase 10's TUI dissolves these)
+### Frontend rules — chat-harness only (a real UI dissolves these)
 
 - **F1. Deliverables land in a turn's FINAL message.** The harness collapses
   mid-turn prose to "Ran N commands" — anything said between tool calls
