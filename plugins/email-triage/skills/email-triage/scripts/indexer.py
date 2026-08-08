@@ -1242,6 +1242,28 @@ BACKFILL_SQL = """SELECT e.id, e.account, e.folder, e.maildir_key, e.maildir_fil
                   WHERE f.rowid IS NULL"""
 
 
+def _resolve_for_backfill(folder_path: Path, filename: str, key: str):
+    """The recorded filename first, then the stable maildir key.
+
+    Resolve-before-act, same reasoning as act.py: any sync or flag change since
+    the last index may have renamed the file, and the key is the part that does
+    not move."""
+    for sub in ("cur", "new"):
+        candidate = folder_path / sub / filename
+        if candidate.exists():
+            return candidate
+    for sub in ("cur", "new"):
+        d = folder_path / sub
+        if not d.is_dir():
+            continue
+        for entry in d.iterdir():
+            if entry.name.startswith("."):
+                continue
+            if entry.name.split(":2,", 1)[0] == key:
+                return entry
+    return None
+
+
 def cmd_backfill_bodies(args: argparse.Namespace) -> int:
     """One-off: add bodies for rows indexed before body search existed.
 
@@ -1260,11 +1282,9 @@ def cmd_backfill_bodies(args: argparse.Namespace) -> int:
     cur = conn.cursor()
     rows = cur.execute(BACKFILL_SQL).fetchall()
     done = skipped = 0
-    for i, (rowid, account, folder, _key, filename) in enumerate(rows, 1):
-        path = args.maildir / account / folder / "cur" / filename
-        if not path.exists():
-            path = args.maildir / account / folder / "new" / filename
-        if not path.exists():
+    for i, (rowid, account, folder, key, filename) in enumerate(rows, 1):
+        path = _resolve_for_backfill(args.maildir / account / folder, filename, key)
+        if path is None:
             skipped += 1
             continue
         if index_body(cur, rowid, path):

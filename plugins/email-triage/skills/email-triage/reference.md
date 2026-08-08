@@ -72,6 +72,37 @@ Python's `set_content` emits `text/plain; charset=utf-8` with **no**
 because plain unwrapped paragraphs achieve the same result in every modern
 client with none of the trailing-whitespace fragility.
 
+## Search, and which of the four to reach for
+
+| want | use |
+|---|---|
+| "where is anything about X" | `$SEARCH --term "X"` — all three stores |
+| prefixes, `NEAR`, boolean FTS | `$IDX search --term 'deliver*'` |
+| structured: recipients, dates, joins | `$IDX query --sql "…"` |
+| decisions, rules, contacts, notes | `$HIST query --sql "…"` |
+
+`$SEARCH` matches literally (the term is `re.escape`d and passed to FTS as a
+quoted phrase), so a stray `*` or `"` is a character rather than a syntax error.
+That is the whole reason it is separate from `$IDX search`.
+
+**Body search has no snippets** — contentless FTS5 keeps the term dictionary and
+posting lists, not the text. Two reasons that is the right side of the trade: a
+snippet column would be a second door for sender prose to reach the model with
+its own escape path, and a second at-rest copy of body text to keep consistent
+with the Maildir. Results are ranked message-ids; `$THR read` the ones you want.
+
+`snippet()`/`highlight()` do not error on a contentless table — they return
+**NULL silently** (SQLite 3.53.3). Do not build on them.
+
+Population is incremental: only new mail decodes a body, so a session pays for
+arrivals. `$IDX backfill-bodies` is the one-off for pre-existing mail (16,092 of 16,744 on
+2026-08-07). The 652 skips were checked rather than assumed: sampling 400 of them
+found **zero** with extractable text — 390 have genuinely empty text parts and 10
+fail to parse. They are dominated by attachment-only sends (photo, PDF, Word),
+which is why `sent` and `allmail` lead the list: a Gmail sent message is counted
+in both. Nothing searchable is missing. `$IDX index
+--no-bodies` skips body work for a fast header-only rebuild.
+
 ## Message-level search (`$IDX query`)
 
 Read-only SQL over `index.db`, same hardened surface and same invocation as

@@ -2343,7 +2343,32 @@ documents whatever actually landed.
       property of the flag — so it stays true whether or not 11.1 ever lands.
       Runtime docs describe present capability; roadmaps belong in the plan.
 
-- [ ] **11.6 Body search — the piece that does not exist at all.**
+- [x] **11.6 Body search — the piece that does not exist at all** — **DONE
+      2026-08-07** (`a542517` the index, then `$SEARCH`). Backfilled against the
+      real mailbox: **16,092 of 16,744** bodies indexed.
+      **Size beat the estimate, as predicted.** `body_fts*` is **14.6 MB** against
+      this item's 24 MB linear extrapolation, with `envelopes` at 7.6 MB and the
+      file at 26.8 MB total. Sub-linear vocabulary growth is why, and it is worth
+      recording that the pessimistic estimate was the right one to plan with.
+      **The 652 skips were checked, not assumed.** Sampling 400 found **zero**
+      with extractable text: 390 have genuinely empty text parts, 10 fail to
+      parse. Dominated by attachment-only sends (image/jpeg, application/pdf,
+      application/msword beside empty text parts), which is why `sent` (261) and
+      `allmail` (385) lead — a Gmail sent message is counted in both. Nothing
+      searchable is missing, which is the only claim that mattered.
+      Population is **incremental**: only new rows decode a body, since a flag
+      change re-derives from the filename suffix. So the minutes-long cost this
+      item accepted is the one-off backfill, not every session — a better outcome
+      than the accepted-cost paragraph predicted. `--no-bodies` and
+      `backfill-bodies` are the escape hatches.
+      `$SEARCH` covers all three stores, each section classified by its OWN
+      database's column map since the same bare name can differ between them. The
+      term is matched **literally** (`re.escape` + FTS phrase quoting with `""`
+      doubling), so a stray `*`, `%` or `"` is a character rather than a syntax
+      error; `$IDX search --term` remains the FTS-syntax door. "No body hits" and
+      "body search does not exist yet" are deliberately distinguishable via
+      `unavailable`, with a test for it.
+      **Original write-up follows.**
       **Do 11.8 first** — this indexes extracted body text, and changing the
       extractor afterwards means rebuilding every posting from scratch.
       `index.db`
