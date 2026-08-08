@@ -76,8 +76,10 @@ import argparse
 import datetime
 import email
 import email.policy
+import email.utils
 import json
 import os
+import tempfile
 import re
 import sqlite3
 import sys
@@ -1591,6 +1593,206 @@ def resolve_himalaya_id(himalaya_bin: str, hima_account: str, member: dict) -> s
            "not found; run the indexer / sync and retry"))
 
 
+# --------------------------------------------------------------------------
+# edit-draft (11.3): guarded draft mutation
+# --------------------------------------------------------------------------
+
+EDIT_TRUSTED = {"folder", "file", "verified", "dry_run", "next",
+                "replacements.applied_to", "replacements.count"}
+EDIT_HANDLES = {"old_message_id", "new_message_id"}
+_TEXT_SUBTYPES = ("plain", "html")
+
+
+def _editable_parts(msg):
+    """Every text/plain and text/html leaf, in document order.
+
+    Both get edited when both match: a multipart/alternative whose branches
+    disagree shows different text depending on the reader's client, which is the
+    same human/model asymmetry 6.4 exists to prevent -- here pointed at the
+    user."""
+    parts = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        if part.get_content_maintype() == "text" and \
+                part.get_content_subtype() in _TEXT_SUBTYPES:
+            parts.append(part)
+    return parts
+
+
+def apply_replacements(msg, replacements):
+    """Apply (old, new) pairs to decoded text parts. Returns a report list.
+
+    Raises FatalError unless every replacement matches **exactly once in every
+    part that contains it, and at least one part overall**. A replacement that
+    matched twice is ambiguous and one that matched nowhere is a typo; saving
+    either would write a half-corrected draft over a known-good one, and the
+    caller cannot tell from the result which happened."""
+    parts = _editable_parts(msg)
+    if not parts:
+        raise FatalError("draft has no text/plain or text/html part to edit")
+
+    decoded = {}
+    for part in parts:
+        try:
+            decoded[id(part)] = part.get_content()
+        except Exception as e:
+            raise FatalError(f"cannot decode {part.get_content_type()} part: {e}")
+
+    report = []
+    for old, new in replacements:
+        if not old:
+            raise FatalError("empty search string")
+        hits = {}
+        for part in parts:
+            n = decoded[id(part)].count(old)
+            if n > 1:
+                raise FatalError(
+                    f"{old[:40]!r} appears {n} times in the "
+                    f"{part.get_content_type()} part -- ambiguous, refusing to "
+                    "guess which one you meant")
+            if n == 1:
+                hits[part.get_content_type()] = part
+        if not hits:
+            raise FatalError(
+                f"{old[:40]!r} not found in any text part -- nothing was "
+                "changed (check for soft line breaks splitting the phrase)")
+        for ctype, part in hits.items():
+            decoded[id(part)] = decoded[id(part)].replace(old, new, 1)
+        report.append({"count": len(hits), "applied_to": sorted(hits)})
+
+    for part in parts:
+        # set_content rewrites charset and transfer-encoding to match the new
+        # text, which is the point: an edit that lengthens a line must not be
+        # written back under the old quoted-printable framing.
+        part.set_content(decoded[id(part)],
+                         subtype=part.get_content_subtype(), charset="utf-8")
+    return report
+
+
+def cmd_edit_draft(args: argparse.Namespace) -> None:
+    """Edit a saved draft in place-ish: mutate, re-save as a NEW message, and
+    leave the predecessor alone.
+
+    The ordering is the safety property, not a detail. Saving the corrected copy
+    before removing the old one means the failure mode is two drafts, never zero
+    -- and removing the old one is a move, which rule 1 reserves for the user."""
+    conn = connect_db(args.db)
+    try:
+        # Returns a (folder, maildir_key) TUPLE and raises when absent -- it
+        # never returns None, so there is no missing-row branch to write here.
+        indexed_folder, _key = resolve_message_row(conn, args.account,
+                                                   args.message_id)
+        folder = args.folder or indexed_folder
+        path = resolve_message_file(args.maildir, args.account,
+                                    args.message_id, conn)
+    finally:
+        conn.close()
+
+    msg = load_raw_message(path)
+    report = apply_replacements(msg, args.replace)
+
+    if args.dry_run:
+        print(json.dumps(untrusted.apply_trust(
+            {"replacements": report, "dry_run": True, "folder": folder,
+             "old_message_id": args.message_id, "new_message_id": None,
+             "verified": False,
+             "next": "nothing was written; drop --dry-run to save"},
+            EDIT_TRUSTED, handle_fields=EDIT_HANDLES), indent=2, sort_keys=True))
+        return
+
+    # A re-saved draft is a NEW message, so it gets a new id and a new date.
+    # The domain comes from the From address, not from make_msgid's default --
+    # that default is socket.getfqdn(), which stamps the local machine name
+    # ("@Mac") into a header that leaves the building.
+    sender = _first_addr(msg.get("From", ""))
+    new_id = email.utils.make_msgid(
+        domain=sender.rsplit("@", 1)[-1] if "@" in sender else "localhost")
+    del msg["Message-ID"]
+    msg["Message-ID"] = new_id
+    del msg["Date"]
+    msg["Date"] = email.utils.formatdate(localtime=True)
+
+    hima_account = args.himalaya_account or f"{args.account}-local"
+    with tempfile.NamedTemporaryFile("wb", suffix=".eml", delete=False) as tmp:
+        tmp.write(msg.as_bytes(policy=email.policy.default.clone(linesep="\n")))
+        tmp_path = tmp.name
+    try:
+        # On STDIN, never as an argument: the argument form silently saves an
+        # EMPTY message, and passing neither hangs. Both cost a live session.
+        import subprocess
+        with open(tmp_path, "rb") as fh:
+            proc = subprocess.run(
+                [args.himalaya, "message", "save", "-a", hima_account,
+                 "-f", folder],
+                stdin=fh, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise FatalError("himalaya message save failed: "
+                             f"{(proc.stderr or proc.stdout).strip()[:300]}")
+    finally:
+        os.unlink(tmp_path)
+
+    # Resolve the NEW draft's id fresh -- himalaya ids are positional and the
+    # save just shifted them.
+    member = {"folder": folder, "from_addr": _first_addr(msg.get("From", "")),
+              "date_utc": _to_index_date(msg["Date"]),
+              "message_id": new_id}
+    hid = resolve_himalaya_id(args.himalaya, hima_account, member)
+    _himalaya(args.himalaya, "flag", "add", "-a", hima_account, "-f", folder,
+              str(hid), "draft", "seen")
+
+    verified, new_file = _verify_saved_draft(args.maildir, args.account, folder,
+                                            new_id, args.replace)
+    print(json.dumps(untrusted.apply_trust(
+        {"replacements": report, "dry_run": False, "folder": folder,
+         "file": new_file, "old_message_id": args.message_id,
+         "new_message_id": new_id, "verified": verified,
+         "next": "the predecessor is STILL in drafts under its old "
+                 "message-id; removing it is a move, so it needs the user's "
+                 "approval (rule 1). Sync the drafts folder before reporting "
+                 "this done."},
+        EDIT_TRUSTED, handle_fields=EDIT_HANDLES), indent=2, sort_keys=True))
+
+
+def _first_addr(value: str) -> str:
+    return email.utils.parseaddr(value)[1] or value
+
+
+def _to_index_date(value: str):
+    try:
+        dt = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _verify_saved_draft(maildir_root, account, folder, new_id, replacements):
+    """Read the saved draft back off disk and confirm the edits are in it.
+
+    Reported rather than asserted: a false `verified` with the file path is more
+    useful than an exception, because the draft HAS been written by this point
+    and the caller needs to know where it is either way."""
+    folder_dir = os.path.join(str(maildir_root), folder)
+    for sub in ("cur", "new"):
+        d = os.path.join(folder_dir, sub)
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if name.startswith("."):
+                continue
+            full = os.path.join(d, name)
+            try:
+                saved = load_raw_message(full)
+            except Exception:
+                continue
+            if (saved.get("Message-ID") or "").strip() != new_id:
+                continue
+            text = "\n".join(p.get_content() for p in _editable_parts(saved))
+            ok = all(new in text for _old, new in replacements if new)
+            return ok, os.path.relpath(full, str(maildir_root))
+    return False, None
+
+
 def cmd_flag(args: argparse.Namespace) -> None:
     """--seen: mark ONE message read (the moment its content is shown).
     --block / --unblock: rule 2's thread-wide clear-then-set, mechanized —
@@ -1909,6 +2111,37 @@ def build_parser() -> argparse.ArgumentParser:
              "full body",
     )
     read_p.set_defaults(func=cmd_read)
+
+    ed_p = sub.add_parser(
+        "edit-draft",
+        help="apply exact replacements to a saved draft and re-save it as a new "
+             "message, leaving the predecessor in place",
+        description="Encapsulates the eight manual steps (resolve, export, "
+                    "decode, replace, re-encode, save, flag, verify). Every "
+                    "replacement must match EXACTLY ONCE in every text part "
+                    "that contains it, and at least one part overall -- "
+                    "otherwise nothing is written. The corrected copy is saved "
+                    "BEFORE anything is removed, so the failure mode is two "
+                    "drafts and never zero; removing the old one is a move and "
+                    "belongs to the user (rule 1).")
+    ed_p.add_argument("--db", type=Path, default=None)
+    ed_p.add_argument("--account", required=True)
+    ed_p.add_argument("--message-id", required=True, dest="message_id")
+    ed_p.add_argument("--maildir", type=Path, default=None)
+    ed_p.add_argument("--folder", default=None,
+                      help="drafts folder; default the draft's indexed folder")
+    ed_p.add_argument("--replace", nargs=2, action="append", required=True,
+                      metavar=("OLD", "NEW"),
+                      help="exact text to find and its replacement; repeatable. "
+                           "Two arguments rather than a delimiter, so no "
+                           "escaping is needed and no separator can appear in "
+                           "the text itself")
+    ed_p.add_argument("--dry-run", action="store_true", dest="dry_run",
+                      help="report match counts and write nothing")
+    ed_p.add_argument("--himalaya", default="himalaya")
+    ed_p.add_argument("--himalaya-account", default=None, dest="himalaya_account",
+                      help="himalaya account name; default <account>-local")
+    ed_p.set_defaults(func=cmd_edit_draft)
 
     return parser
 

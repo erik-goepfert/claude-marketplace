@@ -2282,7 +2282,31 @@ documents whatever actually landed.
       Tests want real fixtures: Apple Mail QP+HTML, Gmail, Outlook, a forward,
       an interleaved reply, and a message quoting an article (tier 3, must
       survive).
-- [ ] **11.3 `$THR edit-draft` — guarded draft mutation.** Encapsulate the eight
+- [x] **11.3 `$THR edit-draft` — guarded draft mutation** — **DONE 2026-08-07.**
+      13 tests. The refusals are the feature: a replacement must match **exactly
+      once in every text part that contains it, and at least one part overall**,
+      and one bad replacement blocks the whole edit — a run that applied two of
+      three would leave a draft nobody has read in a state nobody intended.
+      `--replace OLD NEW` takes two arguments rather than a delimiter, so nothing
+      needs escaping and no separator can collide with the text.
+      `--dry-run` reports counts and touches nothing, which matters when the
+      exactly-once rule is what you are checking.
+      **Both alternatives get edited when both match.** A multipart/alternative
+      whose branches disagree shows different text depending on the client — the
+      same human/model asymmetry 6.4 exists to prevent, pointed at the user. The
+      Apple Mail blank-plain-beside-real-html shape from 2026-08-07 has its own
+      test, since a blank sibling must make the edit neither ambiguous nor absent.
+      The stub genuinely simulates `message save` — reads stdin, writes to the
+      Maildir, registers an envelope — because a stub that printed "ok" would let
+      the two properties that matter most (the save used stdin; the saved copy
+      verifies) pass without being true. The stdin test asserts a byte count, as
+      the argument form silently saves an EMPTY message.
+      **Found while testing:** `make_msgid()` defaults to `socket.getfqdn()`,
+      which was stamping the local machine name (`@Mac`) into a header that
+      leaves the building. The domain now comes from the From address. (I first
+      suspected this call for a slow test run, measured it, and it was not the
+      cause — the fix stands on the hostname leak alone.)
+      **Original write-up follows.** Encapsulate the eight
       manual steps: resolve the draft, export raw, apply caller-supplied
       replacements to the DECODED part (QP/base64 handled), **assert each
       matches exactly once** so a partial fix can never be saved, re-encode,

@@ -1761,5 +1761,240 @@ class ReadNoQuotesTests(ReadFixture):
         self.assertIn("some quoted words", out["body"])
 
 
+HIMALAYA_DRAFT_STUB = """#!/usr/bin/env python3
+import datetime, email, email.policy, email.utils, json, os, pathlib, sys
+args = sys.argv[1:]
+with open(os.environ["HIMA_LOG"], "a") as f:
+    f.write(" ".join(args) + chr(10))
+def folder_of():
+    return args[args.index("-f") + 1]
+def load():
+    p = os.environ["HIMA_DATA"]
+    return json.load(open(p)) if os.path.exists(p) else {}
+if args[:2] == ["message", "save"]:
+    raw = sys.stdin.buffer.read()
+    with open(os.environ["HIMA_LOG"], "a") as f:
+        f.write("STDIN_BYTES=%d" % len(raw) + chr(10))
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    d = pathlib.Path(os.environ["HIMA_MAILDIR"]) / folder_of() / "cur"
+    d.mkdir(parents=True, exist_ok=True)
+    n = len(list(d.iterdir())) + 1
+    (d / ("saved%d:2,D" % n)).write_bytes(raw)
+    data = load()
+    dt = email.utils.parsedate_to_datetime(msg["Date"]).astimezone(
+        datetime.timezone.utc)
+    data.setdefault(folder_of(), []).append(
+        {"id": str(100 + n),
+         "from": {"addr": email.utils.parseaddr(msg["From"])[1]},
+         "date": dt.strftime("%Y-%m-%d %H:%M+00:00")})
+    json.dump(data, open(os.environ["HIMA_DATA"], "w"))
+    print("saved")
+elif args and args[0] == "envelope":
+    print(json.dumps(load().get(folder_of(), [])))
+else:
+    print("ok")
+"""
+
+
+class EditDraftTests(unittest.TestCase):
+    """Phase 11.3 — guarded draft mutation.
+
+    The stub genuinely simulates `message save`: it reads STDIN, writes the
+    message into the Maildir, and registers an envelope so id resolution can find
+    it. A stub that just printed "ok" would let the two properties that matter
+    most -- the save happened on stdin, and the saved copy verifies -- pass
+    without being true."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        tmp = Path(self._tmp.name)
+        self.maildir = tmp / "mail"
+        self.drafts = "Drafts"
+        for sub in ("cur", "new", "tmp"):
+            (self.maildir / self.drafts / sub).mkdir(parents=True)
+        self.db_path = tmp / "index.db"
+        self.conn = indexer.init_db(self.db_path)
+        self.addCleanup(self.conn.close)
+        self.hima = tmp / "hima-stub"
+        self.hima.write_text(HIMALAYA_DRAFT_STUB)
+        self.hima.chmod(0o755)
+        self.log = tmp / "hima.log"
+        os.environ["HIMA_LOG"] = str(self.log)
+        os.environ["HIMA_DATA"] = str(tmp / "hima-data.json")
+        os.environ["HIMA_MAILDIR"] = str(self.maildir)
+
+    def put_draft(self, plain=None, html=None, key="d1",
+                  message_id="<draft1@x>"):
+        msg = EmailMessage()
+        msg["From"] = "me@example.com"
+        msg["To"] = "pete@example.com"
+        msg["Subject"] = "Thursday"
+        msg["Date"] = "Mon, 4 Aug 2026 09:00:00 +0000"
+        msg["Message-ID"] = message_id
+        if plain is not None:
+            msg.set_content(plain)
+            if html is not None:
+                msg.add_alternative(html, subtype="html")
+        elif html is not None:
+            msg.set_content(html, subtype="html")
+        (self.maildir / self.drafts / "cur" / f"{key}:2,D").write_bytes(
+            msg.as_bytes())
+        self.conn.execute(
+            """INSERT INTO envelopes (message_id, folder, maildir_key,
+               maildir_file, account, folder_tier, subject, from_addr, date_utc)
+               VALUES (?, ?, ?, ?, 'ic', 'drafts', 'Thursday',
+                       'me@example.com', '2026-08-04T09:00:00Z')""",
+            (message_id, self.drafts, key, f"{key}:2,D"))
+        self.conn.commit()
+        return message_id
+
+    def edit(self, message_id, pairs, dry_run=False):
+        argv = ["edit-draft", "--db", str(self.db_path), "--account", "ic",
+                "--message-id", message_id, "--maildir", str(self.maildir),
+                "--himalaya", str(self.hima)]
+        for old, new in pairs:
+            argv += ["--replace", old, new]
+        if dry_run:
+            argv.append("--dry-run")
+        args = threads.build_parser().parse_args(argv)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            threads.cmd_edit_draft(args)
+        return unwrap_trust(buf.getvalue())
+
+    def saved_files(self):
+        d = self.maildir / self.drafts / "cur"
+        return sorted(p.name for p in d.iterdir())
+
+    # -- the refusals, which are the point ----------------------------------
+
+    def test_ambiguous_match_refuses_and_writes_nothing(self):
+        """Two matches means we would be guessing which one. A half-corrected
+        draft saved over a known-good one is the failure this prevents."""
+        mid = self.put_draft(plain="fix the teh typo and teh other one")
+        before = self.saved_files()
+        with self.assertRaises(threads.FatalError) as ctx:
+            self.edit(mid, [("teh", "the")])
+        self.assertIn("ambiguous", str(ctx.exception))
+        self.assertEqual(self.saved_files(), before)
+
+    def test_missing_match_refuses_and_writes_nothing(self):
+        mid = self.put_draft(plain="nothing to correct here")
+        before = self.saved_files()
+        with self.assertRaises(threads.FatalError) as ctx:
+            self.edit(mid, [("absent phrase", "x")])
+        self.assertIn("not found", str(ctx.exception))
+        self.assertEqual(self.saved_files(), before)
+
+    def test_one_bad_replacement_blocks_the_whole_edit(self):
+        """All-or-nothing: a run that applied two of three would leave a draft
+        nobody has read in a state nobody intended."""
+        mid = self.put_draft(plain="alpha and beta")
+        before = self.saved_files()
+        with self.assertRaises(threads.FatalError):
+            self.edit(mid, [("alpha", "ALPHA"), ("gamma", "GAMMA")])
+        self.assertEqual(self.saved_files(), before)
+
+    def test_dry_run_reports_counts_and_writes_nothing(self):
+        mid = self.put_draft(plain="alpha and beta")
+        before = self.saved_files()
+        out, _trust = self.edit(mid, [("alpha", "ALPHA")], dry_run=True)
+        self.assertTrue(out["dry_run"])
+        self.assertEqual(out["replacements"][0]["count"], 1)
+        self.assertIsNone(out["new_message_id"])
+        self.assertEqual(self.saved_files(), before)
+        self.assertFalse(self.log.exists())      # himalaya never invoked
+
+    # -- the happy path -----------------------------------------------------
+
+    def test_edit_saves_a_new_draft_and_verifies_it(self):
+        mid = self.put_draft(plain="see you on Tuesday")
+        out, _trust = self.edit(mid, [("Tuesday", "Thursday")])
+        self.assertEqual(out["replacements"][0]["applied_to"], ["text/plain"])
+        self.assertTrue(out["verified"])
+        self.assertIsNotNone(out["file"])
+        self.assertNotEqual(out["new_message_id"], mid)
+
+    def test_predecessor_is_left_in_place(self):
+        """Saving before removing means the failure mode is two drafts, never
+        zero -- and removing one is a move, which rule 1 gives to the user."""
+        mid = self.put_draft(plain="see you on Tuesday", key="d1")
+        out, _trust = self.edit(mid, [("Tuesday", "Thursday")])
+        names = self.saved_files()
+        self.assertIn("d1:2,D", names)                 # original still there
+        self.assertEqual(len(names), 2)
+        self.assertIn("approval", out["next"])
+
+    def test_save_happens_on_stdin_not_as_an_argument(self):
+        """The argument form silently saves an EMPTY message and passing neither
+        hangs. Both cost a live session, so the stub records the byte count."""
+        mid = self.put_draft(plain="see you on Tuesday")
+        self.edit(mid, [("Tuesday", "Thursday")])
+        log = self.log.read_text()
+        self.assertIn("message save", log)
+        sizes = [int(l.split("=")[1]) for l in log.splitlines()
+                 if l.startswith("STDIN_BYTES=")]
+        self.assertEqual(len(sizes), 1)
+        self.assertGreater(sizes[0], 50)
+
+    def test_draft_and_seen_flags_are_set_on_the_new_message(self):
+        mid = self.put_draft(plain="see you on Tuesday")
+        self.edit(mid, [("Tuesday", "Thursday")])
+        flag_lines = [l for l in self.log.read_text().splitlines()
+                      if l.startswith("flag add")]
+        self.assertEqual(len(flag_lines), 1)
+        self.assertIn("draft", flag_lines[0])
+        self.assertIn("seen", flag_lines[0])
+
+    def test_both_alternatives_are_edited_when_both_match(self):
+        """A multipart/alternative whose branches disagree shows different text
+        depending on the client -- the same asymmetry 6.4 exists to prevent,
+        pointed at the user instead of the model."""
+        mid = self.put_draft(plain="see you on Tuesday",
+                             html="<p>see you on Tuesday</p>")
+        out, _trust = self.edit(mid, [("Tuesday", "Thursday")])
+        self.assertEqual(out["replacements"][0]["count"], 2)
+        self.assertEqual(out["replacements"][0]["applied_to"],
+                         ["text/html", "text/plain"])
+        self.assertTrue(out["verified"])
+
+    def test_apple_mail_blank_plain_beside_real_html(self):
+        """The live 2026-08-07 shape. The edit must land in the part that
+        actually holds the draft, and a blank sibling must not make it
+        ambiguous or absent."""
+        mid = self.put_draft(plain="", html="<p>see you on Tuesday</p>")
+        out, _trust = self.edit(mid, [("Tuesday", "Thursday")])
+        self.assertEqual(out["replacements"][0]["applied_to"], ["text/html"])
+        self.assertTrue(out["verified"])
+
+    def test_non_ascii_survives_the_round_trip(self):
+        mid = self.put_draft(plain="cost is 90 EUR - fix it")
+        out, _trust = self.edit(mid, [("90 EUR", "\N{EURO SIGN}90")])
+        self.assertTrue(out["verified"])
+
+    # -- trust --------------------------------------------------------------
+
+    def test_replacement_text_is_never_echoed_back(self):
+        """Counts and part names only. The draft may quote a sender, so echoing
+        the strings would put sender-derived text in a payload whose whole
+        report is otherwise ours."""
+        mid = self.put_draft(plain="see you on Tuesday")
+        out, _trust = self.edit(mid, [("Tuesday", "Thursday")])
+        blob = json.dumps(out)
+        self.assertNotIn("Tuesday", blob)
+        self.assertEqual(set(out["replacements"][0]), {"count", "applied_to"})
+
+    def test_message_ids_are_handles_and_counts_are_trusted(self):
+        mid = self.put_draft(plain="see you on Tuesday")
+        out, trust = self.edit(mid, [("Tuesday", "Thursday")])
+        declared = set(trust["untrusted_fields"])
+        self.assertIn("old_message_id", declared)
+        self.assertIn("new_message_id", declared)
+        self.assertEqual(out["old_message_id"], mid)   # unescaped, still a key
+        self.assertNotIn("replacements.count", declared)
+        self.assertNotIn("verified", declared)
+
+
 if __name__ == "__main__":
     unittest.main()
