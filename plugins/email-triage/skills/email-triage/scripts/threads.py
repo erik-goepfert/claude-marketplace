@@ -82,6 +82,7 @@ import re
 import sqlite3
 import sys
 from collections import defaultdict
+from typing import NamedTuple
 from email.utils import getaddresses
 from html.parser import HTMLParser
 from pathlib import Path
@@ -470,6 +471,12 @@ class _HTMLTextExtractor(HTMLParser):
     # body text. Quote markers deliberately render as the plain-text `> `
     # convention, so quote isolation gets ONE code path for HTML and plain.
     _Q_OPEN, _Q_CLOSE, _PRE_OPEN, _PRE_CLOSE = "\x01>", "\x01<", "\x01[", "\x01]"
+    # A CITE container is a client's own "this is the message I am replying to"
+    # wrapper -- Apple Mail's `type="cite"`, Gmail's `gmail_quote` class. It
+    # renders identically to a bare blockquote; the distinction exists only so
+    # quote isolation can tell tier 2 (structurally marked, strip) from tier 3
+    # (an unattributed quotation the author chose to include, KEEP).
+    _QC_OPEN = "\x01{"
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -539,7 +546,10 @@ class _HTMLTextExtractor(HTMLParser):
         elif tag in self._CELL_TAGS:
             self._chunks.append(" ")
         elif tag == "blockquote":
-            self._chunks.append("\n" + self._Q_OPEN)
+            a = {k.lower(): (v or "") for k, v in attrs}
+            cite = (a.get("type", "").strip().lower() == "cite"
+                    or "gmail_quote" in a.get("class", "").lower())
+            self._chunks.append("\n" + (self._QC_OPEN if cite else self._Q_OPEN))
         elif tag == "pre":
             self._chunks.append("\n" + self._PRE_OPEN)
         if tag == "li":
@@ -590,7 +600,8 @@ class _HTMLTextExtractor(HTMLParser):
 
         One linear pass. A marker anywhere in a line applies to the whole line,
         which is why the emitters put a newline next to each one."""
-        out, quote, pre = [], 0, 0
+        out, kinds, pre = [], [], 0
+        self._cite_lines = set()
         for line in "".join(self._chunks).split("\n"):
             seg, i = [], 0
             # State is captured at the line's FIRST content character, not at
@@ -598,39 +609,51 @@ class _HTMLTextExtractor(HTMLParser):
             # depth afterwards had already un-quoted the line it applied to --
             # which silently dropped the `> ` from every single-line quote and
             # re-collapsed the last line of every <pre>.
-            at_quote = at_pre = None
+            at_kinds = at_pre = None
             while i < len(line):
                 if line[i] == "\x01" and i + 1 < len(line):
                     m = line[i + 1]
                     if m == ">":
-                        quote += 1
+                        kinds.append("plain")
+                    elif m == "{":
+                        kinds.append("cite")
                     elif m == "<":
-                        quote = max(0, quote - 1)
+                        if kinds:
+                            kinds.pop()
                     elif m == "[":
                         pre += 1
                     elif m == "]":
                         pre = max(0, pre - 1)
                     i += 2
                     continue
-                if at_quote is None:
-                    at_quote, at_pre = quote, pre
+                if at_kinds is None:
+                    at_kinds, at_pre = tuple(kinds), pre
                 seg.append(line[i])
                 i += 1
             body = "".join(seg)
-            if at_quote is None:        # marker-only or empty line
-                at_quote, at_pre = quote, pre
-            prefix = "> " * at_quote
+            if at_kinds is None:        # marker-only or empty line
+                at_kinds, at_pre = tuple(kinds), pre
+            prefix = "> " * len(at_kinds)
             if at_pre:
                 # Interior runs are the content in <pre> -- collapsing them is
                 # what turned `col1  col2` into `col1 col2`. Blank lines are
                 # kept here and only here.
+                if "cite" in at_kinds:
+                    self._cite_lines.add(len(out))
                 out.append((prefix + body.rstrip()).rstrip() if not body.strip()
                            else prefix + body.rstrip())
                 continue
             body = re.sub(r"[ \t]+", " ", body).strip()
             if body:
+                if "cite" in at_kinds:
+                    self._cite_lines.add(len(out))
                 out.append(prefix + body)
         return "\n".join(out)
+
+    def cite_lines(self) -> frozenset:
+        """0-based indices of output lines that came from a client cite
+        container. Only valid after text(); text() is what numbers the lines."""
+        return frozenset(getattr(self, "_cite_lines", ()))
 
     def links(self) -> list:
         """Visible link targets in document order, deduped.
@@ -676,15 +699,236 @@ NO_HIDDEN_TEXT = {"present": False, "suspicious": False, "reasons": []}
 LINK_CAP = 20
 
 
-def strip_html(html_text: str):
-    """Returns (text, hidden_report, links) -- see _HTMLTextExtractor."""
+class Stripped(NamedTuple):
+    """Named rather than a bare tuple: this return grew from 1 value to 4 across
+    6.4, 11.8 and 11.2, and each widening silently broke every unpack site."""
+    text: str
+    hidden: dict
+    links: list
+    cite_lines: frozenset
+
+
+def strip_html(html_text: str) -> "Stripped":
     parser = _HTMLTextExtractor()
     parser.feed(html_text)
     parser.close()
-    return parser.text(), parser.hidden_report(), parser.links()
+    text = parser.text()          # numbers the lines cite_lines refers to
+    return Stripped(text, parser.hidden_report(), parser.links(),
+                    parser.cite_lines())
 
 
-def extract_body(msg, force_html: bool):
+# --------------------------------------------------------------------------
+# Quote isolation (11.2): tell a message's own words from what it quotes
+# --------------------------------------------------------------------------
+
+# Tier 2 attribution lines. Two shapes, and they behave differently:
+#  - INLINE ("On <date>, X wrote:") introduces a `>`-quoted run that follows it.
+#  - HARD CUT ("Begin forwarded message:", Outlook's "-----Original Message-----")
+#    introduces quoted material that is NOT `>`-prefixed -- headers and body sit
+#    at the left margin, so everything from the marker to the end is chain.
+_INLINE_ATTRIBUTION = re.compile(r"\bwrote:\s*$", re.I)
+# The strict client-generated form: "On <date>, X wrote:". Required before an
+# attribution is allowed to swallow UNINDENTED text to end-of-message, because
+# that is the one removal that could eat the author's own words. A human writing
+# "As Pete wrote:" mid-paragraph does not start the line with "On".
+_CLIENT_ATTRIBUTION = re.compile(r"^\s*(?:>\s?)*on\b.{4,300}\bwrote:\s*$", re.I)
+_HARD_CUT = re.compile(
+    r"^\s*(?:-{2,}\s*original\s+message\s*-{2,}"
+    r"|-{2,}\s*forwarded\s+message\s*-{2,}"
+    r"|begin\s+forwarded\s+message:)\s*$", re.I)
+_QUOTE_PREFIX = re.compile(r"^(?:>\s?)+")
+# Below this, a quoted run is too short for an ancestor match to mean anything --
+# "Thanks" appears in every thread. Unmatched means KEPT, so the floor errs
+# toward tier 3.
+_MIN_MATCH_WORDS = 5
+ELISION = "[quoted text removed]"
+
+
+def _is_attribution(line: str) -> bool:
+    """Attribution introducing an already-`>`-quoted run. Looser than the strict
+    form is safe here: the text it marks is quoted by the client either way."""
+    return bool(_CLIENT_ATTRIBUTION.match(line)
+                or (_INLINE_ATTRIBUTION.search(line)
+                    and any(ch.isdigit() for ch in line)))
+
+
+def _norm_for_match(text: str) -> str:
+    """Punctuation- and wrap-agnostic form for comparing a quote to an ancestor.
+
+    Quoting clients re-wrap, re-indent and re-encode, so a literal comparison
+    fails on text that is plainly the same words."""
+    text = _QUOTE_PREFIX.sub("", text or "", count=0)
+    text = re.sub(r"^(?:>\s?)+", "", text or "", flags=re.M)
+    return re.sub(r"\W+", " ", text).strip().lower()
+
+
+def _matches_an_ancestor(run_text: str, ancestor_norms) -> bool:
+    """True when this run is a copy of an indexed ancestor's body.
+
+    Tier 1, and the only tier that is ground truth rather than a heuristic --
+    available only because the whole thread is held locally."""
+    norm = _norm_for_match(run_text)
+    if len(norm.split()) < _MIN_MATCH_WORDS:
+        return False
+    return any(norm and norm in anc for anc in ancestor_norms)
+
+
+def isolate_quotes(text: str, ancestor_bodies=(), cite_lines=frozenset()):
+    """Return (kept_text, removals) where removals is a list of
+    {basis, chars} — see the three tiers in implementation-plan.md 11.2.
+
+    Polarity is the whole design: tier 3 (an unattributed quotation) is KEPT,
+    because losing words the author deliberately included is a worse failure
+    than leaving a stray quote in place."""
+    if not text:
+        return text, []
+    lines = text.split("\n")
+    ancestor_norms = [n for n in (_norm_for_match(b) for b in ancestor_bodies) if n]
+    drop = [False] * len(lines)
+    bases = {}
+
+    # Pass 1: hard cuts swallow everything after them. Two kinds --
+    #  - the dashed markers, which are unambiguous; and
+    #  - "On <date>, X wrote:" when what FOLLOWS is not `>`-prefixed. Measured
+    #    on 240 real replies: 30 put the chain at the left margin like this, so
+    #    keying only off a following `>` run missed every one of them. The strict
+    #    _CLIENT_ATTRIBUTION form is required here for exactly the reason the
+    #    looser one is fine in pass 2 -- nothing else marks where this ends.
+    for i, line in enumerate(lines):
+        cut = _HARD_CUT.match(line)
+        if not cut and _CLIENT_ATTRIBUTION.match(line):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            cut = j < len(lines) and not _QUOTE_PREFIX.match(lines[j])
+        if cut:
+            for j in range(i, len(lines)):
+                drop[j] = True
+                bases.setdefault(j, "attribution-line")
+            break
+
+    # Pass 2: `>`-prefixed runs, each classified independently.
+    i = 0
+    while i < len(lines):
+        if drop[i] or not _QUOTE_PREFIX.match(lines[i]):
+            i += 1
+            continue
+        start = i
+        while i < len(lines) and (_QUOTE_PREFIX.match(lines[i]) or not lines[i].strip()):
+            i += 1
+        end = i                                    # exclusive
+        while end > start and not lines[end - 1].strip():
+            end -= 1                               # don't swallow trailing blanks
+        run = "\n".join(lines[start:end])
+
+        # An attribution line immediately above (skipping blanks) marks the run.
+        attributed_at = None
+        k = start - 1
+        while k >= 0 and not lines[k].strip():
+            k -= 1
+        if k >= 0 and _is_attribution(lines[k]):
+            attributed_at = k
+        # ...or INSIDE it. In a nested reply the attribution is itself quoted
+        # (`> On Mon, Pete wrote:`), so it becomes the run's own first line and
+        # a look-back finds nothing. 40 of 44 missed detections on real mail
+        # were this shape. Only the run's opening lines count -- an attribution
+        # deep inside is a quoted quote, already covered by the enclosing run.
+        marked_inside = any(
+            _is_attribution(_QUOTE_PREFIX.sub("", lines[n]).strip())
+            for n in range(start, min(start + 3, end)))
+
+        if _matches_an_ancestor(run, ancestor_norms):
+            basis = "matched-ancestor"
+        elif attributed_at is not None or marked_inside:
+            basis = "attribution-line"
+        elif any(n in cite_lines for n in range(start, end)):
+            basis = "client-container"
+        else:
+            basis = None                           # tier 3 -- KEEP
+
+        if basis:
+            if attributed_at is not None:
+                drop[attributed_at] = True
+                bases.setdefault(attributed_at, basis)
+            for j in range(start, end):
+                drop[j] = True
+                bases.setdefault(j, basis)
+
+    # Assemble: keep order, and label a gap when kept text FOLLOWS it, so the
+    # following text does not read as the start of the message. A gap is marked
+    # on what comes after it, not before -- marking on "something preceded it"
+    # put an elision at the end of every ordinary reply-above-quote message,
+    # where the report already says everything useful.
+    kept, removals, run_basis, run_chars = [], [], None, 0
+
+    def flush():
+        nonlocal run_basis, run_chars
+        if run_basis is None:
+            return
+        removals.append({"basis": run_basis, "chars": run_chars})
+        kept.append(ELISION)
+        run_basis, run_chars = None, 0
+
+    for i, line in enumerate(lines):
+        if drop[i]:
+            if run_basis is not None and bases[i] != run_basis:
+                flush()
+            run_basis = bases[i]
+            run_chars += len(line) + 1
+        else:
+            flush()
+            kept.append(line)
+    flush()
+    # Trailing: counted, not marked. Blank lines are popped alongside, because a
+    # body ending in a newline leaves an empty line AFTER the elision, which was
+    # enough to stop the marker being recognised as trailing at all.
+    while kept and (kept[-1] == ELISION or not kept[-1].strip()):
+        kept.pop()
+
+    out = "\n".join(kept).strip("\n")
+    return out, removals
+
+
+class Body(NamedTuple):
+    text: str
+    source_part: str
+    hidden: dict
+    links: list
+    cite_lines: frozenset
+
+
+def ancestor_bodies(conn, maildir_root, account: str, message_id: str) -> list:
+    """Bodies of every INDEXED ancestor of this message, for tier-1 matching.
+
+    All ancestors, not just the `In-Reply-To` parent: people quote earlier
+    messages in a thread, not only the one they are answering. Unreadable or
+    unindexed ancestors are skipped rather than raised -- a missing ancestor
+    means tier 1 cannot fire, which degrades to KEEP, the safe direction."""
+    row = resolve_message_row(conn, account, message_id)
+    if row is None:
+        return []
+    members = load_account_members(conn, account)
+    me = members.get(message_id)
+    if me is None:
+        return []
+    wanted = [r for r in me["references_chain"] if r != message_id]
+    if me["in_reply_to"] and me["in_reply_to"] not in wanted:
+        wanted.append(me["in_reply_to"])
+    bodies = []
+    for mid in wanted:
+        if mid not in members:
+            continue
+        try:
+            path = resolve_message_file(maildir_root, account, mid, conn)
+            body = extract_body(load_raw_message(path), force_html=False).text
+        except Exception:
+            continue                      # see docstring: skip, never raise
+        if body:
+            bodies.append(body)
+    return bodies
+
+
+def extract_body(msg, force_html: bool) -> "Body":
     """Returns (body, source_part, hidden_report). Default is the text/plain
     part; falls back to tag-stripped text/html when there is no text/plain
     part OR --html-text was given -- design review §4's two trigger
@@ -706,19 +950,20 @@ def extract_body(msg, force_html: bool):
     # No link list for text/plain: a plain-text body already shows its URLs
     # inline, so there is nothing to recover and nothing to separate.
     if plain_text is not None and plain_text.strip() and not force_html:
-        return plain_text, "text/plain", NO_HIDDEN_TEXT, []
+        return Body(plain_text, "text/plain", NO_HIDDEN_TEXT, [], frozenset())
 
     html_part = find_part(msg, "html")
     if html_part is not None:
-        text, hidden, links = strip_html(decode_text_part(html_part))
-        return text, "text/html-stripped", hidden, links
+        st = strip_html(decode_text_part(html_part))
+        return Body(st.text, "text/html-stripped", st.hidden, st.links,
+                    st.cite_lines)
 
     # Blank plain and no html at all: the message really is empty. Return it as
     # text/plain rather than None so the caller can tell "empty" from "absent".
     if plain_text is not None:
-        return plain_text, "text/plain", NO_HIDDEN_TEXT, []
+        return Body(plain_text, "text/plain", NO_HIDDEN_TEXT, [], frozenset())
 
-    return None, None, NO_HIDDEN_TEXT, []
+    return Body(None, None, NO_HIDDEN_TEXT, [], frozenset())
 
 
 def load_account_members(conn: sqlite3.Connection, account: str) -> dict:
@@ -1060,7 +1305,9 @@ FLAG_HANDLES = untrusted.under("actions", {"message_id"})
 # generated by mbsync rather than by any sender.
 # hidden_text_reasons is a list of OUR OWN labels, not sender text -- the one
 # place in this script where a string array is genuinely pipeline-generated.
-READ_TRUSTED = {"source_part", "file", "hidden_text_reasons"} | SIGNAL_FIELDS
+# `quoted_removed.basis` is our own three-value vocabulary, not sender text.
+READ_TRUSTED = ({"source_part", "file", "hidden_text_reasons",
+                 "quoted_removed.basis"} | SIGNAL_FIELDS)
 # `links.url` is sender-chosen and must stay unescaped to remain a usable key,
 # which is exactly what a handle is. `links.n` and `links_truncated` are ints,
 # and the manifest only classifies strings, so they need no entry.
@@ -1482,11 +1729,25 @@ def cmd_read(args: argparse.Namespace) -> None:
             "injection_signals": [],
             "links": [],
             "links_truncated": 0,
+            "quoted_removed": [],
             "file": rel_file,
         }
     else:
-        body, source_part, hidden, links = extract_body(
-            msg, force_html=args.html_text)
+        extracted = extract_body(msg, force_html=args.html_text)
+        body, source_part = extracted.text, extracted.source_part
+        hidden, links = extracted.hidden, extracted.links
+        # 11.2: opt-in. The FULL body stays available without the flag -- a
+        # "show me less" mode must never become the only way to read something.
+        quoted_removed = []
+        if args.no_quotes and body:
+            conn2 = connect_db(args.db)
+            try:
+                ancestors = ancestor_bodies(conn2, args.maildir, args.account,
+                                            args.message_id)
+            finally:
+                conn2.close()
+            body, quoted_removed = isolate_quotes(body, ancestors,
+                                                  extracted.cite_lines)
         result = {
             "headers": selected_message_headers(msg),
             "body": body,
@@ -1513,6 +1774,9 @@ def cmd_read(args: argparse.Namespace) -> None:
             "links": [{"n": i, "url": u}
                       for i, u in enumerate(links[:LINK_CAP], start=1)],
             "links_truncated": max(0, len(links) - LINK_CAP),
+            # Report, never silently transform: same contract as
+            # injection_signals and hidden_text_reasons.
+            "quoted_removed": quoted_removed,
             "file": rel_file,
         }
     # 6.3: the body gets the full nonce envelope, built inside apply_trust so
@@ -1635,6 +1899,14 @@ def build_parser() -> argparse.ArgumentParser:
     read_p.add_argument(
         "--headers-only", action="store_true", dest="headers_only",
         help="full header block only, no body",
+    )
+    read_p.add_argument(
+        "--no-quotes", action="store_true", dest="no_quotes",
+        help="drop quoted CHAIN content -- text matching an indexed ancestor, "
+             "or marked by an attribution line or a client cite container. An "
+             "unattributed quotation is KEPT as the author's own content. "
+             "Removals are reported in `quoted_removed`; omit the flag for the "
+             "full body",
     )
     read_p.set_defaults(func=cmd_read)
 

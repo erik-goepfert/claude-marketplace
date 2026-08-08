@@ -1481,5 +1481,285 @@ class ReadLinksTests(ReadFixture):
         self.assertEqual(undeclared, set())
 
 
+class QuoteIsolationTests(unittest.TestCase):
+    """Phase 11.2 — `--no-quotes`. Unit-level against isolate_quotes.
+
+    The polarity is the design: tier 3 (an unattributed quotation) is KEPT,
+    because deleting words the author chose to include is a worse failure than
+    leaving a stray quote. Several tests exist only to pin that direction."""
+
+    def iso(self, text, ancestors=(), cites=frozenset()):
+        return threads.isolate_quotes(text, ancestors, cites)
+
+    # -- tier 2: attribution lines -------------------------------------------
+
+    def test_gmail_inline_attribution_and_quoted_run(self):
+        kept, rem = self.iso(
+            "Sounds good, see you then.\n\n"
+            "On Mon, Aug 4, 2026 at 9:12 AM Pete <p@x> wrote:\n"
+            "> Are we still on for Thursday?\n> Let me know.\n")
+        self.assertEqual(kept, "Sounds good, see you then.")
+        self.assertEqual([r["basis"] for r in rem], ["attribution-line"])
+
+    def test_nested_reply_attribution_inside_the_quoted_run(self):
+        """40 of 44 missed detections on real mail were this: in a nested reply
+        the attribution is itself quoted, so it becomes the run's own first line
+        and a look-back above the run finds nothing."""
+        kept, rem = self.iso(
+            "Agreed on all points.\n\n"
+            "> On Mon, Aug 4, 2026 at 9:12 AM Pete <p@x> wrote:\n"
+            "> > The original question was about Thursday.\n"
+            "> Still curious.\n")
+        self.assertEqual(kept, "Agreed on all points.")
+        self.assertEqual([r["basis"] for r in rem], ["attribution-line"])
+
+    def test_outlook_original_message_marker(self):
+        kept, _rem = self.iso(
+            "Please handle this.\n\n-----Original Message-----\n"
+            "From: Bob\nSubject: Invoice\n\nThe invoice is attached.\n")
+        self.assertEqual(kept, "Please handle this.")
+
+    def test_apple_begin_forwarded_message(self):
+        kept, _rem = self.iso(
+            "FYI\n\nBegin forwarded message:\n\n"
+            "From: Becky\nSubject: Package\n\nIt arrived.\n")
+        self.assertEqual(kept, "FYI")
+
+    def test_forwarded_chain_is_not_an_ancestor_and_still_goes(self):
+        """A forwarded chain appears nowhere in the thread, so tier 1 cannot see
+        it. Tier 2 is why the forward case works at all."""
+        kept, rem = self.iso(
+            "Passing this along.\n\n---------- Forwarded message ---------\n"
+            "From: Becky Corbin\nTo: Melanie Chavez\n\nOriginal text.\n",
+            ancestors=())
+        self.assertEqual(kept, "Passing this along.")
+        self.assertEqual([r["basis"] for r in rem], ["attribution-line"])
+
+    def test_attribution_followed_by_unindented_text_is_a_hard_cut(self):
+        """30 of 240 real replies put the chain at the left margin after the
+        attribution, with no `>` anywhere."""
+        kept, rem = self.iso(
+            "Yes that works.\n\n"
+            "On Aug 4, 2026, at 09:12, Pete <p@x> wrote:\n\n"
+            "Are we still on for Thursday? I need to know by tonight.\n")
+        self.assertEqual(kept, "Yes that works.")
+        self.assertEqual([r["basis"] for r in rem], ["attribution-line"])
+
+    def test_prose_saying_wrote_does_not_swallow_the_rest(self):
+        """The dangerous direction. Only the strict client form
+        ("On <date> ... wrote:") may consume unindented text, so a human writing
+        "As Pete wrote:" mid-message keeps everything after it."""
+        kept, rem = self.iso(
+            "As Pete wrote:\n\n"
+            "we should ship on Thursday, and I agree with him.\n\n"
+            "Let me know what you think.\n")
+        self.assertEqual(rem, [])
+        self.assertIn("we should ship on Thursday", kept)
+        self.assertIn("Let me know what you think.", kept)
+
+    # -- tier 1: verified against an indexed ancestor -------------------------
+
+    def test_quote_matching_an_ancestor_is_stripped(self):
+        kept, rem = self.iso(
+            "Agreed.\n\n> Are we still on for Thursday? Let me know soon.\n",
+            ancestors=("Are we still on for Thursday? Let me know soon.",))
+        self.assertEqual(kept, "Agreed.")
+        self.assertEqual([r["basis"] for r in rem], ["matched-ancestor"])
+
+    def test_ancestor_match_survives_rewrapping_and_requoting(self):
+        """Clients re-wrap and re-indent, so the comparison is normalized."""
+        kept, rem = self.iso(
+            "Yes.\n\n> Are we still on\n> for Thursday? Let me\n> know soon.\n",
+            ancestors=("Are we still on for Thursday?\nLet me know soon.",))
+        self.assertEqual(kept, "Yes.")
+        self.assertEqual([r["basis"] for r in rem], ["matched-ancestor"])
+
+    # -- tier 3: KEEP ---------------------------------------------------------
+
+    def test_article_quote_survives(self):
+        """Exit criterion 3, and the failure that would silently delete the
+        user's own words."""
+        kept, rem = self.iso(
+            "I loved this line from the piece:\n\n"
+            "> The city was built on salt and stubbornness.\n\n"
+            "Worth reading.\n")
+        self.assertEqual(rem, [])
+        self.assertIn("salt and stubbornness", kept)
+        self.assertIn("Worth reading.", kept)
+
+    def test_short_quote_below_the_match_floor_is_kept(self):
+        """Documents a known limitation rather than hiding it: a quote too short
+        to match an ancestor confidently is kept, so interleaved point-by-point
+        replies can retain their shortest quoted fragments."""
+        kept, rem = self.iso("> And the invoice?\nNext week.\n",
+                             ancestors=("And the invoice?",))
+        self.assertEqual(rem, [])
+        self.assertIn("> And the invoice?", kept)
+
+    # -- assembly -------------------------------------------------------------
+
+    def test_interleaved_reply_keeps_fragments_in_order_and_marks_the_gap(self):
+        kept, rem = self.iso(
+            "> Can you send the file when you get a chance?\n"
+            "Yes, attached.\n\n> Anything else you need from me?\nNot today.\n",
+            ancestors=("Can you send the file when you get a chance? "
+                       "Anything else you need from me?",))
+        self.assertEqual(kept.split("\n")[0], threads.ELISION)
+        self.assertIn("Yes, attached.", kept)
+        self.assertIn("Not today.", kept)
+        self.assertLess(kept.index("Yes, attached."), kept.index("Not today."))
+        self.assertEqual(len(rem), 2)
+
+    def test_trailing_removal_is_counted_but_not_marked(self):
+        """The ordinary reply-above-quote shape. A marker there would append
+        boilerplate to nearly every message for no information -- the report
+        already carries it."""
+        kept, rem = self.iso(
+            "Short answer: yes.\n\nOn Mon, Aug 4, 2026 Pete <p@x> wrote:\n"
+            "> Long original question here.\n")
+        self.assertEqual(kept, "Short answer: yes.")
+        self.assertNotIn(threads.ELISION, kept)
+        self.assertEqual(len(rem), 1)
+
+    def test_removal_chars_are_reported(self):
+        _kept, rem = self.iso(
+            "Hi.\n\nOn Mon, Aug 4, 2026 Pete <p@x> wrote:\n> abcdefghij\n")
+        self.assertEqual(len(rem), 1)
+        self.assertGreater(rem[0]["chars"], 10)
+
+    def test_body_with_no_quotes_is_untouched(self):
+        kept, rem = self.iso("Just a plain note.\n\nWith two paragraphs.\n")
+        self.assertEqual(rem, [])
+        self.assertEqual(kept, "Just a plain note.\n\nWith two paragraphs.")
+
+    def test_empty_body_is_safe(self):
+        self.assertEqual(self.iso(""), ("", []))
+        self.assertEqual(self.iso(None), (None, []))
+
+    def test_a_message_is_never_emptied_without_saying_why(self):
+        """Over 240 real replies isolation never emptied a body; pin the case
+        where the whole body IS an attributed quote -- the removal is reported,
+        so the caller can explain the blank."""
+        kept, rem = self.iso(
+            "On Mon, Aug 4, 2026 Pete <p@x> wrote:\n> everything was quoted\n")
+        self.assertEqual(kept, "")
+        self.assertEqual(len(rem), 1)
+
+
+class CiteContainerTests(unittest.TestCase):
+    """11.2 tier 2 via HTML: a client's own cite wrapper, which 11.8 renders as
+    `> ` identically to a bare blockquote. The distinction has to survive."""
+
+    def test_apple_mail_type_cite_is_a_cite_container(self):
+        st = threads.strip_html('<p>My reply.</p><blockquote type="cite">'
+                                'their words</blockquote>')
+        self.assertTrue(st.cite_lines)
+        kept, rem = threads.isolate_quotes(st.text, (), st.cite_lines)
+        self.assertEqual(kept, "My reply.")
+        self.assertEqual([r["basis"] for r in rem], ["client-container"])
+
+    def test_gmail_quote_class_is_a_cite_container(self):
+        st = threads.strip_html('<p>Mine.</p><blockquote class="gmail_quote">'
+                                'theirs</blockquote>')
+        kept, rem = threads.isolate_quotes(st.text, (), st.cite_lines)
+        self.assertEqual(kept, "Mine.")
+        self.assertEqual([r["basis"] for r in rem], ["client-container"])
+
+    def test_bare_blockquote_is_not_a_cite_container_and_is_kept(self):
+        """The tier-2/tier-3 boundary. A plain <blockquote> is a quotation the
+        author chose to include."""
+        st = threads.strip_html("<p>Look at this:</p><blockquote>a line of "
+                                "poetry</blockquote><p>Nice.</p>")
+        self.assertEqual(st.cite_lines, frozenset())
+        kept, rem = threads.isolate_quotes(st.text, (), st.cite_lines)
+        self.assertEqual(rem, [])
+        self.assertIn("a line of poetry", kept)
+
+
+class ReadNoQuotesTests(ReadFixture):
+    """11.2 through cmd_read: payload shape, trust, and the opt-in contract.
+
+    Body assertions are containment, not equality -- cmd_read wraps the body in
+    the nonce trust envelope, which is the point of 6.3."""
+
+    def make(self, message_id, body, key, in_reply_to=None):
+        msg = EmailMessage()
+        msg["From"] = "pete@example.com"
+        msg["To"] = "me@example.com"
+        msg["Subject"] = "Thursday"
+        msg["Date"] = "Mon, 4 Aug 2026 09:12:00 +0000"
+        msg["Message-ID"] = message_id
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            msg["References"] = in_reply_to
+        msg.set_content(body)
+        put_maildir_file(self.maildir_root, "INBOX", f"{key}:2,", msg.as_bytes())
+        self.index_row("INBOX", key, message_id, f"{key}:2,")
+        if in_reply_to:
+            # Tier 1 resolves ancestors from the INDEX, not from the raw
+            # headers -- ReadFixture.index_row does not populate the header
+            # links, so without this the ancestor lookup finds nothing and the
+            # test silently exercises tier 3 instead.
+            self.conn.execute(
+                "UPDATE envelopes SET in_reply_to = ?, references_chain = ? "
+                "WHERE message_id = ?",
+                (in_reply_to, json.dumps([in_reply_to]), message_id))
+            self.conn.commit()
+
+    def test_no_quotes_reports_removals_and_trims_the_body(self):
+        self.make("<q1@x>", "Yes.\n\nOn Mon, Aug 4, 2026 Pete <p@x> wrote:\n"
+                            "> The original question.\n", "q1")
+        out = self.run_read("<q1@x>", extra_args=("--no-quotes",))
+        self.assertIn("Yes.", out["body"])
+        self.assertNotIn("The original question.", out["body"])
+        self.assertEqual([r["basis"] for r in out["quoted_removed"]],
+                         ["attribution-line"])
+
+    def test_full_body_without_the_flag(self):
+        """A "show me less" mode must never become the only way to read
+        something."""
+        self.make("<q2@x>", "Yes.\n\nOn Mon, Aug 4, 2026 Pete <p@x> wrote:\n"
+                            "> The original question.\n", "q2")
+        out = self.run_read("<q2@x>")
+        self.assertIn("The original question.", out["body"])
+        self.assertEqual(out["quoted_removed"], [])
+
+    def test_tier_one_uses_the_indexed_ancestor(self):
+        """The ground-truth tier, and the reason holding the thread locally is
+        an advantage over any mail client."""
+        self.make("<p0@x>", "Are we still on for Thursday? Let me know soon.\n",
+                  "p0")
+        self.make("<q3@x>", "Agreed.\n\n"
+                            "> Are we still on for Thursday? Let me know soon.\n",
+                  "q3", in_reply_to="<p0@x>")
+        out = self.run_read("<q3@x>", extra_args=("--no-quotes",))
+        self.assertIn("Agreed.", out["body"])
+        self.assertNotIn("still on for Thursday", out["body"])
+        self.assertEqual([r["basis"] for r in out["quoted_removed"]],
+                         ["matched-ancestor"])
+
+    def test_basis_is_trusted_and_the_payload_is_fully_classified(self):
+        self.make("<q4@x>", "Yes.\n\nOn Mon, Aug 4, 2026 Pete <p@x> wrote:\n"
+                            "> Question here.\n", "q4")
+        out = self.run_read("<q4@x>", extra_args=("--no-quotes",))
+        self.assertNotIn("quoted_removed.basis", self.trust["untrusted_fields"])
+        paths = untrusted.string_paths(out)
+        undeclared = (paths
+                      - {p for p in paths if p.startswith("_trust")}
+                      - set(threads.READ_TRUSTED)
+                      - set(threads.READ_ENVELOPES)
+                      - set(self.trust["untrusted_fields"]))
+        self.assertEqual(undeclared, set())
+
+    def test_missing_ancestor_degrades_to_keep_not_to_an_error(self):
+        """An unindexed parent means tier 1 cannot fire. That must not raise and
+        must not strip -- it degrades to the safe direction."""
+        self.make("<q5@x>", "Hi.\n\n> some quoted words that are not short.\n",
+                  "q5", in_reply_to="<never-indexed@x>")
+        out = self.run_read("<q5@x>", extra_args=("--no-quotes",))
+        self.assertEqual(out["quoted_removed"], [])
+        self.assertIn("some quoted words", out["body"])
+
+
 if __name__ == "__main__":
     unittest.main()

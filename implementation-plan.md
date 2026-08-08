@@ -2189,8 +2189,32 @@ documents whatever actually landed.
       `account`/`indexed_at`/`folder_tier` trusted. Same
       `UNTRUSTED_COLUMNS`-classified-deliberately test so a new column fails the
       suite rather than drifting.
-- [ ] **11.2 `$THR read --no-quotes` — isolate one message's own words.**
-      **Depends on 11.8** for the `blockquote` marker tier 2 keys off.
+- [x] **11.2 `$THR read --no-quotes` — isolate one message's own words** —
+      **DONE 2026-08-07.** All three tiers, `quoted_removed` reporting, 27 tests.
+      Verified over **240 real replies**: quotes removed in 95, and **0 bodies
+      emptied** — the failure that would have made this dangerous never fired.
+      Where something was removed the kept text is a median 0.19 of the original,
+      which is the whole value of the flag. Of 145 with nothing removed, 140
+      contain no quote markers at all and 5 are tier-3 keeps.
+      Two detection bugs found by measuring rather than by fixture, both of which
+      a synthetic suite would have missed entirely (removals went 25 → 95):
+      1. **Attribution INSIDE the run.** In a nested reply the attribution is
+         itself `>`-quoted, so it becomes the run's own first line and a
+         look-back above the run finds nothing. **40 of 44** missed detections.
+      2. **Attribution followed by UNINDENTED text.** 30 of 240 real replies put
+         the chain at the left margin with no `>` anywhere, so keying off a
+         following quoted run missed all of them. Promoted to a hard cut, but
+         **only** for the strict client-generated `On <date> … wrote:` form —
+         a human writing "As Pete wrote:" must not have the rest of their
+         message eaten, and there is a test for exactly that.
+      Elision markers label a gap only when kept text FOLLOWS it. Marking on
+      "something preceded it" appended a marker to every ordinary
+      reply-above-quote message, where the report already says everything.
+      `Stripped`/`Body` became NamedTuples: this return grew 1 → 4 values across
+      6.4, 11.8 and 11.2, and each widening silently broke every unpack site.
+      **Known limitation, documented not hidden:** a quoted run under 5 words
+      cannot be ancestor-matched confidently, so interleaved point-by-point
+      replies keep their shortest fragments. Fails toward KEEP, by design.
       **The question this task exists to answer: can chain quotes be told apart
       from quotes the author deliberately included as content?** Yes, in three
       tiers of decreasing confidence, and the polarity matters more than the
