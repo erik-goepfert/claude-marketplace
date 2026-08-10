@@ -90,6 +90,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import act
+import session
 import untrusted
 
 # --------------------------------------------------------------------------
@@ -1293,9 +1294,12 @@ RESIDUE_TRUSTED = untrusted.under(
 RESIDUE_HANDLES = untrusted.under("residue", {"root_message_id"})
 
 # flag's actions are entirely our own bookkeeping; only the message_id it
-# echoes back came from a sender.
-FLAG_TRUSTED = {"account", "mode"} | untrusted.under(
-    "actions", {"folder", "himalaya_id", "op"})
+# echoes back came from a sender. `sync.stderr` is absent on purpose, so
+# default-deny escapes and declares it -- mbsync's own text, same call as
+# batch.py's identically named field.
+FLAG_TRUSTED = ({"account", "mode"}
+                | untrusted.under("actions", {"folder", "himalaya_id", "op"})
+                | untrusted.under("sync", {"account", "boxes", "attempts", "ok"}))
 FLAG_HANDLES = untrusted.under("actions", {"message_id"})
 
 # read: NO `headers.*` path is ever allowlisted. Under --headers-only the key
@@ -1829,10 +1833,18 @@ def cmd_flag(args: argparse.Namespace) -> None:
             if target is None:
                 raise FatalError("thread has no state-eligible member to flag")
             op(target, "add", "flagged")
+
+    out = {"account": args.account, "mode": args.mode, "actions": actions}
+    # A flag write is not finished until it reaches the server -- the same hard
+    # invariant $BATCH run carries, and the reason the push lives here rather
+    # than in a hand-typed command (2026-08-10). Box-scoped to the folders this
+    # call actually touched; no actions means nothing to push.
+    if actions and not args.no_sync:
+        boxes = sorted({a["folder"] for a in actions})
+        out["sync"] = session.sync_specs([(args.account, boxes)],
+                                         args.mbsync, args.mbsyncrc)
     print(json.dumps(
-        untrusted.apply_trust({"account": args.account, "mode": args.mode,
-                               "actions": actions},
-                              FLAG_TRUSTED, handle_fields=FLAG_HANDLES),
+        untrusted.apply_trust(out, FLAG_TRUSTED, handle_fields=FLAG_HANDLES),
         indent=2, sort_keys=True))
 
 
@@ -2060,6 +2072,11 @@ def build_parser() -> argparse.ArgumentParser:
     flag_p.add_argument("--himalaya", default="himalaya", help="himalaya binary (tests override)")
     flag_p.add_argument("--himalaya-account", default=None,
                         help="himalaya account name; default <account>-local")
+    flag_p.add_argument("--mbsyncrc", default=os.path.expanduser("~/.config/isync/mbsyncrc"),
+                        help="mbsync config (never auto-discovered)")
+    flag_p.add_argument("--mbsync", default="mbsync", help="mbsync binary (tests override)")
+    flag_p.add_argument("--no-sync", action="store_true",
+                        help="skip the push of the touched folders (the caller owns the invariant then)")
     flag_p.set_defaults(func=cmd_flag)
 
     res_p = sub.add_parser(

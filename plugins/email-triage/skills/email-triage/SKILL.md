@@ -55,9 +55,10 @@ in reference §Incident history.
   `$SES sync --scope priority|full` for the session's two stages, `$BATCH run`
   for a batch's own push. Each builds the box list from `config.yaml` and runs
   mbsync as argv, so no folder name is ever hand-quoted — `[Gmail]/Sent Mail`
-  carries a space *and* shell glob characters. Where mbsync is still typed by
-  hand (the flag/reply push under Acting), **`-c` must be spelled out** — it is
-  never auto-discovered: `mbsync -c ~/.config/isync/mbsyncrc '<acct>:<folders>'`.
+  carries a space *and* shell glob characters. `$THR flag` pushes itself too, so
+  the one place mbsync is still typed by hand is the **reply** push under
+  Acting; there **`-c` must be spelled out** — it is never auto-discovered:
+  `mbsync -c ~/.config/isync/mbsyncrc '<acct>:<folders>'`.
 - **Every standard session step lives in a script, never ad-hoc shell**
   (user rule): `cat`/`mkdir`/`date`/`nohup` glue prompts. A new
   every-session step goes into a script — session.py owns lifecycle glue.
@@ -650,11 +651,18 @@ conventions, both learned from sent mail:
   but second-best evidence for how the user writes. No history at all → say so
   and use neutral-professional rather than inventing a register.
 
-**Flags and replies are not moves, so they run the same unit by hand:**
-act (`-local` himalaya for flags, IMAP himalaya for replies) → log the
-event → `$IDX index` (a full run is cheap, ~25 s) → box-scoped push,
-`mbsync -c ~/.config/isync/mbsyncrc '<acct>:<folders touched>'`, one
-account per invocation. Same hard invariant: not done until the sync runs.
+**Flags and replies are not moves, so they don't go through `$BATCH`.** Same
+hard invariant either way — not done until the sync runs:
+
+- **Flags:** `$THR flag` **pushes the folders it touched itself** (2026-08-10),
+  exactly as `$BATCH run` does — check `sync[].ok`. Then log the event and
+  `$IDX index` (~25 s): without the event the next `--suggest-events` run reads
+  your own flag change as an external `manual` decision the user never made.
+- **Replies:** act (IMAP himalaya) → log the event → `$IDX index` → box-scoped
+  push by hand, `mbsync -c ~/.config/isync/mbsyncrc '<acct>:<folders touched>'`,
+  one account per invocation. **The last hand-typed sync in the flow** — it
+  survives only because sending still goes through IMAP himalaya rather than a
+  script that could own the push.
 
 `$ACT move`/`$ACT remove` are the low-level layer for one-offs and recovery;
 `remove` refuses to strip a message's only copy. Resolve-before-act is
@@ -662,7 +670,7 @@ built in — "message file not found on disk" means the index is stale:
 rerun `$IDX index` and retry.
 
 - **Flag / unflag** (autonomous; thread-wide clear-then-set, rule 2 —
-  mechanized): `$THR flag --account <acct> --message-id <any member>
+  mechanized, and it pushes what it touched): `$THR flag --account <acct> --message-id <any member>
   --block` clears `\Flagged` from every member and sets it on the latest
   state-eligible one; `--unblock` clears only.
 - **Move / resolve / trash** (approved): `$BATCH run` (or `$ACT` one-off)

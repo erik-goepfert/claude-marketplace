@@ -678,16 +678,32 @@ class FlagCommandTests(unittest.TestCase):
         self.hima_data = tmp / "hima-data.json"
         os.environ["HIMA_LOG"] = str(self.hima_log)
         os.environ["HIMA_DATA"] = str(self.hima_data)
+        self.mbsync_log = tmp / "mbsync.log"
+        self.mbsync = tmp / "mbsync-stub"
+        self.mbsync.write_text(
+            '#!/bin/sh\nfor a in "$@"; do echo "ARG:$a" >> "$MBSYNC_LOG"; done\n'
+            'exit 0\n')
+        self.mbsync.chmod(0o755)
+        self.mbsync_fail = tmp / "mbsync-fail"
+        self.mbsync_fail.write_text(
+            "#!/bin/sh\necho 'box <b>Active</b> cannot be opened' >&2\nexit 1\n")
+        self.mbsync_fail.chmod(0o755)
+        os.environ["MBSYNC_LOG"] = str(self.mbsync_log)
 
     def insert(self, **kw):
         ThreadsTestCaseFixture.insert(self, **kw)
 
-    def run_flag(self, message_id, mode):
+    def run_flag(self, message_id, mode, *extra, mbsync=None):
+        """Always passes a stub mbsync and a /dev/null mbsyncrc. `flag` pushes
+        the folders it touched since 2026-08-10, and a test must never reach a
+        real server or read the user's real isync config."""
         parser = threads.build_parser()
         args = parser.parse_args([
             "flag", "--db", str(self.db_path), "--account", "ic",
             "--message-id", message_id, f"--{mode}",
-            "--himalaya", str(self.hima)])
+            "--himalaya", str(self.hima),
+            "--mbsync", str(mbsync or self.mbsync), "--mbsyncrc", "/dev/null",
+            *extra])
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             threads.cmd_flag(args)
@@ -726,6 +742,65 @@ class FlagCommandTests(unittest.TestCase):
         out = self.run_flag("A", "seen")
         self.assertEqual(out["actions"], [{"message_id": "A", "folder": "INBOX",
                                            "himalaya_id": "3", "op": "add seen"}])
+
+    # -- the push (2026-08-10): a flag write is not done until it reaches the
+    # server, the same invariant $BATCH run carries. It used to be a hand-typed
+    # mbsync line in the SKILL, which is both forgettable and a permission
+    # prompt for every flag in every session.
+
+    def two_member_thread(self):
+        self.insert(message_id="A", folder="Active", folder_tier="active", account="ic",
+                    subject="Quote", from_addr="a@x.com", date_utc="2026-07-10T10:00:23Z",
+                    is_flagged=1, flags=["Flagged", "Seen"])
+        self.insert(message_id="B", folder="INBOX", folder_tier="untriaged", account="ic",
+                    in_reply_to="A", subject="Re: Quote", from_addr="b@x.com",
+                    date_utc="2026-07-18T09:30:11Z")
+        json.dump({
+            "Active": [{"id": "4", "from": {"addr": "a@x.com"}, "date": "2026-07-10 10:00+00:00"}],
+            "INBOX": [{"id": "9", "from": {"addr": "b@x.com"}, "date": "2026-07-18 09:30+00:00"}],
+        }, open(self.hima_data, "w"))
+
+    def test_push_covers_exactly_the_folders_touched(self):
+        self.two_member_thread()
+        out = self.run_flag("A", "block")
+        self.assertEqual(out["sync"], [{"account": "ic",
+                                        "boxes": ["Active", "INBOX"],
+                                        "attempts": 1, "ok": True}])
+        self.assertIn("ARG:ic:Active,INBOX",
+                      self.mbsync_log.read_text().splitlines())
+
+    def test_unblock_pushes_only_the_folder_it_cleared(self):
+        self.two_member_thread()
+        out = self.run_flag("A", "unblock")
+        self.assertEqual(out["sync"][0]["boxes"], ["Active"])
+
+    def test_no_sync_skips_the_push_entirely(self):
+        self.two_member_thread()
+        out = self.run_flag("A", "block", "--no-sync")
+        self.assertNotIn("sync", out)
+        self.assertFalse(self.mbsync_log.exists())
+
+    def test_nothing_to_clear_means_nothing_to_push(self):
+        """--unblock on an already-clean thread performs no flag op, so there
+        is no folder to push and no empty mbsync run to explain."""
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged",
+                    account="ic", subject="Note", from_addr="a@x.com",
+                    date_utc="2026-07-18T09:30:59Z")
+        json.dump({"INBOX": [{"id": "3", "from": {"addr": "a@x.com"},
+                              "date": "2026-07-18 09:30+00:00"}]},
+                  open(self.hima_data, "w"))
+        out = self.run_flag("A", "unblock")
+        self.assertEqual(out["actions"], [])
+        self.assertNotIn("sync", out)
+        self.assertFalse(self.mbsync_log.exists())
+
+    def test_failed_push_is_retried_reported_and_its_stderr_escaped(self):
+        self.two_member_thread()
+        out = self.run_flag("A", "block", mbsync=self.mbsync_fail)
+        self.assertFalse(out["sync"][0]["ok"])
+        self.assertEqual(out["sync"][0]["attempts"], 2)
+        self.assertIn("sync.stderr", out["_trust"]["untrusted_fields"])
+        self.assertIn("&lt;b&gt;", out["sync"][0]["stderr"])
 
     def test_resolution_ambiguity_is_a_hard_error(self):
         self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",

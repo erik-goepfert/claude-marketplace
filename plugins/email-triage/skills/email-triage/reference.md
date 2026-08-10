@@ -352,9 +352,18 @@ drafted, subject, from_addr, date_utc, residual_count, folders}],
 
 **`$THR flag`:** `--seen` (one message) or `--block`/`--unblock`
 (thread-wide, rule 2) → `{"account", "mode", "actions": [{message_id,
-folder, himalaya_id, op}]}`. Resolution is internal (from_addr + minute
-date against `envelope list`); 0 or 2+ matches is a hard error (stale
-index → re-index/sync; ambiguous → act manually).
+folder, himalaya_id, op}], "sync": [{account, boxes, attempts, ok,
+stderr?}]}`. Resolution is internal (from_addr + minute date against
+`envelope list`); 0 or 2+ matches is a hard error (stale index →
+re-index/sync; ambiguous → act manually).
+
+Since 2026-08-10 it **pushes the folders it touched itself**, exactly as
+`$BATCH run` does — one retry, box-scoped, `sync[].ok` to check. No `actions`
+means no `sync` key: an `--unblock` on an already-clean thread has nothing to
+push. `--no-sync` opts out and hands the invariant back to the caller.
+Logging and re-indexing are still yours: without the event, the next
+`--suggest-events` run sees the flag change as an external `manual` decision
+the user never made.
 
 **`$IDX index` change report:** `new` / `moved` / `deleted` /
 `flag_changed` / `parse_errors` / `unrecognized_folders`. Entries carry
