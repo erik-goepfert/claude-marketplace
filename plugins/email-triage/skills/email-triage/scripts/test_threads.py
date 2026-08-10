@@ -1528,20 +1528,55 @@ class ReadLinksTests(ReadFixture):
         self.assertEqual([l["n"] for l in out["links"]],
                          list(range(1, threads.LINK_CAP + 1)))
 
-    def test_text_plain_read_has_no_link_list(self):
+    def test_text_plain_read_lists_its_urls(self):
+        """Inverted 2026-08-10; this test used to assert `links == []`, pinning
+        the bug. The old rationale -- a plain body shows its URLs inline, so
+        there is nothing to recover -- is true for a human and false for every
+        consumer: $UNSUB could not see a plain-text unsubscribe URL at all, and
+        the only alternative was lifting a URL out of untrusted body prose by
+        hand, which is what the handle/prose split exists to prevent."""
         msg = EmailMessage()
         msg["From"] = "sender@example.com"
         msg["Subject"] = "Plain"
         msg["Date"] = "Mon, 1 Jan 2026 00:00:00 +0000"
         msg["Message-ID"] = "<lk4@x>"
-        msg.set_content("See https://ex.com/inline for details.\n")
+        msg.set_content("See https://ex.com/inline for details.\n"
+                        "Or write to mailto:help@ex.com, or visit "
+                        "https://ex.com/end.\n")
         put_maildir_file(self.maildir_root, "INBOX", "lk4:2,", msg.as_bytes())
         self.index_row("INBOX", "lk4", "<lk4@x>", "lk4:2,")
         out = self.run_read("<lk4@x>")
         self.assertEqual(out["source_part"], "text/plain")
-        self.assertEqual(out["links"], [])
-        # The URL is still readable -- it was already inline in the body.
+        self.assertEqual([l["url"] for l in out["links"]],
+                         ["https://ex.com/inline", "mailto:help@ex.com",
+                          "https://ex.com/end"])
+        # Sentence punctuation is not part of the URL, and the body still shows
+        # it inline either way.
         self.assertIn("https://ex.com/inline", out["body"])
+
+    def test_plain_url_extraction_edges(self):
+        self.assertEqual(
+            threads.plain_text_links("a https://x.com/p, b https://x.com/q. c"),
+            ["https://x.com/p", "https://x.com/q"])
+        # A paren the URL itself opened survives; the sentence's does not.
+        self.assertEqual(
+            threads.plain_text_links("see https://x.com/Foo_(bar). done"),
+            ["https://x.com/Foo_(bar)"])
+        self.assertEqual(
+            threads.plain_text_links("(https://x.com/plain)"),
+            ["https://x.com/plain"])
+        # Angle brackets are a wrapper, not part of the target.
+        self.assertEqual(threads.plain_text_links("<https://x.com/ang>"),
+                         ["https://x.com/ang"])
+        # Deduped, document order preserved.
+        self.assertEqual(
+            threads.plain_text_links("https://x.com/a https://x.com/b https://x.com/a"),
+            ["https://x.com/a", "https://x.com/b"])
+        # A scheme is REQUIRED: prose is full of bare domains, and a false
+        # link matters because `$UNSUB exec --link N` acts on this list.
+        self.assertEqual(threads.plain_text_links("visit www.example.com or example.com"), [])
+        self.assertEqual(threads.plain_text_links(""), [])
+        self.assertEqual(threads.plain_text_links(None), [])
 
     def test_headers_only_read_has_no_link_list(self):
         out = self.html_message("<lk5@x>", '<a href="https://ex.com/x">x</a>')

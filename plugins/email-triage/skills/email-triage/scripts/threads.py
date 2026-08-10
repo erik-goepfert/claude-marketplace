@@ -702,6 +702,52 @@ NO_HIDDEN_TEXT = {"present": False, "suspicious": False, "reasons": []}
 LINK_CAP = 20
 
 
+# Bare URLs in a plain-text body. An explicit scheme is REQUIRED: bare domains
+# and `www.foo` shapes turn up in ordinary prose constantly, and a false link is
+# worse than a missed one here because `$UNSUB exec --link N` acts on what this
+# produces. `<>` and quotes are excluded from the body so an angle-bracketed
+# `<https://x/y>` yields the URL without its wrapper.
+_PLAIN_URL = re.compile(r"(?i)\b(?:https?://|mailto:)[^\s<>\"']+")
+_URL_TRAILING = ".,;:!?'\")]}>"
+
+
+def _trim_url(raw: str) -> str:
+    """Drop sentence punctuation that ran into the match, then give back a
+    closing paren the URL itself opened -- `.../Foo_(bar).` must trim to
+    `.../Foo_(bar)`, not to `.../Foo_(bar`, which is a different URL."""
+    url = raw.rstrip(_URL_TRAILING)
+    while (url.count("(") > url.count(")")
+           and len(url) < len(raw) and raw[len(url)] == ")"):
+        url += ")"
+    return url
+
+
+def plain_text_links(text: str) -> list:
+    """URL targets in a text/plain body, in document order, deduped.
+
+    Added 2026-08-10, and it is a fix rather than a feature. This returned
+    nothing before, on the reasoning that "a plain-text body already shows its
+    URLs inline, so there is nothing to recover." That holds for a human reader
+    and fails for every programmatic consumer: `$UNSUB links` could not see a
+    plain-text unsubscribe URL at all, so a plain-text sender was
+    indistinguishable from a sender with no opt-out mechanism. Measured the day
+    it was found -- three plain-text bodies read, three empty link lists, two of
+    which visibly contained a URL, and one of those had been recorded a session
+    earlier as "the DNC has NO unsubscribe mechanism (no header, no body link,
+    no mailto)."
+
+    It is also a containment fix. With no list, the only way to act on a URL in
+    a plain-text body is to lift it out of the untrusted body text by hand --
+    exactly what the handle-versus-prose split exists to prevent."""
+    seen, ordered = set(), []
+    for raw in _PLAIN_URL.findall(text or ""):
+        url = _trim_url(raw)
+        if url and url not in seen:
+            seen.add(url)
+            ordered.append(url)
+    return ordered
+
+
 class Stripped(NamedTuple):
     """Named rather than a bare tuple: this return grew from 1 value to 4 across
     6.4, 11.8 and 11.2, and each widening silently broke every unpack site."""
@@ -950,10 +996,9 @@ def extract_body(msg, force_html: bool) -> "Body":
     # it merely EXISTS reported a fully-written draft as empty -- and a session
     # following the documented read path would have told the user their draft
     # was blank, then offered to rewrite it over the top of real content.
-    # No link list for text/plain: a plain-text body already shows its URLs
-    # inline, so there is nothing to recover and nothing to separate.
     if plain_text is not None and plain_text.strip() and not force_html:
-        return Body(plain_text, "text/plain", NO_HIDDEN_TEXT, [], frozenset())
+        return Body(plain_text, "text/plain", NO_HIDDEN_TEXT,
+                    plain_text_links(plain_text), frozenset())
 
     html_part = find_part(msg, "html")
     if html_part is not None:
@@ -964,7 +1009,8 @@ def extract_body(msg, force_html: bool) -> "Body":
     # Blank plain and no html at all: the message really is empty. Return it as
     # text/plain rather than None so the caller can tell "empty" from "absent".
     if plain_text is not None:
-        return Body(plain_text, "text/plain", NO_HIDDEN_TEXT, [], frozenset())
+        return Body(plain_text, "text/plain", NO_HIDDEN_TEXT,
+                    plain_text_links(plain_text), frozenset())
 
     return Body(None, None, NO_HIDDEN_TEXT, [], frozenset())
 

@@ -205,12 +205,64 @@ def extract_body_links(html_text: str) -> list:
     return parser.links
 
 
+def extract_plain_body_links(plain_text: str) -> list:
+    """Unsubscribe candidates in a text/plain body (2026-08-10).
+
+    Until this existed, a message with no HTML part produced an EMPTY body-link
+    list unconditionally, so `recommended.manual` was None and a plain-text
+    sender read as a sender with no opt-out at all. That is how the DNC got
+    recorded as having "NO unsubscribe mechanism" while its plain-text body
+    carried a working unsubscribe URL.
+
+    HTML has anchor text to judge; plain text does not, so the qualifying signal
+    is either the URL itself matching UNSUB_PATTERN, or its CONTEXT -- the line
+    it sits on plus the preceding non-blank line, which is where the standard
+    "You can unsubscribe from this mailing list at any time:" label lives. URL
+    extraction is shared with threads.plain_text_links deliberately: two
+    independent URL scanners drifting apart is the shape of the bug this fixes."""
+    lines = (plain_text or "").splitlines()
+    out, seen = [], set()
+    for i, line in enumerate(lines):
+        urls = threads.plain_text_links(line)
+        if not urls:
+            continue
+        preceding = next((lines[j] for j in range(i - 1, -1, -1)
+                          if lines[j].strip()), "")
+        for url in urls:
+            if url in seen:
+                continue
+            # The URL first: `.../cms/unsubscribe/...` is self-describing and
+            # needs no label. Then the context, for the labelled-link layout.
+            if UNSUB_PATTERN.search(url):
+                source, text = "plain-url", url
+            elif UNSUB_PATTERN.search(line) or UNSUB_PATTERN.search(preceding):
+                source = "plain-context"
+                text = re.sub(r"\s+", " ", (preceding + " " + line)).strip()
+            else:
+                continue
+            seen.add(url)
+            out.append({"url": url, "source": source, "text": text})
+    return out
+
+
 def extract_all_links(msg) -> dict:
     """{header, body} link extraction for one parsed message -- the common
-    core of `links` and `exec`'s provenance re-check."""
+    core of `links` and `exec`'s provenance re-check.
+
+    Both part types are scanned, not one or the other: a multipart/alternative
+    message can carry the opt-out in either, and preferring a part meant the
+    other one's link did not exist as far as this tool was concerned."""
     header_links = extract_header_links(msg)
+    body_links = []
     html_part = threads.find_part(msg, "html")
-    body_links = extract_body_links(threads.decode_text_part(html_part)) if html_part is not None else []
+    if html_part is not None:
+        body_links += extract_body_links(threads.decode_text_part(html_part))
+    plain_part = threads.find_part(msg, "plain")
+    if plain_part is not None:
+        known = {link["url"] for link in body_links}
+        body_links += [link for link
+                       in extract_plain_body_links(threads.decode_text_part(plain_part))
+                       if link["url"] not in known]
     return {"header": header_links, "body": body_links}
 
 

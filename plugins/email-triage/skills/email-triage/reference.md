@@ -471,12 +471,22 @@ subcommand.
 `unlock` removes a stale lock (user-approved only).
 
 **`$UNSUB links`:** `header` (`https`/`mailto`/`one_click_post`), `body`
-anchors (including image-button links by alt text), and `recommended:
-{automated, automated_method (one-click-post|get|null), manual, mailto}`
-— `automated` is header-derived only; `manual` is the top body link. Plus
-`indexed[]`: every candidate numbered 1..n (`n`, `kind` =
-`header-https`/`header-mailto`/`body`, `method`, `source`, `text`, `url`), in
-a stable order.
+candidates, and `recommended: {automated, automated_method
+(one-click-post|get|null), manual, mailto}` — `automated` is header-derived
+only; `manual` is the top body link. Plus `indexed[]`: every candidate numbered
+1..n (`n`, `kind` = `header-https`/`header-mailto`/`body`, `method`, `source`,
+`text`, `url`), in a stable order.
+
+**`body[].source` — BOTH parts are scanned** (2026-08-10): `anchor-text` and
+`img-alt` from the HTML part, plus `plain-url` (the URL's own path matches the
+unsubscribe pattern) and `plain-context` (its line, or the preceding non-blank
+line, carries the label — the "You can unsubscribe at any time:" layout) from
+text/plain. HTML wins a tie and a shared URL is not double-counted. Before this
+the scan was HTML-or-nothing, so a plain-text-only message reported an empty
+`body` and a null `manual` — indistinguishable from a sender with no opt-out at
+all, which is how the DNC came to be recorded as having none while its body
+carried a working unsubscribe URL. `$THR read`'s `links` had the same blind spot
+and got the same fix.
 
 `exec` default is the RFC 8058 one-click POST. **To pick a different link use
 `--link N` from `indexed[]`, not `--url`** — `exec` re-extracts the list
