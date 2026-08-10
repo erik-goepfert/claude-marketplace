@@ -8,6 +8,15 @@ Subcommands:
   log-note    Append a session note.
   context     Print session-start context (recent notes, active rules,
               sender stats) as JSON.
+  add-rule / list-rules / update-rule / delete-rule / set-rule
+              Full CRUD over rules (2026-08-10; before this the table was
+              append-plus-a-visibility-bit, so a badly worded rule could
+              only be retired and rewritten, leaving a dead row behind).
+              The two MUTATING verbs refuse a rule that events cite unless
+              --force: `events.rule_id` is a claim about the basis a
+              decision was made on, so rewriting or deleting it rewrites
+              history. `--active` alone is exempt -- retirement changes
+              what is in force without touching the recorded basis.
   backup      Consistent dated copy of history.db (+config.yaml) into a
               cloud-synced folder; prunes to the newest N (2.8).
 """
@@ -233,6 +242,8 @@ def cmd_add_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
 
 
 def cmd_set_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Kept as its own verb: `set-rule <id> --active 0` is the retire idiom the
+    SKILL and reference name, and `update-rule --active 0` now does the same."""
     cur = conn.execute(
         "UPDATE rules SET active = ? WHERE id = ?",
         (int(args.active), args.rule_id),
@@ -241,6 +252,105 @@ def cmd_set_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
         sys.exit(f"error: no rule with id {args.rule_id}")
     conn.commit()
     print(f"rule {args.rule_id} active={int(args.active)}")
+
+
+RULE_COLUMNS = ("id", "created_at", "updated_at", "active", "predicate",
+                "action", "origin")
+
+
+def cmd_list_rules(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Every rule, not just the active ones -- `context` deliberately shows only
+    active rules because a session should not be steered by retired ones, which
+    left no way to SEE a retired rule at all. `cited_by` counts events naming
+    each rule, so 0 across the board is visible rather than assumed."""
+    where = {"active": " WHERE active = 1", "inactive": " WHERE active = 0",
+             "all": ""}[args.filter]
+    rows = [dict(r) for r in conn.execute(
+        f"SELECT {', '.join(RULE_COLUMNS)} FROM rules{where} ORDER BY id")]
+    cited = dict(conn.execute(
+        "SELECT rule_id, COUNT(*) FROM events WHERE rule_id IS NOT NULL "
+        "GROUP BY rule_id").fetchall())
+    for row in rows:
+        row["cited_by"] = cited.get(row["id"], 0)
+    trusted, handles = column_trust({"rules": "rules"})
+    json.dump(untrusted.apply_trust(
+        {"rules": rows, "count": len(rows), "filter": args.filter},
+        trusted | {"count", "filter", "rules.cited_by"},
+        handle_fields=handles), sys.stdout, indent=2)
+    print()
+
+
+def _citing_events(conn: sqlite3.Connection, rule_id: int) -> int:
+    (n,) = conn.execute("SELECT COUNT(*) FROM events WHERE rule_id = ?",
+                        (rule_id,)).fetchone()
+    return n
+
+
+def _rule_or_exit(conn: sqlite3.Connection, rule_id: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    if row is None:
+        sys.exit(f"error: no rule with id {rule_id}")
+    return row
+
+
+# Both mutating verbs stop when events cite the rule, and say the count. An
+# event's `rule_id` is a claim about the basis a decision was made on, so
+# rewriting or deleting that basis silently rewrites history -- `--force` exists
+# because it is the user's log and their call, not because it is free.
+CITED_HINT = ("{n} event(s) cite rule {id}: {what} would change the recorded "
+              "basis for decisions already made. Re-run with --force if that "
+              "is what you want, or add a new rule and retire this one "
+              "(`set-rule {id} --active 0`), which preserves both.")
+
+
+def cmd_update_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    _rule_or_exit(conn, args.rule_id)
+    sets, params, changed = [], [], []
+    for col, val in (("predicate", args.predicate), ("action", args.action),
+                     ("origin", args.origin)):
+        if val is not None:
+            sets.append(f"{col} = ?")
+            params.append(val)
+            changed.append(col)
+    if args.active is not None:
+        sets.append("active = ?")
+        params.append(int(args.active))
+        changed.append("active")
+    if not sets:
+        sys.exit("error: nothing to update — give at least one of "
+                 "--predicate / --action / --origin / --active")
+
+    # Toggling `active` alone is retirement, not rewriting: it changes what is
+    # in force from now on and leaves the recorded basis intact, so it is never
+    # gated and does not stamp updated_at.
+    rewriting = [c for c in changed if c != "active"]
+    if rewriting:
+        n = _citing_events(conn, args.rule_id)
+        if n and not args.force:
+            sys.exit("error: " + CITED_HINT.format(
+                n=n, id=args.rule_id, what="editing " + "/".join(rewriting)))
+        sets.append("updated_at = ?")
+        params.append(utc_now())
+
+    conn.execute(f"UPDATE rules SET {', '.join(sets)} WHERE id = ?",
+                 (*params, args.rule_id))
+    conn.commit()
+    print(f"rule {args.rule_id} updated: {', '.join(changed)}")
+
+
+def cmd_delete_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Deletion is for mistakes -- a rule written wrong, or one that never
+    should have existed. To end a rule that DID govern real decisions, retire it
+    instead: `set-rule <id> --active 0` keeps the row those events point at."""
+    _rule_or_exit(conn, args.rule_id)
+    n = _citing_events(conn, args.rule_id)
+    if n and not args.force:
+        sys.exit("error: " + CITED_HINT.format(n=n, id=args.rule_id,
+                                               what="deleting it"))
+    conn.execute("DELETE FROM rules WHERE id = ?", (args.rule_id,))
+    conn.commit()
+    print(f"rule {args.rule_id} deleted"
+          + (f" (was cited by {n} event(s), forced)" if n else ""))
 
 
 def cmd_add_contact(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -330,7 +440,7 @@ TRUSTED_COLUMNS = {
     },
     "session_notes": {"id", "session_started_at", "written_at"},
     "contacts": {"is_vip", "updated_at"},
-    "rules": {"id", "created_at", "active", "origin"},
+    "rules": {"id", "created_at", "updated_at", "active", "origin"},
     # Enumerated rather than described as "all counts, rates" (UC §6 was loose
     # here). The view drifts: it gained `holds` and lost `skips` on 2026-08-06,
     # and a description cannot fail a test.
@@ -554,6 +664,33 @@ def main() -> None:
     sr.add_argument("rule_id", type=int)
     sr.add_argument("--active", required=True, type=int, choices=(0, 1))
     sr.set_defaults(func=cmd_set_rule)
+
+    lr = sub.add_parser("list-rules",
+                        help="list rules (all by default, incl. retired) with "
+                             "how many events cite each")
+    lr.add_argument("--filter", choices=("all", "active", "inactive"),
+                    default="all")
+    lr.set_defaults(func=cmd_list_rules)
+
+    ur = sub.add_parser("update-rule",
+                        help="edit a rule in place; refuses to rewrite one that "
+                             "events cite unless --force")
+    ur.add_argument("rule_id", type=int)
+    ur.add_argument("--predicate")
+    ur.add_argument("--action")
+    ur.add_argument("--origin", choices=("user", "claude-proposed"))
+    ur.add_argument("--active", type=int, choices=(0, 1), default=None)
+    ur.add_argument("--force", action="store_true",
+                    help="rewrite even though events cite this rule")
+    ur.set_defaults(func=cmd_update_rule)
+
+    dr = sub.add_parser("delete-rule",
+                        help="delete a rule written by mistake; to end one that "
+                             "governed real decisions, retire it instead")
+    dr.add_argument("rule_id", type=int)
+    dr.add_argument("--force", action="store_true",
+                    help="delete even though events cite this rule")
+    dr.set_defaults(func=cmd_delete_rule)
 
     ac = sub.add_parser("add-contact",
                         help="upsert a contact (asserted facts only)")

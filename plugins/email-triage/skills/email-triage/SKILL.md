@@ -800,7 +800,28 @@ then toss," "scan and trash"), promote it **the moment it's stated**:
   (`summarize-then-trash`, `scan-then-trash`, `surface-immediately`), not
   just the event enum. Claude-proposed rules (cite `candidates`
   analytics) use `--origin claude-proposed`, added only after approval;
-- retire with `$HIST set-rule <id> --active 0`.
+- read them with `$HIST list-rules` — **all** of them including retired ones,
+  where `context` shows only active ones, plus `cited_by` per rule;
+- **retire vs edit vs delete, and the distinction is the point:**
+  `set-rule <id> --active 0` (or `update-rule --active 0`) **retires** — the
+  rule governed real decisions and its row must survive for them to point at.
+  `update-rule <id> [--predicate|--action|--origin]` **rewrites** in place and
+  stamps `updated_at`. `delete-rule <id>` is for a rule written *wrong* — one
+  that never governed anything. Both mutating verbs refuse a rule that events
+  cite unless `--force`, because `events.rule_id` is a claim about the basis a
+  decision was made on.
+
+**Don't restate the approval gate inside a rule** (2026-08-10). Rule 1 already
+makes every rule a proposal, so "propose then confirm" adds nothing — and
+worse, a rule that spells it out implies the ones that don't are autonomous.
+Say it only when the pause IS the rule's substance: "summarize, *pause*, then
+trash" and "ask every time even though the answer is always yes" both earn it.
+A destination mapping does not.
+
+**Cite the rule when one drives a decision** — `rule_id` on the event
+(`$BATCH run` takes it per item). Without it a rule cannot be measured: you
+cannot ask whether it fires, or whether it still matches what the user does.
+
 A pattern recorded once frames every future session via `$HIST context`;
 the same pattern in prose notes scrolls away, and sender stats alone
 can't distinguish "noise I clear" from "content I consume then clear."

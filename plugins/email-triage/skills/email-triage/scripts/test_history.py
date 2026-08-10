@@ -52,6 +52,125 @@ class HistoryCliTests(unittest.TestCase):
         self.hist("set-rule", "1", "--active", "1")
         self.assertEqual(len(self.context()["active_rules"]), 1)
 
+    # -- rule CRUD (2026-08-10) --------------------------------------------
+    #
+    # The table used to be append-plus-a-visibility-bit: a badly worded rule
+    # could only be retired and rewritten, leaving a dead row forever. The
+    # guard rail that replaced that immutability is `events.rule_id` -- a claim
+    # about the basis a decision was made on, which the mutating verbs refuse to
+    # rewrite without --force.
+
+    def hist_fail(self, *args):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "history.py"),
+             "--data-dir", str(self.tmp), *args],
+            capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        return proc.stderr
+
+    def a_rule(self, predicate="sender = a@example.com", action="trash"):
+        self.hist("add-rule", "--predicate", predicate, "--action", action,
+                  "--origin", "user")
+
+    def rules(self, *args):
+        return json.loads(self.hist("list-rules", *args))
+
+    def cite_rule(self, rule_id):
+        """An event whose decision claims rule `rule_id` as its basis."""
+        self.hist("log-event", "--session", "2026-08-10T00:00:00Z",
+                  "--sender", "a@example.com", "--category", "newsletter",
+                  "--proposed", "trash", "--final", "trash",
+                  "--decided-by", "approved", "--rule-id", str(rule_id))
+
+    def test_list_rules_shows_retired_ones_which_context_hides(self):
+        self.a_rule(action="keep-me")
+        self.a_rule(action="retire-me")
+        self.hist("set-rule", "2", "--active", "0")
+        self.assertEqual([r["action"] for r in self.context()["active_rules"]],
+                         ["keep-me"])
+        self.assertEqual([r["action"] for r in self.rules()["rules"]],
+                         ["keep-me", "retire-me"])
+        self.assertEqual(self.rules("--filter", "active")["count"], 1)
+        self.assertEqual([r["action"] for r in
+                          self.rules("--filter", "inactive")["rules"]],
+                         ["retire-me"])
+
+    def test_list_rules_reports_citation_counts(self):
+        self.a_rule()
+        self.assertEqual(self.rules()["rules"][0]["cited_by"], 0)
+        self.cite_rule(1)
+        self.cite_rule(1)
+        self.assertEqual(self.rules()["rules"][0]["cited_by"], 2)
+
+    def test_update_rewrites_text_and_stamps_updated_at(self):
+        self.a_rule()
+        self.assertIsNone(self.rules()["rules"][0]["updated_at"])
+        self.hist("update-rule", "1", "--action", "summarize-then-trash")
+        row = self.rules()["rules"][0]
+        self.assertEqual(row["action"], "summarize-then-trash")
+        self.assertEqual(row["predicate"], "sender = a@example.com")  # untouched
+        self.assertRegex(row["updated_at"], r"^\d{4}-\d{2}-\d{2}T")
+
+    def test_update_with_no_fields_is_an_error(self):
+        self.a_rule()
+        self.assertIn("nothing to update", self.hist_fail("update-rule", "1"))
+
+    def test_toggling_active_is_not_a_rewrite(self):
+        """Retirement changes what is in force from now on and leaves the
+        recorded basis intact, so it is never gated and stamps no updated_at."""
+        self.a_rule()
+        self.cite_rule(1)
+        self.hist("update-rule", "1", "--active", "0")
+        row = self.rules()["rules"][0]
+        self.assertEqual(row["active"], 0)
+        self.assertIsNone(row["updated_at"])
+
+    def test_rewriting_a_cited_rule_is_refused_then_allowed_with_force(self):
+        self.a_rule()
+        self.cite_rule(1)
+        err = self.hist_fail("update-rule", "1", "--action", "rewritten")
+        self.assertIn("1 event(s) cite rule 1", err)
+        self.assertIn("--force", err)
+        self.assertIn("set-rule 1 --active 0", err)     # the lossless route
+        self.assertEqual(self.rules()["rules"][0]["action"], "trash")
+
+        self.hist("update-rule", "1", "--action", "rewritten", "--force")
+        self.assertEqual(self.rules()["rules"][0]["action"], "rewritten")
+
+    def test_delete_removes_an_uncited_rule(self):
+        self.a_rule()
+        self.assertIn("rule 1 deleted", self.hist("delete-rule", "1"))
+        self.assertEqual(self.rules()["count"], 0)
+
+    def test_deleting_a_cited_rule_is_refused_then_allowed_with_force(self):
+        self.a_rule()
+        self.cite_rule(1)
+        err = self.hist_fail("delete-rule", "1")
+        self.assertIn("1 event(s) cite rule 1", err)
+        self.assertEqual(self.rules()["count"], 1)      # nothing removed
+
+        out = self.hist("delete-rule", "1", "--force")
+        self.assertIn("forced", out)
+        self.assertEqual(self.rules()["count"], 0)
+
+    def test_missing_id_errors_on_every_rule_verb(self):
+        for argv in (("update-rule", "99", "--action", "x"),
+                     ("delete-rule", "99")):
+            with self.subTest(argv=argv):
+                self.assertIn("no rule with id 99", self.hist_fail(*argv))
+
+    def test_rule_prose_is_escaped_and_declared_in_list_rules(self):
+        """predicate/action are free text a model may have drafted, so they are
+        untrusted for the same reason event notes are."""
+        self.a_rule(predicate="subject has <b>sale</b>", action="trash & file")
+        out = self.rules()
+        declared = set(out["_trust"]["untrusted_fields"])
+        self.assertIn("rules.predicate", declared)
+        self.assertIn("rules.action", declared)
+        self.assertIn("&lt;b&gt;", out["rules"][0]["predicate"])
+        self.assertNotIn("count", declared)
+        self.assertNotIn("rules.cited_by", declared)
+
     def test_set_rule_missing_id_errors(self):
         proc = subprocess.run(
             [sys.executable, str(SCRIPTS / "history.py"), "--data-dir", str(self.tmp),

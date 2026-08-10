@@ -114,6 +114,14 @@ def migrate(conn: sqlite3.Connection) -> None:
     if "unsubscribed" not in cols:
         conn.execute("ALTER TABLE events ADD COLUMN unsubscribed INTEGER NOT NULL DEFAULT 0")
 
+    # 2026-08-10: `update-rule` and `delete-rule` made rule text mutable, so a
+    # rule's row no longer implies its text is what `created_at` created.
+    # Nullable on purpose -- NULL means never edited, which is the honest state
+    # for every rule written before editing existed.
+    rule_cols = {row[1] for row in conn.execute("PRAGMA table_info(rules)")}
+    if "updated_at" not in rule_cols:
+        conn.execute("ALTER TABLE rules ADD COLUMN updated_at TEXT")
+
     # 2026-08-06 vocabulary migration: 'skip' -> 'hold' in both action
     # columns. Value rename only -- no rows added, removed, or otherwise
     # altered, and idempotent (the WHERE matches nothing on a second run).

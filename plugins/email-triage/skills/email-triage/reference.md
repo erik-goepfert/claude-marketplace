@@ -506,6 +506,26 @@ listed in `_trust.untrusted_fields`. Anchor `text` is prose and *is* escaped.
 
 The spine carries the common `log-event` call; these are the rest.
 
+**Rules — full CRUD since 2026-08-10.** `add-rule`, `list-rules
+[--filter all|active|inactive]`, `update-rule <id> [--predicate] [--action]
+[--origin] [--active]`, `delete-rule <id>`, `set-rule <id> --active 0|1`.
+`list-rules` returns every column plus `cited_by`, and defaults to **all**
+rules — `context` shows only active ones, which until now left no way to see a
+retired rule at all.
+
+The table was append-plus-a-visibility-bit before this, so a badly worded rule
+could only be retired and rewritten, leaving a dead row forever (rule 5 is one,
+alive for twelve minutes). What replaced that immutability as the guard rail is
+`events.rule_id`: it is a claim about the basis a decision was made on, so
+`update-rule` (on predicate/action/origin) and `delete-rule` both **refuse a
+cited rule unless `--force`**, and name the lossless route in the error.
+Toggling `active` is exempt and stamps no `updated_at` — retirement changes what
+is in force going forward without touching what was recorded.
+
+Choosing between them: **retire** a rule that governed real decisions,
+**delete** one written wrong. `updated_at` is NULL for every rule never edited,
+which is every rule predating this.
+
 **`log-event`, every flag.** Required: `--session`, `--account`,
 `--sender`, `--proposed`, `--final`, `--decided-by`. Optional:
 `--subject`, `--category`, `--thread-state`, `--inactive-days`,
