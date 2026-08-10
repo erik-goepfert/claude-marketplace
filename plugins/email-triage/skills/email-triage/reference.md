@@ -426,7 +426,9 @@ any more (2026-08-10; the fields were `fast`/`mbsync_fast` when a caller
 did). Wrapped under `priority_folders` since 6.2, matching `$SES start`'s
 field name; it was a bare map.
 
-**`$BATCH run` items** (stdin or `--file`), array of:
+**`$BATCH run` items** — `--items '<json>'` on ONE line (preferred; `--file
+<path>` and stdin also accepted, and a heredoc prompts — see §Quirks), array
+of:
 `{"account", "message_id", "from_folder"}` plus exactly one of
 `"to_folder"` / `"remove": true` / `"disposition": "trash"|"activate"`
 (disposition resolves the folder from the account's tier map) — OR the
@@ -512,19 +514,25 @@ $HIST log-event --session "<session_started_at>" \
 
 **`log-events` — batch insert, all-or-nothing** (one transaction; one
 invalid item aborts the whole batch with no partial writes). Field names
-are the DB column names, not the CLI flag names. Write the real timestamp
-into the JSON — a quoted heredoc (`<<'JSON'`) does NOT expand `$SESSION`,
-and an unexpanded literal would corrupt the log:
+are the DB column names, not the CLI flag names.
+
+**Use `--file`**, which is the prescribed path anyway (`$IDX
+--suggest-events` writes `suggestions.log_file` precisely so the rows travel
+script→script without passing through you). It is also single-line, so it
+matches the allowlist — a heredoc would not, and prompts. `--file` is
+appropriate here in a way it is NOT for `$BATCH`: what is being approved is a
+write to the decision log, not the movement of mail, so a path in the prompt
+loses nothing.
 
 ```sh
-$HIST log-events <<'JSON'
-[{"session_started_at": "2026-07-09T18:15:00Z", "account": "gmail",
-  "sender_addr": "a@example.com", "category": "spam-noise",
-  "proposed_action": "trash", "final_action": "trash",
-  "decided_by": "approved", "from_folder": "INBOX",
-  "to_folder": "[Gmail]/Trash"}]
-JSON
+$HIST log-events --file /Users/erik/.local/share/email-triage/suggested-events.json
 ```
+
+If you ever do hand-build rows, write the real timestamp into the JSON: a
+quoted heredoc does NOT expand `$SESSION`, and an unexpanded literal would
+corrupt the log. Fields per row: `session_started_at`, `account`,
+`sender_addr`, `category`, `proposed_action`, `final_action`, `decided_by`,
+`from_folder`, `to_folder`.
 
 ## Analytics (on demand)
 
@@ -583,9 +591,15 @@ Project graduation runs on a slower loop than per-session triage.
   twice while a thread still sat in Inbox.
 - **Ad-hoc refiltering (`$THR list` filters):** the first live session
   dumped full JSON and re-filtered it with python one-liners 27 times.
-- **Heredoc `$SESSION` trap (Logging):** a quoted heredoc (`<<'JSON'`)
-  does NOT expand `$SESSION`; an unexpanded literal would corrupt the
-  log. Write the real timestamp into the JSON.
+- **Heredocs prompt (2026-08-10):** the permission matcher's prefix globs do
+  not cross newlines, so `<<'JSON'` feeding an *allowlisted* script still falls
+  outside the rule. In one live session 13 single-line script calls prompted
+  zero times and the only two prompts were the two heredocs — both the same
+  `$BATCH run`, which is why the batch that session never executed. Pass JSON
+  as `--items '<json>'` on one line (`$BATCH`) or `--file` (`$HIST
+  log-events`). The older `$SESSION` trap still holds for any hand-built JSON:
+  a quoted heredoc does NOT expand `$SESSION`, and an unexpanded literal would
+  corrupt the log — write the real timestamp in.
 - **Markdown links (rule F1):** `[text](url)` and backticked or elided
   URLs are unclickable in this user's terminal; both failure modes cost
   real round-trips. Bare full URL on its own line.

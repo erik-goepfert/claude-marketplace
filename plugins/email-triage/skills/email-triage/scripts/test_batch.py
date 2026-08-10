@@ -148,6 +148,64 @@ class BatchTestsFixture(unittest.TestCase):
             conn.close()
 
 
+class ItemsSourceTests(BatchTestsFixture):
+    """`--items` (2026-08-10): the items JSON as ONE inline argument.
+
+    Exists for the permission layer, not for ergonomics. A heredoc puts a
+    newline in the command and the matcher's prefix globs do not cross
+    newlines, so the allowlisted script path stops matching and every batch
+    prompts -- verified live, where 13 single-line script calls prompted zero
+    times and the only two prompts were the two heredocs. `--file` is also one
+    line but would show the user a PATH in the approval prompt instead of the
+    mail being moved, which is why it is not the answer."""
+
+    def raw_batch(self, raw_argv):
+        argv = ["run", "--db", str(self.db), "--maildir-root", str(self.maildir),
+                "--data-dir", str(self.data_dir), "--config", str(self.config),
+                "--mbsyncrc", "/dev/null", "--mbsync", str(self.stub),
+                "--session", "2026-07-18T00:00:00Z", *raw_argv]
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = batch.main(argv)
+        stdout = out.getvalue()
+        return code, (json.loads(stdout) if stdout.strip() else None), err.getvalue()
+
+    def test_items_inline_on_one_line_acts_the_same_as_a_file(self):
+        one_line = json.dumps(
+            [{"account": "acct", "message_id": "m1@x", "from_folder": "INBOX",
+              "to_folder": "Trash"}], separators=(",", ":"))
+        self.assertNotIn("\n", one_line)   # the whole point
+        code, out, _ = self.raw_batch(["--items", one_line,
+                                       "--category", "newsletter"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(out["acted"]["moved"]), 1)
+        self.assertEqual(out["events_logged"], 1)
+        self.assertEqual(self.events()[0]["final_action"], "trash")
+
+    def test_items_and_file_are_mutually_exclusive(self):
+        """Two sources would silently pick one. Fail instead."""
+        items_file = self.tmp / "items.json"
+        items_file.write_text("[]")
+        with self.assertRaises(SystemExit) as ctx:
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self.raw_batch(["--items", "[]", "--file", str(items_file)])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_malformed_items_json_fails_before_anything_acts(self):
+        code, _out, err = self.raw_batch(["--items", '[{"account": "acct"'])
+        self.assertNotEqual(code, 0)
+        self.assertTrue(list((self.acct / "INBOX" / "cur").iterdir()),
+                        "mail moved despite unparseable items")
+        self.assertIn("error", err.lower())
+
+    def test_empty_items_is_a_clean_error_not_a_silent_no_op(self):
+        """Pre-existing rule, and the right one: an empty batch means the
+        caller built the wrong command, so it must not report success."""
+        code, _out, err = self.raw_batch(["--items", "[]"])
+        self.assertEqual(code, 1)
+        self.assertIn("non-empty", err)
+
+
 class BatchTests(BatchTestsFixture):
     """Tests over BatchTestsFixture's fixture."""
 

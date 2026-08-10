@@ -24,7 +24,18 @@ context) and the script does the rest:
   5. Box-scoped mbsync per touched account (exactly the touched folders),
      one account per invocation, one automatic retry (the ~25% EOF flake).
 
-Items JSON (stdin or --file), an array of:
+Items JSON — `--items '<json>'` (preferred), `--file <path>`, or stdin.
+
+**Prefer `--items`, and keep it on ONE line** (2026-08-10). A heredoc puts a
+newline in the command, and the permission matcher's prefix globs do not cross
+newlines, so the allowlisted script path stops matching and every batch prompts.
+Verified live: 13 single-line script calls in one session prompted zero times;
+the only two that prompted were the two heredocs.
+`--file` also fits on one line but is the wrong trade — the prompt would show a
+path instead of the mail being moved, so the user would be approving a filename.
+With `--items` the exact ids and destinations are visible in the command.
+
+An array of:
   {"account": "gmail", "message_id": "<...>", "from_folder": "INBOX",
    "to_folder": "[Gmail]/Trash"}                # move, OR
   {"account": "gmail", "message_id": "<...>", "from_folder": "INBOX",
@@ -390,7 +401,12 @@ def main(argv=None) -> int:
     p.add_argument("--notes", help="batch-level default notes")
     p.add_argument("--unsubscribed", action="store_true",
                    help="user confirmed unsubscribing from this whole batch")
-    p.add_argument("--file", help="read the items JSON array from this file instead of stdin")
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--items",
+                     help="the items JSON array inline, on ONE line (preferred: "
+                          "keeps the command allowlist-matchable AND shows in the "
+                          "approval prompt exactly which mail moves where)")
+    src.add_argument("--file", help="read the items JSON array from this file instead of stdin")
     p.add_argument("--dry-run", action="store_true",
                    help="validate + print the derived plan; act nothing")
     p.add_argument("--no-sync", action="store_true",
@@ -411,7 +427,12 @@ def main(argv=None) -> int:
         if not (args.data_dir / "history.db").is_file():
             raise BatchError(f"no history.db in {args.data_dir}")
 
-        raw = Path(args.file).read_text() if args.file else sys.stdin.read()
+        if args.items is not None:
+            raw = args.items
+        elif args.file:
+            raw = Path(args.file).read_text()
+        else:
+            raw = sys.stdin.read()
         items = load_items(raw)
         accounts = sorted({it.get("account") for it in items if it.get("account")})
         tier_maps = indexer.load_tier_maps(config_path, accounts)

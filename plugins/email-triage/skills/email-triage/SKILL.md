@@ -38,12 +38,17 @@ The scripts live in this skill's `scripts/` directory. In this document,
 **Invocation rules.** Each one was a live permission prompt; the *why* is
 in reference §Incident history.
 
-- **One statement per call, script filename written literally:**
+- **One statement per call, ON ONE LINE, script filename written literally:**
   `<scripts-dir>/session.py start`. No shell variable, no assignment, no
   `echo`/`cd` preamble, no `python3`/`uv run` wrapper — the permission
   engine matches literal statement text, so anything it can't read
   through prompts. (`analytics.py` is the one exception; reference
   §Analytics.)
+  **"One line" is literal: a newline breaks the match.** The matcher's prefix
+  globs don't cross newlines, so a heredoc — even one feeding an allowlisted
+  script — falls outside the rule and prompts. Pass JSON via `--items '<json>'`
+  instead (Acting), never `<<'JSON'`. Measured 2026-08-10: 13 single-line
+  script calls prompted zero times, both heredocs prompted.
 - **`<scripts-dir>`** = the skill launch banner's "Base directory for this
   skill" + `/scripts`, written out in every command. `$CLAUDE_SKILL_DIR`
   is NOT set in live sessions — the banner is the source of truth.
@@ -597,19 +602,23 @@ hardcoded:**
 | Save reply for later | Reply step 5, "Save for later" exit — writes into `<tiers.drafts>` |
 
 **Approved move/remove batches → `$BATCH run`** (one call: act + derived
-events + echo-absorbed re-index + box-scoped push):
+events + echo-absorbed re-index + box-scoped push). **`--items`, on ONE line:**
 
 ```sh
-$BATCH run --session "<session_started_at>" \
-  --category newsletter [--notes "..."] [--unsubscribed] [--dry-run] <<'JSON'
-[
-  {"account": "gmail", "thread_of": "m1@x", "disposition": "trash"},
-  {"account": "icloud", "thread_of": "m9@y", "disposition": "trash"},
-  {"account": "gmail", "message_id": "m2@x", "from_folder": "INBOX",
-   "remove": true}
-]
-JSON
+<scripts-dir>/batch.py run --session "<session_started_at>" --category newsletter --items '[{"account":"gmail","thread_of":"m1@x","disposition":"trash"},{"account":"icloud","thread_of":"m9@y","disposition":"trash"},{"account":"gmail","message_id":"m2@x","from_folder":"INBOX","remove":true}]'
 ```
+
+Plus optional `--notes "..."`, `--unsubscribed`, `--dry-run`.
+
+**Never a heredoc, and this is the invocation rule above, not a style
+preference** (2026-08-10). A heredoc puts a newline in the command; the
+permission matcher's prefix globs don't cross newlines, so the allowlisted
+script path stops matching and **every batch prompts**. Measured in one live
+session: 13 single-line script calls, zero prompts; the only two prompts were
+the two heredocs. `--file <path>` is also one line and is still the wrong
+answer — the prompt would show a *path*, so the user would be approving a
+filename instead of seeing which mail moves where. With `--items` the ids and
+destinations are in the command they are shown.
 
 **`thread_of` + `disposition` is the standard board form** (R1,
 2026-07-19): name ANY member of the thread; the script expands to every
