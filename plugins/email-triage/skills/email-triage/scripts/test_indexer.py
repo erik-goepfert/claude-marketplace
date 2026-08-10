@@ -1014,12 +1014,12 @@ class PriorityFoldersTest(unittest.TestCase):
         # the `_trust` block, matching `session.py start`'s field name.
         result = json.loads(buf.getvalue())["priority_folders"]
         self.assertEqual(result["icloud"], {
-            "fast": ["INBOX", "Active", "Sent Messages", "Drafts"],
-            "mbsync_fast": "icloud:INBOX,Active,Sent Messages,Drafts",
+            "boxes": ["INBOX", "Active", "Sent Messages", "Drafts"],
+            "mbsync_spec": "icloud:INBOX,Active,Sent Messages,Drafts",
             "slow_hint": "full channel",
         })
-        self.assertEqual(result["gmail"]["fast"], ["INBOX", "Active", "[Gmail]/Sent Mail", "[Gmail]/Drafts"])
-        self.assertEqual(result["gmail"]["mbsync_fast"],
+        self.assertEqual(result["gmail"]["boxes"], ["INBOX", "Active", "[Gmail]/Sent Mail", "[Gmail]/Drafts"])
+        self.assertEqual(result["gmail"]["mbsync_spec"],
                          "gmail:INBOX,Active,[Gmail]/Sent Mail,[Gmail]/Drafts")
 
     def test_cmd_priority_folders_no_config_degrades_to_defaults(self):
@@ -1034,8 +1034,8 @@ class PriorityFoldersTest(unittest.TestCase):
         self.assertEqual(payload["_trust"]["untrusted_fields"], [])
         result = payload["priority_folders"]
         self.assertEqual(set(result.keys()), {"icloud", "gmail"})
-        self.assertEqual(result["icloud"]["fast"], ["INBOX", "Active", "Sent Messages", "Drafts"])
-        self.assertEqual(result["gmail"]["fast"], ["INBOX", "Active", "[Gmail]/Sent Mail", "[Gmail]/Drafts"])
+        self.assertEqual(result["icloud"]["boxes"], ["INBOX", "Active", "Sent Messages", "Drafts"])
+        self.assertEqual(result["gmail"]["boxes"], ["INBOX", "Active", "[Gmail]/Sent Mail", "[Gmail]/Drafts"])
 
 
 class IndexColumnTrustTests(unittest.TestCase):

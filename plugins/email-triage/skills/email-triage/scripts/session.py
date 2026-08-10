@@ -14,10 +14,25 @@ Subcommands:
                    nothing) if the lock is already held.
   unlock           Remove a stale session lock -- only after the user has
                    approved removing it.
-  sync-background  Detached full sync of every account (one mbsync
-                   invocation per account, one automatic retry each);
-                   touches .fullsync-done only if ALL succeed. Stage 2 of
-                   the two-stage sync.
+  sync             Both stages of the two-stage sync, `--scope` picking
+                   which. The scopes NEST -- `full` re-syncs everything
+                   `priority` did, INBOX included -- which is what makes
+                   the step-6 re-index able to surface mail that arrived
+                   during Stage 1. Hence inclusive names, not hot/cold.
+                     priority  Stage 1: the live working set + sent +
+                               drafts. FOREGROUND and sequential --
+                               classification runs on this data, so
+                               returning before it lands defeats it.
+                     full      Stage 2: every folder, DETACHED -- it takes
+                               minutes and classification proceeds
+                               meanwhile. Touches .fullsync-done only if
+                               ALL accounts succeed.
+                   Box lists come from config.yaml via
+                   indexer.priority_fast_map, never from the caller: this
+                   command exists so no caller hand-assembles a box list
+                   or hand-quotes `[Gmail]/Sent Mail` (2026-08-10).
+  sync-background  Alias for `sync --scope full`, kept because reference.md
+                   and cmd_check_fullsync's own hint name it.
   check-fullsync   Is Stage 2 done? Marker status + log tail when not.
   end              Detached final sync chain that releases the session
                    lock only on success. Write the session note BEFORE
@@ -57,15 +72,20 @@ def utc_now() -> str:
 TRUSTED_FIELDS = {
     "session_started_at", "lock", "hint", "warning", "config", "config_path",
     "unlock", "stage2", "end_chain", "log", "marker", "note", "accounts",
+    "scope", "all_ok", "unknown_accounts", "synced.account", "synced.boxes",
+    "synced.attempts", "synced.ok",
 }
 # priority_folders is keyed by account name and env by variable name: dynamic
 # key spaces, but OURS (config and os.environ), never a sender's. That is the
 # only condition under which a subtree may be trusted wholesale.
 TRUSTED_SUBTREES = {"priority_folders", "env"}
-# `log_tail` is absent on purpose. It is mbsync's own output -- an external
-# process whose text is not a vocabulary we control, reporting on data senders
-# produced. Default-deny escapes and declares it; nothing feeds it back, so
+# Absent on purpose, so default-deny escapes and declares them. Both are
+# mbsync's own output -- an external process whose text is not a vocabulary we
+# control, reporting on data senders produced. Nothing feeds either back, so
 # escaping is free.
+#   log_tail        -- check-fullsync's tail of fullsync.log
+#   synced.stderr   -- a failed foreground attempt's tail (same call as
+#                      batch.py's `sync.stderr`, same reasoning)
 
 
 def emit(obj: dict) -> None:
@@ -103,6 +123,32 @@ def full_sync_chain(accounts: list, mbsync: str, mbsyncrc: str, tail: str) -> st
         cmd = f"{shlex.quote(mbsync)} -c {shlex.quote(mbsyncrc)} {shlex.quote(account)}"
         parts.append(f"({cmd} || {cmd})")
     return " && ".join(parts) + f" && {tail}"
+
+
+def sync_specs(specs: list, mbsync: str, mbsyncrc: str) -> list:
+    """Foreground per-account sync, ONE retry each (the ~25% `read: unexpected
+    EOF` flake). Sequential by construction -- it is a loop, so the ordering
+    the SKILL used to ask a caller to honour can no longer be gotten wrong.
+
+    Result shape deliberately matches batch.py's `sync_boxes`, so a reader who
+    knows one knows the other: account / boxes / attempts / ok, plus a stderr
+    tail only on failure. Argv, never a shell string -- folder names contain
+    spaces and `[Gmail]/...` contains glob characters, and hand-quoting those
+    is the hazard this whole command removes."""
+    results = []
+    for account, boxes in specs:
+        spec = f"{account}:{','.join(boxes)}"
+        attempts, ok, err = 0, False, ""
+        while attempts < 2 and not ok:
+            attempts += 1
+            proc = subprocess.run([mbsync, "-c", mbsyncrc, spec],
+                                  capture_output=True, text=True)
+            ok = proc.returncode == 0
+            err = (proc.stderr or "").strip()[-500:]
+        results.append({"account": account, "boxes": list(boxes),
+                        "attempts": attempts, "ok": ok,
+                        **({} if ok else {"stderr": err})})
+    return results
 
 
 def launch_detached(chain: str, log_path: Path) -> int:
@@ -176,7 +222,14 @@ def cmd_unlock(args) -> int:
     return 0
 
 
-def cmd_sync_background(args) -> int:
+def cmd_sync(args) -> int:
+    return _sync_full(args) if args.scope == "full" else _sync_priority(args)
+
+
+def _sync_full(args) -> int:
+    """Stage 2, detached. Every folder including the ones Stage 1 already
+    covered -- the scopes nest, and re-covering INBOX is load-bearing: mail
+    arriving during Stage 1 reaches the index only via step 6's re-index."""
     data_dir = args.data_dir
     marker = data_dir / ".fullsync-done"
     log = data_dir / "fullsync.log"
@@ -184,9 +237,32 @@ def cmd_sync_background(args) -> int:
     chain = full_sync_chain(accounts, args.mbsync, args.mbsyncrc,
                             f"touch {shlex.quote(str(marker))}")
     pid = launch_detached(chain, log)
-    emit({"stage2": "launched", "pid": pid, "accounts": accounts,
-          "log": str(log), "marker": str(marker)})
+    emit({"scope": "full", "stage2": "launched", "pid": pid,
+          "accounts": accounts, "log": str(log), "marker": str(marker)})
     return 0
+
+
+def _sync_priority(args) -> int:
+    """Stage 1, foreground. Exit 1 if ANY account failed both attempts: a
+    partial Stage 1 means that account's mirror still holds last session's
+    state, and classifying against it silently reports stale mail as current."""
+    pmap = indexer.priority_fast_map(config_path_for(args))
+    wanted = accounts_for(args)
+    unknown = [a for a in wanted if a not in pmap]
+    results = sync_specs([(a, pmap[a]["boxes"]) for a in wanted if a in pmap],
+                         args.mbsync, args.mbsyncrc)
+    all_ok = bool(results) and all(r["ok"] for r in results) and not unknown
+    out = {"scope": "priority", "synced": results, "all_ok": all_ok}
+    if unknown:
+        # Named an account config.yaml does not define. Never silently sync
+        # nothing and report success.
+        out["unknown_accounts"] = unknown
+    if not all_ok:
+        out["hint"] = ("rerun the failed account(s); until Stage 1 succeeds "
+                       "their mirror holds last session's state, so anything "
+                       "classified from it is stale")
+    emit(out)
+    return 0 if all_ok else 1
 
 
 def cmd_check_fullsync(args) -> int:
@@ -215,22 +291,51 @@ def cmd_end(args) -> int:
     return 0
 
 
+def add_shared_options(p, *, suppress: bool) -> None:
+    """Options accepted BOTH before and after the subcommand, because
+    `sync --scope priority --account gmail` is the order anyone actually
+    writes, while argparse only honours pre-subcommand flags by default.
+
+    On the subparser copies every default is SUPPRESS, so a flag left off does
+    not overwrite the top-level value with a default -- argparse's
+    subparser-defaults trap, and the reason this is a function rather than a
+    parent parser."""
+    def d(value):
+        return argparse.SUPPRESS if suppress else value
+    p.add_argument("--data-dir", type=Path, default=d(DEFAULT_DATA_DIR))
+    p.add_argument("--config", type=Path, default=d(None),
+                   help="config.yaml path; default <data-dir>/config.yaml")
+    p.add_argument("--mbsyncrc", default=d(DEFAULT_MBSYNCRC),
+                   help="mbsync config (never auto-discovered)")
+    p.add_argument("--mbsync", default=d("mbsync"),
+                   help="mbsync binary (tests override)")
+    p.add_argument("--account", action="append", default=d(None),
+                   help="act on this account only (repeatable); default: all configured")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
-    ap.add_argument("--config", type=Path, default=None,
-                    help="config.yaml path; default <data-dir>/config.yaml")
-    ap.add_argument("--mbsyncrc", default=DEFAULT_MBSYNCRC,
-                    help="mbsync config (never auto-discovered)")
-    ap.add_argument("--mbsync", default="mbsync", help="mbsync binary (tests override)")
-    ap.add_argument("--account", action="append",
-                    help="sync only this account (repeatable); default: all configured")
+    add_shared_options(ap, suppress=False)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    def add(name, **kw):
+        p = sub.add_parser(name, **kw)
+        add_shared_options(p, suppress=True)
+        return p
+
     for name, fn in (("start", cmd_start), ("unlock", cmd_unlock),
-                     ("sync-background", cmd_sync_background),
                      ("check-fullsync", cmd_check_fullsync), ("end", cmd_end)):
-        p = sub.add_parser(name)
-        p.set_defaults(func=fn)
+        add(name).set_defaults(func=fn)
+
+    p = add("sync", help="Stage 1 (--scope priority, foreground) or "
+                         "Stage 2 (--scope full, detached)")
+    p.add_argument("--scope", required=True, choices=("priority", "full"),
+                   help="priority = live working set + sent + drafts; full = "
+                        "every folder, a SUPERSET of priority. Required on "
+                        "purpose: a default either way would let a half sync "
+                        "pass for a whole one")
+    p.set_defaults(func=cmd_sync)
+    # An alias, not a second implementation.
+    add("sync-background").set_defaults(func=cmd_sync, scope="full")
     args = ap.parse_args(argv)
     try:
         return args.func(args)

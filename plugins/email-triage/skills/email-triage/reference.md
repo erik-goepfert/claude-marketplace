@@ -204,6 +204,12 @@ standing ones.
   `read: unexpected EOF` ~25% of the time (opening the second channel); a
   single retry always recovered. Gmail costs ~60–80 s per invocation
   regardless of scope; a full gmail channel walk is 5–8 min.
+  All of that is now encoded in `$SES sync` and `$BATCH run`, which build the
+  spec from `config.yaml` and invoke mbsync as **argv** — the retry, the
+  one-account rule, and the quoting all handled where they can't be
+  misremembered. A folder name like `[Gmail]/Sent Mail` holds a space and two
+  shell globs, so hand-quoting it was a standing hazard rather than a style
+  question (2026-08-10).
 - **`himalaya envelope list` defaults to a 10-envelope page** on every
   backend — a listing that "looks complete" at 10 is silently truncated.
   Always pass `-s 500` (or page with `-p`). Cost a live session ~9 tool
@@ -403,11 +409,13 @@ Self-echo comes from `SELECT ... FROM events WHERE session_started_at = ?`,
 which is authoritative and cannot forget across a compaction the way recall
 can. `--session` is required for exactly that query.
 
-**`$IDX priority-folders`:** `{"priority_folders": {<account>: {"fast":
-[names], "mbsync_fast": "<acct>:<f1>,<f2>,...", "slow_hint": "full
-channel"}}}` — pass `mbsync_fast` verbatim as ONE mbsync argument. (Wrapped
-under `priority_folders` since 6.2, matching `$SES start`'s field name; it
-was a bare map.)
+**`$IDX priority-folders`:** `{"priority_folders": {<account>: {"boxes":
+[names], "mbsync_spec": "<acct>:<f1>,<f2>,...", "slow_hint": "full
+channel"}}}` — **diagnostic only.** `$SES sync --scope priority` builds the
+spec from `boxes` itself and runs it as argv; nothing pastes `mbsync_spec`
+any more (2026-08-10; the fields were `fast`/`mbsync_fast` when a caller
+did). Wrapped under `priority_folders` since 6.2, matching `$SES start`'s
+field name; it was a bare map.
 
 **`$BATCH run` items** (stdin or `--file`), array of:
 `{"account", "message_id", "from_folder"}` plus exactly one of
@@ -432,9 +440,22 @@ overrides (inherited by expanded members):
 the launch banner is the base-dir source of truth)}`. When the lock is
 held: exit 1, touches nothing, and emits ONLY `{lock, hint, env}` (R8). All scripts default `--db`/`--maildir`/`--maildir-root`/
 `--data-dir`/`--mbsyncrc` from `$EMAIL_TRIAGE_DATA_DIR` (2026-07-19) —
-path flags are overrides, not boilerplate. `sync-background` / `end` →
-`{pid, accounts, log}` (detached chain: per-account mbsync with one
-retry each; marker touch / lock rmdir only if ALL succeed).
+path flags are overrides, not boilerplate.
+
+`sync --scope priority` (Stage 1) → `{scope, synced: [{account, boxes,
+attempts, ok, stderr?}], all_ok, unknown_accounts?, hint?}`, **foreground**,
+exit 1 unless every account synced — a failed account's mirror still holds
+last session's state, so `all_ok` gates classification. `sync --scope full`
+(Stage 2) and `end` → `{pid, accounts, log}`, detached chain: per-account
+mbsync with one retry each, marker touch / lock rmdir only if ALL succeed.
+`sync-background` is an alias for `--scope full`. **The scopes nest** —
+`full` re-syncs the priority boxes too, INBOX included, which is what lets
+step 6's re-index pick up mail that landed during Stage 1; that inclusion is
+why the names are `priority`/`full` and not `hot`/`cold` (2026-08-10).
+`--scope` is required: a default would let a half sync pass for a whole one.
+Both scopes take `--account` (repeatable), accepted before *or* after the
+subcommand.
+
 `check-fullsync` → `{fullsync_done, log_tail?}`, exit 1 until done.
 `unlock` removes a stale lock (user-approved only).
 

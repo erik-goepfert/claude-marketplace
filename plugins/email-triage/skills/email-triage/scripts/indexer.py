@@ -1472,14 +1472,16 @@ def priority_fast_map(config_path: Path) -> dict:
     result = {}
     for account in account_names:
         tier_map = parsed.get(account) or DEFAULT_TIER_MAPS.get(account, {})
-        fast = [tier_map[k] for k in PRIORITY_FAST_TIER_KEYS if tier_map.get(k)]
+        boxes = [tier_map[k] for k in PRIORITY_FAST_TIER_KEYS if tier_map.get(k)]
         result[account] = {
-            "fast": fast,
-            # Ready-made Stage-1 argument (5.7): pass verbatim as ONE
-            # argument -- mbsync -c "$MBSYNCRC" '<mbsync_fast>' -- instead
-            # of hand-assembling the box list (a quoting slip in a live
-            # session cost a retry cycle).
-            "mbsync_fast": f"{account}:{','.join(fast)}",
+            "boxes": boxes,
+            # The mbsync argument, kept for diagnostics only. Nobody pastes
+            # this any more: `session.py sync --scope priority` builds it from
+            # `boxes` and runs it as argv (2026-08-10). It existed because the
+            # SKILL asked the model to pass it verbatim as ONE argument, after
+            # a hand-assembled box list cost a live retry cycle -- fixing the
+            # quoting was the right patch to the wrong layer.
+            "mbsync_spec": f"{account}:{','.join(boxes)}",
             "slow_hint": "full channel",
         }
     return result

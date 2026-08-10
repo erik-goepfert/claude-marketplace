@@ -10,7 +10,7 @@ import tempfile
 import time
 import unittest
 from io import StringIO
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,6 +41,38 @@ fi
 exit 0
 """
 
+# One line per argument, so a test can prove the box spec arrived as ONE
+# argument. `echo "$@"` cannot show that: it joins with spaces, so a spec that
+# had been word-split would print identically to one that had not.
+ARGV_STUB = """#!/bin/sh
+for a in "$@"; do echo "ARG:$a" >> "$STUBLOG"; done
+exit 0
+"""
+
+ALWAYS_FAIL_STUB = """#!/bin/sh
+echo 'far side box <script>alert(1)</script> cannot be opened' >&2
+exit 1
+"""
+
+# Two accounts and a bracketed, space-bearing folder name -- the shapes that
+# made hand-quoting a hazard: `[` and `]` are shell globs, and the space would
+# split the argument.
+CONFIG_TWO = """\
+accounts:
+  acct:
+    tiers:
+      untriaged: INBOX
+      active: Active
+      sent: "[Gmail]/Sent Mail"
+      drafts: Drafts
+  other:
+    tiers:
+      untriaged: INBOX
+      active: Live
+      sent: Sent Messages
+      drafts: Drafts
+"""
+
 
 def wait_for(predicate, timeout=5.0):
     deadline = time.time() + timeout
@@ -63,13 +95,23 @@ class SessionTests(unittest.TestCase):
         os.environ["STUBLOG"] = str(self.stublog)
         os.environ.pop("FAIL_ONCE_MARKER", None)
 
-    def run_ses(self, *argv):
+    def run_ses(self, *argv, stub=None):
         buf = StringIO()
         with redirect_stdout(buf):
             code = session.main(["--data-dir", str(self.tmp),
                                  "--mbsyncrc", "/dev/null",
-                                 "--mbsync", str(self.stub), *argv])
+                                 "--mbsync", str(stub or self.stub), *argv])
         return code, json.loads(buf.getvalue())
+
+    def write_stub(self, name, text):
+        path = self.tmp / name
+        path.write_text(text)
+        path.chmod(0o755)
+        return path
+
+    def write_config(self, text) -> list:
+        (self.tmp / "alt.yaml").write_text(text)
+        return ["--config", str(self.tmp / "alt.yaml")]
 
     def test_start_bundles_config_lock_stamp_priority(self):
         (self.tmp / ".fullsync-done").touch()  # stale marker from last time
@@ -79,7 +121,7 @@ class SessionTests(unittest.TestCase):
         self.assertTrue((self.tmp / "session.lock").is_dir())
         self.assertRegex(out["session_started_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertIn("untriaged: INBOX", out["config"])
-        self.assertEqual(out["priority_folders"]["acct"]["mbsync_fast"],
+        self.assertEqual(out["priority_folders"]["acct"]["mbsync_spec"],
                          "acct:INBOX,Active,Sent,Drafts")
         self.assertTrue(out["fullsync_marker_cleared"])
         self.assertFalse((self.tmp / ".fullsync-done").exists())
@@ -130,6 +172,122 @@ class SessionTests(unittest.TestCase):
         marker = self.tmp / ".fullsync-done"
         self.assertTrue(wait_for(marker.is_file), "marker never appeared after retry")
         self.assertEqual(len(self.stublog.read_text().splitlines()), 2)
+
+    # -- `sync --scope` (2026-08-10): Stage 1 stops being ad-hoc shell ------
+    #
+    # The point of these is that the caller supplies intent (`priority` or
+    # `full`, optionally an account) and NEVER a folder list. Everything about
+    # which boxes to sync is config's business, so these tests assert on what
+    # reached mbsync's argv.
+
+    def test_priority_syncs_the_config_boxes_and_reports_per_account(self):
+        code, out = self.run_ses("sync", "--scope", "priority")
+        self.assertEqual(code, 0)
+        self.assertEqual(out["scope"], "priority")
+        self.assertTrue(out["all_ok"])
+        self.assertEqual(out["synced"], [{
+            "account": "acct",
+            "boxes": ["INBOX", "Active", "Sent", "Drafts"],
+            "attempts": 1, "ok": True,
+        }])
+        self.assertEqual(self.stublog.read_text().strip(),
+                         "-c /dev/null acct:INBOX,Active,Sent,Drafts")
+
+    def test_priority_is_finished_before_it_returns(self):
+        """The foreground guarantee, and the reason scope decides detachment:
+        classification runs on this data, so `sync` returning while mbsync is
+        still walking would hand back last session's mirror. Note the absence
+        of `wait_for` -- sync-background's test needs one, this must not."""
+        self.run_ses("sync", "--scope", "priority")
+        self.assertIn("acct:INBOX", self.stublog.read_text())
+
+    def test_priority_retries_a_flake_once(self):
+        os.environ["FAIL_ONCE_MARKER"] = str(self.tmp / "failed-once")
+        self.addCleanup(os.environ.pop, "FAIL_ONCE_MARKER", None)
+        code, out = self.run_ses("sync", "--scope", "priority")
+        self.assertEqual(code, 0)
+        self.assertTrue(out["all_ok"])
+        self.assertEqual(out["synced"][0]["attempts"], 2)
+        self.assertEqual(len(self.stublog.read_text().splitlines()), 2)
+
+    def test_priority_failure_exits_1_and_says_the_mirror_is_stale(self):
+        """Stage 1 had no retry and no failure signal at all while it was a
+        hand-typed command: a flake left the mirror stale and classification
+        proceeded on it anyway."""
+        stub = self.write_stub("mbsync-fail", ALWAYS_FAIL_STUB)
+        code, out = self.run_ses("sync", "--scope", "priority", stub=stub)
+        self.assertEqual(code, 1)
+        self.assertFalse(out["all_ok"])
+        self.assertFalse(out["synced"][0]["ok"])
+        self.assertEqual(out["synced"][0]["attempts"], 2)
+        self.assertIn("stale", out["hint"])
+
+    def test_failed_attempt_stderr_is_escaped_and_declared(self):
+        """mbsync's own text, about folders a sender's mail sits in -- same
+        call as batch.py's `sync.stderr`, so default-deny must reach it."""
+        stub = self.write_stub("mbsync-fail", ALWAYS_FAIL_STUB)
+        _code, out = self.run_ses("sync", "--scope", "priority", stub=stub)
+        self.assertIn("synced.stderr", out["_trust"]["untrusted_fields"])
+        self.assertNotIn("<script>", out["synced"][0]["stderr"])
+        self.assertIn("&lt;script&gt;", out["synced"][0]["stderr"])
+
+    def test_box_spec_reaches_mbsync_as_one_unsplit_argument(self):
+        """The hazard the command removes. `[Gmail]/Sent Mail` carries shell
+        globs AND a space; it used to be hand-quoted in a typed command, where
+        one missing quote splits the spec or globs the brackets. argv has no
+        such failure mode -- assert it really is argv."""
+        stub = self.write_stub("mbsync-argv", ARGV_STUB)
+        cfg = self.write_config(CONFIG_TWO)
+        code, _out = self.run_ses("sync", "--scope", "priority",
+                                  "--account", "acct", *cfg, stub=stub)
+        self.assertEqual(code, 0)
+        self.assertIn("ARG:acct:INBOX,Active,[Gmail]/Sent Mail,Drafts",
+                      self.stublog.read_text().splitlines())
+
+    def test_account_scopes_the_sync_to_one_account(self):
+        cfg = self.write_config(CONFIG_TWO)
+        code, out = self.run_ses("sync", "--scope", "priority",
+                                 "--account", "other", *cfg)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["account"] for r in out["synced"]], ["other"])
+        self.assertIn("other:INBOX,Live,Sent Messages,Drafts",
+                      self.stublog.read_text())
+        self.assertNotIn("acct:", self.stublog.read_text())
+
+    def test_unknown_account_is_reported_not_a_silent_success(self):
+        """`--account typo` must not sync nothing and call it done."""
+        code, out = self.run_ses("sync", "--scope", "priority",
+                                 "--account", "nope")
+        self.assertEqual(code, 1)
+        self.assertFalse(out["all_ok"])
+        self.assertEqual(out["unknown_accounts"], ["nope"])
+        self.assertFalse(self.stublog.exists())
+
+    def test_full_syncs_whole_channels_so_the_scopes_nest(self):
+        """Why the names are inclusive rather than hot/cold: `full` re-covers
+        the priority boxes, INBOX included. A bare channel name, no box spec.
+        Mail arriving during Stage 1 reaches the index only because of this."""
+        stub = self.write_stub("mbsync-argv", ARGV_STUB)
+        code, out = self.run_ses("sync", "--scope", "full", stub=stub)
+        self.assertEqual(code, 0)
+        self.assertEqual(out["scope"], "full")
+        self.assertTrue(wait_for(lambda: self.stublog.is_file()))
+        self.assertTrue(wait_for(
+            lambda: "ARG:acct" in self.stublog.read_text().splitlines()))
+        self.assertNotIn("ARG:acct:INBOX", self.stublog.read_text())
+
+    def test_scope_is_required(self):
+        """No default: `priority` would silently half-sync, `full` would block
+        the session for minutes. Making the caller say which is the feature."""
+        with self.assertRaises(SystemExit) as ctx:
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                session.main(["--data-dir", str(self.tmp), "sync"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_sync_background_is_an_alias_for_scope_full(self):
+        _code, out = self.run_ses("sync-background")
+        self.assertEqual(out["scope"], "full")
+        self.assertEqual(out["stage2"], "launched")
 
     def test_end_releases_lock_only_on_success(self):
         (self.tmp / "session.lock").mkdir()

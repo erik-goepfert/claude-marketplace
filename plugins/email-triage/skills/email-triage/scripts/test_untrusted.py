@@ -240,12 +240,12 @@ class ManifestTests(unittest.TestCase):
         # allowlist can name the paths. Legitimate only because the keys come
         # from config, never from a sender.
         out = untrusted.apply_trust(
-            {"priority_folders": {"gmail": {"fast": ["INBOX", "Active"]},
-                                  "icloud": {"fast": ["INBOX"]}},
+            {"priority_folders": {"gmail": {"boxes": ["INBOX", "Active"]},
+                                  "icloud": {"boxes": ["INBOX"]}},
              "subject": "<b>"},
             [], trusted_subtrees=["priority_folders"])
         self.assertEqual(out["_trust"]["untrusted_fields"], ["subject"])
-        self.assertEqual(out["priority_folders"]["gmail"]["fast"],
+        self.assertEqual(out["priority_folders"]["gmail"]["boxes"],
                          ["INBOX", "Active"])
 
     def test_a_subtree_does_not_leak_to_a_sibling_with_a_shared_prefix(self):

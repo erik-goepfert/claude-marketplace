@@ -51,8 +51,13 @@ in reference §Incident history.
   `$EMAIL_TRIAGE_DATA_DIR`. `--db`/`--maildir`/`--maildir-root`/
   `--data-dir`/`--mbsyncrc` are overrides — `threads.py list` and
   `session.py start` are complete commands as-is.
-- **mbsync needs `-c` spelled out** (never auto-discovered):
-  `mbsync -c ~/.config/isync/mbsyncrc '<boxes>'`.
+- **Syncs run through scripts, never `mbsync` by hand** (2026-08-10):
+  `$SES sync --scope priority|full` for the session's two stages, `$BATCH run`
+  for a batch's own push. Each builds the box list from `config.yaml` and runs
+  mbsync as argv, so no folder name is ever hand-quoted — `[Gmail]/Sent Mail`
+  carries a space *and* shell glob characters. Where mbsync is still typed by
+  hand (the flag/reply push under Acting), **`-c` must be spelled out** — it is
+  never auto-discovered: `mbsync -c ~/.config/isync/mbsyncrc '<acct>:<folders>'`.
 - **Every standard session step lives in a script, never ad-hoc shell**
   (user rule): `cat`/`mkdir`/`date`/`nohup` glue prompts. A new
   every-session step goes into a script — session.py owns lifecycle glue.
@@ -247,15 +252,22 @@ frontend rules stay a contiguous tail that can be stripped wholesale.
    category mix this month?" — use `$HIST query --sql "SELECT ..."`
    (read-only, enforced by SQLite; sample queries in reference §History
    queries).
-3. **Two-stage sync.** Stage 1 — priority sync, foreground (the live
-   working set + Sent + Drafts; Sent is required or `waiting` derivation
-   lies): pass each account's `mbsync_fast` value from `start`'s output
-   verbatim as ONE argument — `mbsync -c ~/.config/isync/mbsyncrc '<mbsync_fast>'`
-   (~60–90 s total). Never hand-assemble or hardcode folder names. **Run
-   Stage-1 invocations SEQUENTIALLY, one account at a time.**
-   Stage 2 — full sync, background: `$SES sync-background` (one mbsync
-   invocation per account with one automatic retry each — the ~25% flake
-   — marker touched only if ALL succeed; log `fullsync.log`).
+3. **Two-stage sync — one command each, and you never name a folder:**
+   ```sh
+   <scripts-dir>/session.py sync --scope priority     # Stage 1
+   <scripts-dir>/session.py sync --scope full         # Stage 2
+   ```
+   Box lists come from `config.yaml`; `--account <name>` narrows either
+   scope. **The scopes NEST** — `full` re-syncs everything `priority` did,
+   INBOX included, which is how mail arriving *during* Stage 1 reaches the
+   index at step 6. They are not two halves of a mailbox.
+   - **Stage 1 (`priority`)** — the live working set + Sent + Drafts (Sent is
+     required or `waiting` derivation lies). **Foreground**, every account in
+     turn, one retry each, ~60–90 s total. **Exit 1 means an account's mirror
+     still holds last session's state** — say so and rerun; anything
+     classified from it is stale. Check `all_ok`.
+   - **Stage 2 (`full`)** — every folder, **detached**; the marker is touched
+     only if ALL accounts succeed (log `fullsync.log`).
    Classification proceeds on Stage 1's data immediately; **acting gates
    on Stage 2** (step 6) — never rename files while mbsync may be walking
    the same folders.
