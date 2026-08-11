@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS events (
     to_folder          TEXT,
     decided_by         TEXT NOT NULL CHECK (decided_by IN
                          ('auto','approved','override','manual')),
-    rule_id            INTEGER,
+    rule_id            TEXT,     -- a rule SLUG since 2026-08-10, not a number
     notes              TEXT,
     unsubscribed       INTEGER NOT NULL DEFAULT 0  -- user-confirmed; clicking
                                                     -- itself is never observed (§4.4)
@@ -57,9 +57,16 @@ CREATE TABLE IF NOT EXISTS contacts (
     updated_at   TEXT
 );
 
+-- `id` is a caller-chosen kebab-case SLUG, not a number (2026-08-10). Numbers
+-- collided with the SKILL's own engine rules 1-6: "rule 4" read as either, and
+-- two rules had text citing an engine rule by bare number while sitting in this
+-- table under that same number. A slug cannot be misread that way.
+-- Slugs are also never auto-suffixed on collision: `add-rule` refuses, so two
+-- rules can never differ only by a trailing digit.
 CREATE TABLE IF NOT EXISTS rules (
-    id          INTEGER PRIMARY KEY,
+    id          TEXT PRIMARY KEY,
     created_at  TEXT NOT NULL,
+    updated_at  TEXT,
     active      INTEGER NOT NULL DEFAULT 1,
     predicate   TEXT NOT NULL,
     action      TEXT NOT NULL,
@@ -99,6 +106,16 @@ FROM events GROUP BY sender_addr;
 """
 
 
+def _column_type(conn: sqlite3.Connection, table: str, column: str):
+    """Declared type of one column, or None if the column is absent. The
+    migration guards key off this rather than a version number, so re-running
+    init on an already-migrated DB is a no-op."""
+    for row in conn.execute(f"PRAGMA table_info({table})"):
+        if row[1] == column:
+            return (row[2] or "").upper()
+    return None
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Additive migrations for DBs created before a schema change.
 
@@ -121,6 +138,45 @@ def migrate(conn: sqlite3.Connection) -> None:
     rule_cols = {row[1] for row in conn.execute("PRAGMA table_info(rules)")}
     if "updated_at" not in rule_cols:
         conn.execute("ALTER TABLE rules ADD COLUMN updated_at TEXT")
+
+    # 2026-08-10: integer rule ids -> slugs. The FIRST non-additive migration
+    # here, so it is written to be re-runnable and to touch as little as
+    # possible. Note what it does NOT do: it does not invent semantic slugs.
+    # A shipped migration cannot know that id 4 means "political-campaigning",
+    # and guessing per-id would corrupt any other install whose numbering
+    # differs. Every rule becomes `rule-<n>`; renaming to something meaningful
+    # is a data operation (`update-rule <id> --new-id <slug>`), by whoever
+    # knows what the rule means.
+    if _column_type(conn, "rules", "id") == "INTEGER":
+        # events.rule_id INTEGER -> TEXT. Add/copy/drop/rename rather than
+        # rebuilding the table: `events` is the irreplaceable one, and not
+        # copying 300+ audit rows is worth a changed column ORDER (nothing
+        # reads events positionally; every query names its columns).
+        conn.execute("ALTER TABLE events ADD COLUMN rule_id_slug TEXT")
+        conn.execute("UPDATE events SET rule_id_slug = 'rule-' || rule_id "
+                     "WHERE rule_id IS NOT NULL")
+        conn.execute("ALTER TABLE events DROP COLUMN rule_id")
+        conn.execute("ALTER TABLE events RENAME COLUMN rule_id_slug TO rule_id")
+
+        # rules must be rebuilt -- a PRIMARY KEY's type cannot be ALTERed.
+        # Four rows in practice.
+        conn.execute("""
+            CREATE TABLE rules_slugged (
+                id          TEXT PRIMARY KEY,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT,
+                active      INTEGER NOT NULL DEFAULT 1,
+                predicate   TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                origin      TEXT NOT NULL CHECK (origin IN ('user','claude-proposed'))
+            )""")
+        conn.execute("""
+            INSERT INTO rules_slugged (id, created_at, updated_at, active,
+                                       predicate, action, origin)
+            SELECT 'rule-' || id, created_at, updated_at, active, predicate,
+                   action, origin FROM rules""")
+        conn.execute("DROP TABLE rules")
+        conn.execute("ALTER TABLE rules_slugged RENAME TO rules")
 
     # 2026-08-06 vocabulary migration: 'skip' -> 'hold' in both action
     # columns. Value rename only -- no rows added, removed, or otherwise

@@ -795,21 +795,32 @@ per-sender disposition ("always surface these immediately," "summarize
 then toss," "scan and trash"), promote it **the moment it's stated**:
 - who-someone-is facts → `$HIST add-contact <addr> [--relation "plumber"]
   [--vip 1] [--notes "..."]` (upsert; asserted facts only);
-- repeatable dispositions → `$HIST add-rule --predicate "sender = ..."
-  --action <x> --origin user` — actions may be interaction patterns
+- repeatable dispositions → `$HIST add-rule --id <slug> --predicate "sender =
+  ..." --action <x> --origin user` — actions may be interaction patterns
   (`summarize-then-trash`, `scan-then-trash`, `surface-immediately`), not
   just the event enum. Claude-proposed rules (cite `candidates`
   analytics) use `--origin claude-proposed`, added only after approval;
+- **`--id` is a kebab-case slug you choose** (`credit-karma`,
+  `political-campaigning`), never a number — numbers collided with these engine
+  rules, so "rule 4" read as either one and two rules ended up citing an engine
+  rule by bare number while sitting under that number themselves. **Refer to DB
+  rules by slug and engine rules by number** and the ambiguity is gone.
+  A taken slug is **refused, never auto-suffixed** — retry with a different
+  name. The error distinguishes "identical, you meant `update-rule`" from
+  "differs, pick another name," and a slug still cited by events cannot be
+  reused at all, since re-pointing old decisions at a new rule reads correct
+  forever and isn't;
 - read them with `$HIST list-rules` — **all** of them including retired ones,
   where `context` shows only active ones, plus `cited_by` per rule;
 - **retire vs edit vs delete, and the distinction is the point:**
   `set-rule <id> --active 0` (or `update-rule --active 0`) **retires** — the
   rule governed real decisions and its row must survive for them to point at.
-  `update-rule <id> [--predicate|--action|--origin]` **rewrites** in place and
-  stamps `updated_at`. `delete-rule <id>` is for a rule written *wrong* — one
-  that never governed anything. Both mutating verbs refuse a rule that events
-  cite unless `--force`, because `events.rule_id` is a claim about the basis a
-  decision was made on.
+  `update-rule <id> [--predicate|--action|--origin|--new-id]` **rewrites** in
+  place and stamps `updated_at`. `delete-rule <id>` is for a rule written
+  *wrong* — one that never governed anything. Both mutating verbs refuse a rule
+  that events cite unless `--force`, because `events.rule_id` is a claim about
+  the basis a decision was made on. Renaming counts as a rewrite: it orphans
+  every citation of the old slug.
 
 **Don't restate the approval gate inside a rule** (2026-08-10). Rule 1 already
 makes every rule a proposal, so "propose then confirm" adds nothing — and

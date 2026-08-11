@@ -26,6 +26,7 @@ import datetime
 import shutil
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -226,19 +227,77 @@ def cmd_set_unsubscribed(conn: sqlite3.Connection, args: argparse.Namespace) -> 
         indent=2, sort_keys=True))
 
 
+# A rule id is a caller-chosen slug (2026-08-10). Numbers collided with the
+# SKILL's own engine rules 1-6 -- "rule 4" read as either one, and two rules
+# ended up citing an engine rule by bare number while themselves sitting under
+# that number.
+SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+SLUG_LEN = (3, 32)
+
+
+def _valid_slug_or_exit(slug: str) -> str:
+    lo, hi = SLUG_LEN
+    if not SLUG_RE.match(slug) or not (lo <= len(slug) <= hi):
+        sys.exit(f"error: rule id must be kebab-case (lowercase, digits, "
+                 f"single hyphens) and {lo}-{hi} characters: {slug!r}")
+    return slug
+
+
+def _refuse_if_slug_taken(conn: sqlite3.Connection, slug: str,
+                          predicate=None, action=None) -> None:
+    """A slug collision is information, so the two cases get different errors.
+
+    Identical text means the caller is re-adding what already exists and should
+    update instead. Different text means two distinct rules want one name, and
+    the fix is a different name -- never an auto-suffix, because
+    `receipt-filing` beside `receipt-filing-2` is the "which of these is live?"
+    problem the slugs were meant to end."""
+    row = conn.execute("SELECT * FROM rules WHERE id = ?", (slug,)).fetchone()
+    if row is not None:
+        state = "active" if row["active"] else "retired"
+        if predicate == row["predicate"] and action == row["action"]:
+            sys.exit(f"error: rule {slug!r} already exists with an IDENTICAL "
+                     f"predicate and action (created {row['created_at']}, "
+                     f"{state}). Nothing to add — did you mean "
+                     f"`update-rule {slug}`?")
+        sys.exit(
+            f"error: rule {slug!r} already exists ({state}) and DIFFERS from "
+            f"what you passed. Retry with a different id, or update that rule.\n"
+            f"  existing predicate: {row['predicate'][:100]}\n"
+            f"  existing action:    {row['action'][:100]}")
+
+    # Free slug, but a decision still points at it: reusing it would re-point
+    # those events at a different rule. An orphaned reference is honest; a
+    # re-bound one reads correct forever and is not.
+    cited = _citing_events(conn, slug)
+    if cited:
+        sys.exit(f"error: slug {slug!r} is still cited by {cited} event(s) "
+                 f"whose rule is gone. Reusing it would silently re-point "
+                 f"those decisions at a different rule. Retry with a "
+                 f"different id.")
+
+
 def cmd_add_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
-    """Rules are history turned into behavior (§9). Since 5.5 the action
+    """Rules are history turned into behavior. Since 5.5 the action
     vocabulary is wider than the event enum: alongside plain actions
     ('trash') an action may name an INTERACTION PATTERN — how to handle the
     matching mail, e.g. 'summarize-then-trash', 'scan-then-trash',
     'surface-immediately'. Free text by design; the enum lives on events,
-    not rules."""
-    cur = conn.execute(
-        "INSERT INTO rules (created_at, active, predicate, action, origin) VALUES (?, 1, ?, ?, ?)",
-        (utc_now(), args.predicate, args.action, args.origin),
+    not rules.
+
+    `--id` is required and never derived from the predicate: predicates here are
+    long prose ("filing a kept transactional or home-related message: receipt,
+    statement, ..."), so derivation would mint `filing-a-kept-transactional` and
+    that would stick forever."""
+    slug = _valid_slug_or_exit(args.id)
+    _refuse_if_slug_taken(conn, slug, args.predicate, args.action)
+    conn.execute(
+        "INSERT INTO rules (id, created_at, active, predicate, action, origin) "
+        "VALUES (?, ?, 1, ?, ?, ?)",
+        (slug, utc_now(), args.predicate, args.action, args.origin),
     )
     conn.commit()
-    print(f"rule {cur.lastrowid} added")
+    print(f"rule {slug} added")
 
 
 def cmd_set_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -280,13 +339,13 @@ def cmd_list_rules(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     print()
 
 
-def _citing_events(conn: sqlite3.Connection, rule_id: int) -> int:
+def _citing_events(conn: sqlite3.Connection, rule_id: str) -> int:
     (n,) = conn.execute("SELECT COUNT(*) FROM events WHERE rule_id = ?",
                         (rule_id,)).fetchone()
     return n
 
 
-def _rule_or_exit(conn: sqlite3.Connection, rule_id: int) -> sqlite3.Row:
+def _rule_or_exit(conn: sqlite3.Connection, rule_id: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
     if row is None:
         sys.exit(f"error: no rule with id {rule_id}")
@@ -306,6 +365,14 @@ CITED_HINT = ("{n} event(s) cite rule {id}: {what} would change the recorded "
 def cmd_update_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     _rule_or_exit(conn, args.rule_id)
     sets, params, changed = [], [], []
+    if args.new_id is not None:
+        # Renaming is a rewrite of identity: events citing the old slug become
+        # orphans, so it is gated exactly like editing the text.
+        new_slug = _valid_slug_or_exit(args.new_id)
+        _refuse_if_slug_taken(conn, new_slug)
+        sets.append("id = ?")
+        params.append(new_slug)
+        changed.append("id")
     for col, val in (("predicate", args.predicate), ("action", args.action),
                      ("origin", args.origin)):
         if val is not None:
@@ -335,7 +402,9 @@ def cmd_update_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     conn.execute(f"UPDATE rules SET {', '.join(sets)} WHERE id = ?",
                  (*params, args.rule_id))
     conn.commit()
-    print(f"rule {args.rule_id} updated: {', '.join(changed)}")
+    now = args.new_id or args.rule_id
+    renamed = f" (now {now})" if args.new_id else ""
+    print(f"rule {args.rule_id} updated: {', '.join(changed)}{renamed}")
 
 
 def cmd_delete_rule(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -623,7 +692,9 @@ def main() -> None:
     ev.add_argument("--from-folder")
     ev.add_argument("--to-folder")
     ev.add_argument("--decided-by", required=True, choices=DECIDED_BY)
-    ev.add_argument("--rule-id", type=int)
+    ev.add_argument("--rule-id",
+                    help="slug of the rule that justified this decision; "
+                         "without it the rule cannot be measured")
     ev.add_argument("--notes")
     ev.add_argument(
         "--unsubscribed",
@@ -652,6 +723,10 @@ def main() -> None:
         "add-rule",
         help="add an active rule (action may be a plain action OR an "
              "interaction pattern like 'summarize-then-trash')")
+    ar.add_argument("--id", required=True,
+                    help="kebab-case slug naming the rule, 3-32 chars, e.g. "
+                         "'credit-karma' or 'receipt-filing'. Refused if taken "
+                         "(never auto-suffixed) — retry with another")
     ar.add_argument("--predicate", required=True,
                     help="e.g. \"sender = ship-confirm@amazon.com\"")
     ar.add_argument("--action", required=True,
@@ -661,7 +736,7 @@ def main() -> None:
     ar.set_defaults(func=cmd_add_rule)
 
     sr = sub.add_parser("set-rule", help="activate/deactivate a rule")
-    sr.add_argument("rule_id", type=int)
+    sr.add_argument("rule_id")
     sr.add_argument("--active", required=True, type=int, choices=(0, 1))
     sr.set_defaults(func=cmd_set_rule)
 
@@ -675,7 +750,10 @@ def main() -> None:
     ur = sub.add_parser("update-rule",
                         help="edit a rule in place; refuses to rewrite one that "
                              "events cite unless --force")
-    ur.add_argument("rule_id", type=int)
+    ur.add_argument("rule_id")
+    ur.add_argument("--new-id", dest="new_id",
+                    help="rename the rule; gated like a text edit, since events "
+                         "citing the old slug become orphans")
     ur.add_argument("--predicate")
     ur.add_argument("--action")
     ur.add_argument("--origin", choices=("user", "claude-proposed"))
@@ -687,7 +765,7 @@ def main() -> None:
     dr = sub.add_parser("delete-rule",
                         help="delete a rule written by mistake; to end one that "
                              "governed real decisions, retire it instead")
-    dr.add_argument("rule_id", type=int)
+    dr.add_argument("rule_id")
     dr.add_argument("--force", action="store_true",
                     help="delete even though events cite this rule")
     dr.set_defaults(func=cmd_delete_rule)

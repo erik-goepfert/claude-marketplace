@@ -506,12 +506,30 @@ listed in `_trust.untrusted_fields`. Anchor `text` is prose and *is* escaped.
 
 The spine carries the common `log-event` call; these are the rest.
 
-**Rules — full CRUD since 2026-08-10.** `add-rule`, `list-rules
+**Rules — full CRUD since 2026-08-10.** `add-rule --id <slug>`, `list-rules
 [--filter all|active|inactive]`, `update-rule <id> [--predicate] [--action]
-[--origin] [--active]`, `delete-rule <id>`, `set-rule <id> --active 0|1`.
-`list-rules` returns every column plus `cited_by`, and defaults to **all**
-rules — `context` shows only active ones, which until now left no way to see a
-retired rule at all.
+[--origin] [--active] [--new-id]`, `delete-rule <id>`, `set-rule <id>
+--active 0|1`. `list-rules` returns every column plus `cited_by`, and defaults
+to **all** rules — `context` shows only active ones, which until now left no way
+to see a retired rule at all.
+
+**Ids are kebab-case slugs, not numbers** (`credit-karma`,
+`waking-up-digests`, `political-campaigning`, `receipt-filing`). Numbers shared
+a namespace with the SKILL's engine rules 1–6: "rule 4" read as either, and two
+rules cited an engine rule by bare number while themselves sitting under that
+number. Convention now: **DB rules by slug, engine rules by number.**
+`--id` is required and never derived — predicates here are long prose, so
+derivation would mint `filing-a-kept-transactional` and it would stick.
+Validation is `^[a-z0-9]+(-[a-z0-9]+)*$`, 3–32 chars.
+
+**A taken slug is refused, never auto-suffixed**, and the error splits on the
+useful distinction: *identical* predicate+action means you meant `update-rule`;
+*differing* means two rules want one name, so pick another (it prints the
+existing text to compare). `receipt-filing` beside `receipt-filing-2` would
+recreate the "which of these is live?" problem the slugs exist to end.
+**A slug still cited by events cannot be reused even after its rule is gone** —
+that check is what a date qualifier in the id would otherwise have done. An
+orphaned citation is honest; a re-bound one reads correct forever and is not.
 
 The table was append-plus-a-visibility-bit before this, so a badly worded rule
 could only be retired and rewritten, leaving a dead row forever (rule 5 is one,

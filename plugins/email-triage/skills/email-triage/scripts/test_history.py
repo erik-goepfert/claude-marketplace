@@ -37,19 +37,20 @@ class HistoryCliTests(unittest.TestCase):
         return json.loads(self.hist("context"))
 
     def test_add_rule_interaction_pattern_and_deactivate(self):
-        out = self.hist("add-rule",
+        out = self.hist("add-rule", "--id", "updates-digest",
                         "--predicate", "sender = updates@example.com",
                         "--action", "summarize-then-trash",
                         "--origin", "user")
-        self.assertIn("rule 1 added", out)
+        self.assertIn("rule updates-digest added", out)
         rules = self.context()["active_rules"]
         self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["id"], "updates-digest")
         self.assertEqual(rules[0]["action"], "summarize-then-trash")
         self.assertEqual(rules[0]["origin"], "user")
 
-        self.hist("set-rule", "1", "--active", "0")
+        self.hist("set-rule", "updates-digest", "--active", "0")
         self.assertEqual(self.context()["active_rules"], [])
-        self.hist("set-rule", "1", "--active", "1")
+        self.hist("set-rule", "updates-digest", "--active", "1")
         self.assertEqual(len(self.context()["active_rules"]), 1)
 
     # -- rule CRUD (2026-08-10) --------------------------------------------
@@ -68,44 +69,45 @@ class HistoryCliTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
         return proc.stderr
 
-    def a_rule(self, predicate="sender = a@example.com", action="trash"):
-        self.hist("add-rule", "--predicate", predicate, "--action", action,
-                  "--origin", "user")
+    def a_rule(self, slug="my-rule", predicate="sender = a@example.com",
+               action="trash"):
+        self.hist("add-rule", "--id", slug, "--predicate", predicate,
+                  "--action", action, "--origin", "user")
 
     def rules(self, *args):
         return json.loads(self.hist("list-rules", *args))
 
-    def cite_rule(self, rule_id):
-        """An event whose decision claims rule `rule_id` as its basis."""
+    def cite_rule(self, slug):
+        """An event whose decision claims rule `slug` as its basis."""
         self.hist("log-event", "--session", "2026-08-10T00:00:00Z",
                   "--sender", "a@example.com", "--category", "newsletter",
                   "--proposed", "trash", "--final", "trash",
-                  "--decided-by", "approved", "--rule-id", str(rule_id))
+                  "--decided-by", "approved", "--rule-id", slug)
 
     def test_list_rules_shows_retired_ones_which_context_hides(self):
-        self.a_rule(action="keep-me")
-        self.a_rule(action="retire-me")
-        self.hist("set-rule", "2", "--active", "0")
-        self.assertEqual([r["action"] for r in self.context()["active_rules"]],
-                         ["keep-me"])
-        self.assertEqual([r["action"] for r in self.rules()["rules"]],
-                         ["keep-me", "retire-me"])
+        self.a_rule(slug="keep-this")
+        self.a_rule(slug="retire-this")
+        self.hist("set-rule", "retire-this", "--active", "0")
+        self.assertEqual([r["id"] for r in self.context()["active_rules"]],
+                         ["keep-this"])
+        self.assertEqual([r["id"] for r in self.rules()["rules"]],
+                         ["keep-this", "retire-this"])
         self.assertEqual(self.rules("--filter", "active")["count"], 1)
-        self.assertEqual([r["action"] for r in
+        self.assertEqual([r["id"] for r in
                           self.rules("--filter", "inactive")["rules"]],
-                         ["retire-me"])
+                         ["retire-this"])
 
     def test_list_rules_reports_citation_counts(self):
         self.a_rule()
         self.assertEqual(self.rules()["rules"][0]["cited_by"], 0)
-        self.cite_rule(1)
-        self.cite_rule(1)
+        self.cite_rule("my-rule")
+        self.cite_rule("my-rule")
         self.assertEqual(self.rules()["rules"][0]["cited_by"], 2)
 
     def test_update_rewrites_text_and_stamps_updated_at(self):
         self.a_rule()
         self.assertIsNone(self.rules()["rules"][0]["updated_at"])
-        self.hist("update-rule", "1", "--action", "summarize-then-trash")
+        self.hist("update-rule", "my-rule", "--action", "summarize-then-trash")
         row = self.rules()["rules"][0]
         self.assertEqual(row["action"], "summarize-then-trash")
         self.assertEqual(row["predicate"], "sender = a@example.com")  # untouched
@@ -113,63 +115,141 @@ class HistoryCliTests(unittest.TestCase):
 
     def test_update_with_no_fields_is_an_error(self):
         self.a_rule()
-        self.assertIn("nothing to update", self.hist_fail("update-rule", "1"))
+        self.assertIn("nothing to update",
+                      self.hist_fail("update-rule", "my-rule"))
 
     def test_toggling_active_is_not_a_rewrite(self):
         """Retirement changes what is in force from now on and leaves the
         recorded basis intact, so it is never gated and stamps no updated_at."""
         self.a_rule()
-        self.cite_rule(1)
-        self.hist("update-rule", "1", "--active", "0")
+        self.cite_rule("my-rule")
+        self.hist("update-rule", "my-rule", "--active", "0")
         row = self.rules()["rules"][0]
         self.assertEqual(row["active"], 0)
         self.assertIsNone(row["updated_at"])
 
     def test_rewriting_a_cited_rule_is_refused_then_allowed_with_force(self):
         self.a_rule()
-        self.cite_rule(1)
-        err = self.hist_fail("update-rule", "1", "--action", "rewritten")
-        self.assertIn("1 event(s) cite rule 1", err)
+        self.cite_rule("my-rule")
+        err = self.hist_fail("update-rule", "my-rule", "--action", "rewritten")
+        self.assertIn("1 event(s) cite rule my-rule", err)
         self.assertIn("--force", err)
-        self.assertIn("set-rule 1 --active 0", err)     # the lossless route
+        self.assertIn("set-rule my-rule --active 0", err)   # the lossless route
         self.assertEqual(self.rules()["rules"][0]["action"], "trash")
 
-        self.hist("update-rule", "1", "--action", "rewritten", "--force")
+        self.hist("update-rule", "my-rule", "--action", "rewritten", "--force")
         self.assertEqual(self.rules()["rules"][0]["action"], "rewritten")
 
     def test_delete_removes_an_uncited_rule(self):
         self.a_rule()
-        self.assertIn("rule 1 deleted", self.hist("delete-rule", "1"))
+        self.assertIn("rule my-rule deleted", self.hist("delete-rule", "my-rule"))
         self.assertEqual(self.rules()["count"], 0)
 
     def test_deleting_a_cited_rule_is_refused_then_allowed_with_force(self):
         self.a_rule()
-        self.cite_rule(1)
-        err = self.hist_fail("delete-rule", "1")
-        self.assertIn("1 event(s) cite rule 1", err)
+        self.cite_rule("my-rule")
+        err = self.hist_fail("delete-rule", "my-rule")
+        self.assertIn("1 event(s) cite rule my-rule", err)
         self.assertEqual(self.rules()["count"], 1)      # nothing removed
 
-        out = self.hist("delete-rule", "1", "--force")
+        out = self.hist("delete-rule", "my-rule", "--force")
         self.assertIn("forced", out)
         self.assertEqual(self.rules()["count"], 0)
 
     def test_missing_id_errors_on_every_rule_verb(self):
-        for argv in (("update-rule", "99", "--action", "x"),
-                     ("delete-rule", "99")):
+        for argv in (("update-rule", "nope", "--action", "x"),
+                     ("delete-rule", "nope")):
             with self.subTest(argv=argv):
-                self.assertIn("no rule with id 99", self.hist_fail(*argv))
+                self.assertIn("no rule with id nope", self.hist_fail(*argv))
 
     def test_rule_prose_is_escaped_and_declared_in_list_rules(self):
         """predicate/action are free text a model may have drafted, so they are
-        untrusted for the same reason event notes are."""
+        untrusted for the same reason event notes are. `id` is OURS -- a
+        validated slug, never sender-derived -- so it stays trusted."""
         self.a_rule(predicate="subject has <b>sale</b>", action="trash & file")
         out = self.rules()
         declared = set(out["_trust"]["untrusted_fields"])
         self.assertIn("rules.predicate", declared)
         self.assertIn("rules.action", declared)
         self.assertIn("&lt;b&gt;", out["rules"][0]["predicate"])
+        self.assertNotIn("rules.id", declared)
         self.assertNotIn("count", declared)
         self.assertNotIn("rules.cited_by", declared)
+
+    # -- slug ids (2026-08-10) ---------------------------------------------
+    #
+    # Numbers collided with the SKILL's own engine rules 1-6: "rule 4" read as
+    # either, and two rules ended up citing an engine rule by bare number while
+    # themselves sitting under that number.
+
+    def test_slug_format_is_enforced(self):
+        # `--id=X` rather than `--id X` so a leading-dash value reaches the
+        # validator: argparse would otherwise reject it as a missing argument,
+        # which tests argparse and not us.
+        for bad in ("Receipt-Filing", "receipt_filing", "receipt--filing",
+                    "-receipt", "receipt-", "ab", "x" * 33, "receipt filing",
+                    "réçu"):
+            with self.subTest(slug=bad):
+                self.assertIn("kebab-case", self.hist_fail(
+                    "add-rule", f"--id={bad}", "--predicate", "p",
+                    "--action", "a", "--origin", "user"))
+        self.assertEqual(self.rules()["count"], 0)
+
+    def test_identical_duplicate_says_so_and_points_at_update(self):
+        """A collision is information: same text means the caller is re-adding
+        what exists, and the fix is `update-rule`, not a new name."""
+        self.a_rule()
+        err = self.hist_fail("add-rule", "--id", "my-rule",
+                             "--predicate", "sender = a@example.com",
+                             "--action", "trash", "--origin", "user")
+        self.assertIn("IDENTICAL", err)
+        self.assertIn("update-rule my-rule", err)
+
+    def test_differing_duplicate_shows_the_existing_text_to_compare(self):
+        self.a_rule()
+        err = self.hist_fail("add-rule", "--id", "my-rule",
+                             "--predicate", "something else entirely",
+                             "--action", "hold", "--origin", "user")
+        self.assertIn("DIFFERS", err)
+        self.assertIn("sender = a@example.com", err)     # the existing predicate
+        self.assertIn("different id", err)
+        # Never auto-suffixed: one rule, unchanged.
+        self.assertEqual(self.rules()["count"], 1)
+        self.assertEqual(self.rules()["rules"][0]["action"], "trash")
+
+    def test_a_slug_still_cited_by_events_cannot_be_reused(self):
+        """This is what replaces a date qualifier in the id. An orphaned
+        reference is honest; a re-bound one reads correct forever and is not."""
+        self.a_rule()
+        self.cite_rule("my-rule")
+        self.hist("delete-rule", "my-rule", "--force")
+        self.assertEqual(self.rules()["count"], 0)
+
+        err = self.hist_fail("add-rule", "--id", "my-rule", "--predicate", "p",
+                             "--action", "a", "--origin", "user")
+        self.assertIn("still cited by 1 event(s)", err)
+        self.assertIn("re-point", err)
+        self.assertEqual(self.rules()["count"], 0)
+
+    def test_rename_moves_the_slug_and_is_gated_like_a_rewrite(self):
+        self.a_rule()
+        self.hist("update-rule", "my-rule", "--new-id", "better-name")
+        row = self.rules()["rules"][0]
+        self.assertEqual(row["id"], "better-name")
+        self.assertRegex(row["updated_at"], r"^\d{4}-\d{2}-\d{2}T")
+
+        self.cite_rule("better-name")
+        err = self.hist_fail("update-rule", "better-name", "--new-id", "third")
+        self.assertIn("1 event(s) cite rule better-name", err)
+        self.assertEqual(self.rules()["rules"][0]["id"], "better-name")
+
+    def test_rename_onto_a_taken_slug_is_refused(self):
+        self.a_rule(slug="first")
+        self.a_rule(slug="second")
+        err = self.hist_fail("update-rule", "first", "--new-id", "second")
+        self.assertIn("already exists", err)
+        self.assertEqual([r["id"] for r in self.rules()["rules"]],
+                         ["first", "second"])
 
     def test_set_rule_missing_id_errors(self):
         proc = subprocess.run(
@@ -593,7 +673,8 @@ class ContextTrustTests(TrustedColumnsTestsFixture):
     def seed(self):
         self.hist("log-note", "--session", "2026-08-06T00:00:00Z",
                   "note with <b>markup</b> & an ampersand")
-        self.hist("add-rule", "--predicate", "sender ends-with <evil>.com",
+        self.hist("add-rule", "--id", "evil-senders",
+                  "--predicate", "sender ends-with <evil>.com",
                   "--action", "trash", "--origin", "user")
         self.hist("add-contact", "pete@x.example",
                   "--display-name", "<script>Pete</script>",
