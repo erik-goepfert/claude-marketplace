@@ -246,22 +246,33 @@ def record_optout(conn: sqlite3.Connection, sender: str,
                   args: argparse.Namespace) -> tuple:
     """Insert one sender_optouts row and return (id, sender).
 
-    Idempotent per (sender, session, kind): re-running `set-unsubscribed` after
-    a second batch amends more events without minting a duplicate act. The act
-    happened once even if it authorized trashings at two different times."""
+    Idempotent per (sender, session, kind) EXCEPT when the scope differs, which
+    means a different act. Medium proved that within an hour of this table
+    existing: `allow_product_emails` and `allow_social_emails` were opted out of
+    minutes apart, same sender, same session, two genuinely separate
+    preferences. Collapsing them would have recorded one act and lost which
+    categories were actually turned off.
+
+    A call with NO scope still reuses the newest row -- that is the "amend a
+    second batch of events" case, not a new act."""
     existing = conn.execute(
-        "SELECT id FROM sender_optouts WHERE sender_addr = ? "
-        "AND session_started_at IS ? AND kind = ?",
-        (sender, args.session, args.kind)).fetchone()
-    if existing is not None:
+        "SELECT id, scope FROM sender_optouts WHERE sender_addr = ? "
+        "AND session_started_at IS ? AND kind = ? ORDER BY id DESC",
+        (sender, args.session, args.kind)).fetchall()
+    if args.scope is None:
+        reusable = existing[0] if existing else None
+    else:
+        reusable = next((r for r in existing
+                         if r["scope"] is None or r["scope"] == args.scope), None)
+    if reusable is not None:
         # Fill in scope/mechanism if this call supplies what the first omitted.
         for col, val in (("scope", args.scope), ("mechanism", args.mechanism),
                          ("notes", args.notes)):
             if val is not None:
                 conn.execute(
                     f"UPDATE sender_optouts SET {col} = ? "
-                    f"WHERE id = ? AND {col} IS NULL", (val, existing["id"]))
-        return existing["id"], sender
+                    f"WHERE id = ? AND {col} IS NULL", (val, reusable["id"]))
+        return reusable["id"], sender
     cur = conn.execute(
         """INSERT INTO sender_optouts (sender_addr, occurred_at,
                session_started_at, kind, mechanism, scope, confirmed, notes)

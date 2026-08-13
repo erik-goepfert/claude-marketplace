@@ -469,6 +469,34 @@ class SenderOptoutTests(unittest.TestCase):
         # A later call supplies what the first omitted rather than duplicating.
         self.assertEqual(out["optouts"][0]["scope"], "filled in on the second pass")
 
+    def test_two_categories_from_one_sender_in_one_session_are_two_acts(self):
+        """Medium, within an hour of this table existing: allow_product_emails
+        and allow_social_emails opted out minutes apart, same sender, same
+        session. Keying idempotency on (sender, session, kind) alone collapsed
+        them and lost which categories were actually turned off."""
+        self.log("S1", "noreply@medium.example", "2026-08-13T15:00:00Z")
+        self.hist("set-unsubscribed", "--session", "S1",
+                  "--senders", "noreply@medium.example",
+                  "--scope", "product emails only")
+        self.log("S1", "noreply@medium.example", "2026-08-13T15:30:00Z")
+        self.hist("set-unsubscribed", "--session", "S1",
+                  "--senders", "noreply@medium.example",
+                  "--scope", "daily digest as well")
+        out = self.optouts()
+        self.assertEqual(out["count"], 2)
+        self.assertEqual({r["scope"] for r in out["optouts"]},
+                         {"product emails only", "daily digest as well"})
+
+    def test_an_unscoped_amend_still_reuses_rather_than_duplicating(self):
+        """The distinction is SCOPE, not call count: amending a second batch of
+        events without saying anything new is the same act."""
+        self.log("S1", "a@x.com", "2026-08-13T01:00:00Z")
+        self.hist("set-unsubscribed", "--session", "S1", "--senders", "a@x.com",
+                  "--scope", "everything")
+        self.log("S1", "a@x.com", "2026-08-13T02:00:00Z")
+        self.hist("set-unsubscribed", "--session", "S1", "--senders", "a@x.com")
+        self.assertEqual(self.optouts()["count"], 1)
+
     def test_two_attempts_in_different_sessions_are_two_acts(self):
         """BHCCU: opted out 2026-07-03, mailed again, opted out again 07-18.
         "Did the second attempt stick?" is the question this table answers, and
