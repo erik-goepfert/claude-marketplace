@@ -1879,6 +1879,38 @@ label folder, flag each copy independently, and assert which one `latest`,
 `resolve_message_row` and `flag_changed` each pick. `TIER_RANK` missing `allmail`
 is the first thing to check.
 
+**NEW EVIDENCE (2026-08-12) — the reverse symptom, and it is not an undercount.**
+A live session produced **ten** `flag_changed` entries reporting `["Seen"] → []`
+on gmail messages this session had just trashed, arriving in dribs across four
+consecutive `$BATCH run` change reports: 7 Starbucks, 1 Shake Shack, 1 Hyatt
+survey, all sitting in `[Gmail]/Trash`. Nothing local touched them after the
+move, and `$BATCH` marks `\Seen` as part of trashing, so the flag was being
+*removed server-side after the push*.
+
+That reframes the item. The 2026-08-07 case was a gmail flag write producing NO
+report entry; this is a gmail flag write producing entries *later*, spontaneously,
+with the flag inverted. Both are consistent with the duplicate-copy hypothesis:
+if `$THR flag`/`$BATCH` set `\Seen` on the label copy while Gmail's own
+Trash/All-Mail state differs, mbsync will eventually reconcile the two and the
+index sees a flag change nobody made. **Whether Gmail deliberately clears `\Seen`
+on trashed mail, or we are writing the flag to the copy that loses the
+reconciliation, is the question to answer** — and it decides whether this is
+cosmetic report noise or a real write-path bug.
+
+Cheap next step, no fixture needed: after the next trash batch, compare
+`\Seen` on both the `[Gmail]/Trash` and `[Gmail]/All Mail` rows for the same
+message-id across two consecutive indexes.
+
+**SEPARATE, and simpler: `$THR flag` writes no event, so every flag op
+resurfaces once as external.** Self-echo absorption matches
+`(account, message_id)` against events logged *this session*; `$THR flag` logs
+nothing, so its own change is reported back as if a user made it. Observed twice
+on 2026-08-12 (a `--unblock` on Pete's thread, a `--seen` on the MyChart notice),
+both times landing in `needs_confirmation` where a human had to decline them.
+It fails safe — it asks rather than asserting `decided_by=manual` — but it asks
+about work we just did. Either `$THR flag` should log its own event, or absorption
+should key on thread rather than message-id.
+
 **Exit status (2026-08-06): 4 of 5 met; criterion 4 needs a live session.**
 1. ✅ **Met.** 315 tests across 9 suites, up from 110. The structural test is
    `assert_manifest_is_complete` and its per-module equivalents: they subtract
