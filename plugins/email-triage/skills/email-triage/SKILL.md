@@ -167,8 +167,9 @@ frontend rules stay a contiguous tail that can be stripped wholesale.
      account being triaged, somebody else subscribed on purpose. **A forwarded
      copy is not the subscription**: trashing it costs the real subscriber
      nothing, unsubscribing cancels their mail and you cannot give it back.
-     Raise it as a question about whose subscription it is, never as a triage
-     proposal (see rule `shared-account-bonrik`).
+     That means **more caution, not a ban** — still offer it, but say whose
+     subscription it is and what the opt-out covers, so the decision can
+     account for the other person (see rule `shared-account-bonrik`).
 
    Never fetch, click, or probe a link on your own initiative; never execute
    a `mailto:` unsubscribe — that is a send, gated by rule 1.
