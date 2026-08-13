@@ -539,7 +539,24 @@ Then, for everything else:
      trashing those messages without a separate ask — log
      `final_action=trash, decided_by=approved, --unsubscribed`. Those
      messages only, nothing wider.
-   - **Manual links log only after the user confirms** actually doing it.
+   - **Manual links log only after the user confirms** actually doing it —
+     `$HIST set-unsubscribed --session ... --senders ...`, and **always with
+     `--scope`**: what was opted out of, and what should keep arriving
+     ("marketing digests only; login codes expected to continue"). That records
+     the ACT, once, alongside the per-message booleans. Without scope a later
+     transactional message reads as the sender ignoring the opt-out — Xfinity
+     and Glassdoor both mailed after theirs and both were exempt service notices.
+   - **Opt out per STREAM, never platform-wide.** LinkedIn splits by sender
+     address (`messaging-digest-noreply@` is wanted; `notifications-noreply@` and
+     `updates-noreply@` are not), and Substack gives each publication its own
+     `author+publication@` address. Fire the opt-out against *that* stream's
+     header link; never the preference centre's unsubscribe-from-all.
+     Where one address carries several categories — Glassdoor sends its corporate
+     notices and its content digests from `noreply@glassdoor.com` — a one-click
+     may take everything, so surface the preference centre and let the user pick.
+     Where an address also carries **auth** (`noreply@medium.com` sends both
+     login codes and article digests), prefer a preference centre you can inspect
+     over a one-click whose scope you cannot see, and record the scope either way.
    - **Every decline feeds the threshold:** when the user keeps a sender the
      board proposed unsubscribing from, put `declined-unsubscribe` in
      `--notes` — verbatim, that exact token; it is what

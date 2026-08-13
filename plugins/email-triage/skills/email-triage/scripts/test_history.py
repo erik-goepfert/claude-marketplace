@@ -384,6 +384,182 @@ class HistoryCliTests(unittest.TestCase):
         self.assertEqual(c["notes"], "prefers calls")
 
 
+class SenderOptoutTests(unittest.TestCase):
+    """sender_optouts + event_optouts (2026-08-13).
+
+    An opt-out is a fact about a SENDER RELATIONSHIP and happens once;
+    `events.unsubscribed` is a fact about a MESSAGE and is correctly true on all
+    16 rows of a batch. Both are real. Only the second had a home before this,
+    so the when/how/scope of an act had to be reverse-engineered with MIN()/MAX()
+    over duplicated booleans, and scope had nowhere to live at all."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="email-triage-optout-test-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)]))
+        self.init()
+
+    def init(self):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "init_history_db.py"),
+             "--data-dir", str(self.tmp)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def hist(self, *args):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "history.py"),
+             "--data-dir", str(self.tmp), *args],
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def sql(self, query, params=()):
+        conn = sqlite3.connect(self.tmp / "history.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute(query, params)]
+        finally:
+            conn.close()
+
+    def log(self, session, sender, occurred_at, unsubscribed=False):
+        args = ["log-event", "--session", session, "--occurred-at", occurred_at,
+                "--sender", sender, "--category", "marketing",
+                "--proposed", "trash", "--final", "trash",
+                "--decided-by", "approved"]
+        if unsubscribed:
+            args.append("--unsubscribed")
+        self.hist(*args)
+
+    def optouts(self, *args):
+        return json.loads(self.hist("optouts", *args))
+
+    # -- the write path -----------------------------------------------------
+
+    def test_set_unsubscribed_records_the_act_once_for_many_events(self):
+        """The Roy Cooper shape: one board, one yes, 16 trashings. Sixteen event
+        rows are correct; ONE opt-out row is the act."""
+        for i in range(16):
+            self.log("S1", "info@e.example.com", f"2026-08-07T20:06:{i:02d}Z")
+        self.hist("set-unsubscribed", "--session", "S1",
+                  "--senders", "info@e.example.com",
+                  "--scope", "all campaign mail",
+                  "--mechanism", "one-click-post")
+        out = self.optouts()
+        self.assertEqual(out["count"], 1)
+        row = out["optouts"][0]
+        self.assertEqual(row["sender_addr"], "info@e.example.com")
+        self.assertEqual(row["kind"], "unsubscribed")
+        self.assertEqual(row["mechanism"], "one-click-post")
+        self.assertEqual(row["scope"], "all campaign mail")
+        self.assertEqual(row["events_covered"], 16)
+        self.assertEqual(
+            self.sql("SELECT COUNT(*) n FROM events WHERE unsubscribed=1")[0]["n"],
+            16)
+
+    def test_amending_twice_in_one_session_does_not_mint_two_acts(self):
+        """The DNC shape: messages trashed at 01:31, a straggler amended at
+        14:27, one click. Idempotent per (sender, session, kind)."""
+        self.log("S1", "a@x.com", "2026-08-13T01:31:57Z")
+        self.hist("set-unsubscribed", "--session", "S1", "--senders", "a@x.com")
+        self.log("S1", "a@x.com", "2026-08-13T14:27:30Z")
+        self.hist("set-unsubscribed", "--session", "S1", "--senders", "a@x.com",
+                  "--scope", "filled in on the second pass")
+        out = self.optouts()
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["optouts"][0]["events_covered"], 2)
+        # A later call supplies what the first omitted rather than duplicating.
+        self.assertEqual(out["optouts"][0]["scope"], "filled in on the second pass")
+
+    def test_two_attempts_in_different_sessions_are_two_acts(self):
+        """BHCCU: opted out 2026-07-03, mailed again, opted out again 07-18.
+        "Did the second attempt stick?" is the question this table answers, and
+        it needs both rows to be askable."""
+        self.log("S1", "b@x.com", "2026-07-03T00:00:00Z")
+        self.hist("set-unsubscribed", "--session", "S1", "--senders", "b@x.com")
+        self.log("S2", "b@x.com", "2026-07-18T00:00:00Z")
+        self.hist("set-unsubscribed", "--session", "S2", "--senders", "b@x.com")
+        self.assertEqual(self.optouts()["count"], 2)
+
+    def test_scope_is_what_stops_a_false_recidivism_alarm(self):
+        self.log("S1", "noreply@medium.example", "2026-08-13T00:00:00Z")
+        self.hist("set-unsubscribed", "--session", "S1",
+                  "--senders", "noreply@medium.example",
+                  "--scope", "marketing digests only; login codes expected to continue")
+        self.assertIn("login codes expected",
+                      self.optouts()["optouts"][0]["scope"])
+
+    def test_optouts_filters_by_sender(self):
+        for addr in ("a@x.com", "b@x.com"):
+            self.log("S1", addr, "2026-08-13T00:00:00Z")
+        self.hist("set-unsubscribed", "--session", "S1",
+                  "--senders", "a@x.com,b@x.com")
+        self.assertEqual(self.optouts()["count"], 2)
+        self.assertEqual(self.optouts("--sender", "a@x.com")["count"], 1)
+
+    # -- the backfill -------------------------------------------------------
+
+    def test_backfill_groups_by_session_not_by_timestamp(self):
+        """The grouping key that the live DNC data settled. Its four events span
+        01:31 and 14:27 from ONE click; grouping on occurred_at would mint two
+        acts. Sessions are the unit an opt-out actually happens in."""
+        conn = sqlite3.connect(self.tmp / "history.db")
+        conn.execute("DELETE FROM event_optouts")
+        conn.execute("DELETE FROM sender_optouts")
+        conn.commit()
+        conn.close()
+        for at in ("2026-08-13T01:31:57Z", "2026-08-13T14:27:30Z"):
+            self.log("S1", "dnc@x.com", at, unsubscribed=True)
+        self.log("S2", "dnc@x.com", "2026-09-01T00:00:00Z", unsubscribed=True)
+
+        self.init()          # re-run migrate(), which backfills
+        rows = self.sql("SELECT * FROM sender_optouts ORDER BY occurred_at")
+        self.assertEqual(len(rows), 2)                      # 2 sessions, not 3
+        self.assertEqual(rows[0]["occurred_at"], "2026-08-13T01:31:57Z")
+        self.assertEqual(rows[0]["kind"], "unsubscribed")
+        self.assertEqual(rows[0]["confirmed"], 1)
+        # Unknown rather than guessed, for records predating the table.
+        self.assertIsNone(rows[0]["mechanism"])
+        self.assertIsNone(rows[0]["scope"])
+        self.assertEqual(
+            self.sql("SELECT COUNT(*) n FROM event_optouts")[0]["n"], 3)
+
+    def test_backfill_is_idempotent_and_leaves_events_untouched(self):
+        before = self.sql("PRAGMA table_info(events)")
+        self.log("S1", "c@x.com", "2026-08-13T00:00:00Z", unsubscribed=True)
+        self.init()
+        self.init()          # a second migrate() must not duplicate
+        self.assertEqual(self.sql("SELECT COUNT(*) n FROM sender_optouts")[0]["n"], 1)
+        # The whole point of the junction: events' schema is frozen.
+        self.assertEqual(self.sql("PRAGMA table_info(events)"), before)
+
+    def test_one_event_cannot_be_claimed_by_two_optouts(self):
+        """UNIQUE(event_id) does the work an events.optout_id column would have
+        done structurally. The relationship is 1:N, not many-to-many."""
+        self.log("S1", "d@x.com", "2026-08-13T00:00:00Z", unsubscribed=True)
+        self.init()
+        conn = sqlite3.connect(self.tmp / "history.db")
+        try:
+            conn.execute("INSERT INTO sender_optouts (sender_addr, occurred_at, "
+                         "kind) VALUES ('d@x.com', '2026-09-01T00:00:00Z', "
+                         "'unsubscribed')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO event_optouts (event_id, optout_id) "
+                             "SELECT id, 2 FROM events LIMIT 1")
+        finally:
+            conn.close()
+
+    def test_optout_prose_is_escaped_and_the_address_stays_a_handle(self):
+        self.log("S1", "e@x.com", "2026-08-13T00:00:00Z")
+        self.hist("set-unsubscribed", "--session", "S1", "--senders", "e@x.com",
+                  "--scope", "digests <b>only</b>")
+        out = self.optouts()
+        declared = set(out["_trust"]["untrusted_fields"])
+        self.assertIn("optouts.scope", declared)
+        self.assertIn("optouts.sender_addr", declared)     # handle: unescaped
+        self.assertIn("&lt;b&gt;", out["optouts"][0]["scope"])
+        self.assertEqual(out["optouts"][0]["sender_addr"], "e@x.com")
+        self.assertNotIn("optouts.kind", declared)
+
+
 class SetUnsubscribedTests(unittest.TestCase):
     """Amending `unsubscribed` after the fact. Needed because SKILL step 5
     assumes confirmation precedes logging -- true for the automated one-click

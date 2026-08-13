@@ -506,6 +506,35 @@ listed in `_trust.untrusted_fields`. Anchor `text` is prose and *is* escaped.
 
 The spine carries the common `log-event` call; these are the rest.
 
+**Opt-outs — `sender_optouts` + `event_optouts` (2026-08-13).** An opt-out is a
+fact about a SENDER RELATIONSHIP and happens once; `events.unsubscribed` is a
+fact about a MESSAGE and is correctly true on all 16 rows of a batch. Both are
+real, and only the second had a home before this — so the when/how/scope of an
+act had to be reverse-engineered with `MIN()`/`MAX()` over duplicated booleans.
+
+`set-unsubscribed --session S --senders a,b [--scope ...] [--mechanism ...]
+[--kind unsubscribed|declined|alias-deactivated] [--notes ...]` amends the
+events **and** records the act. Idempotent per `(sender, session, kind)`: a
+second call in the same session fills in what the first omitted rather than
+minting a duplicate. `$HIST optouts [--sender addr]` lists them with
+`events_covered`.
+
+**Always pass `--scope`.** It names what was opted out of and what should keep
+arriving — *"marketing digests only; login codes expected to continue"*. Without
+it a later transactional message reads as the sender ignoring the opt-out, which
+is not hypothetical: Xfinity and Glassdoor both mailed after their opt-outs, and
+both were exempt service notices (a billing-system change, an acquisition). The
+recidivism question is answered by REVIEW, not assertion, so scope is free text a
+human reads rather than something a parser interprets.
+
+`event_optouts` is a junction, not an `events.optout_id` column, so `events` —
+the irreplaceable table, with no scheduled backup — is never ALTERed. The
+relationship is 1:N, so `UNIQUE(event_id)` does the work a foreign key would have
+done structurally. Backfill groups by `(sender_addr, session_started_at)`, NOT by
+`occurred_at`: the DNC's four events span 01:31 and 14:27 from one click, and
+grouping on timestamps would have minted two acts. BHCCU's two attempts fall in
+different sessions and correctly stay two rows.
+
 **Rules — full CRUD since 2026-08-10.** `add-rule --id <slug>`, `list-rules
 [--filter all|active|inactive]`, `update-rule <id> [--predicate] [--action]
 [--origin] [--active] [--new-id]`, `delete-rule <id>`, `set-rule <id>

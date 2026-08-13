@@ -218,13 +218,80 @@ def cmd_set_unsubscribed(conn: sqlite3.Connection, args: argparse.Namespace) -> 
         f"WHERE session_started_at = ? AND sender_addr IN ({placeholders}) "
         f"GROUP BY sender_addr",
         (args.session, *addrs)).fetchall()
+
+    # One opt-out row per sender per session -- the act, recorded once, with the
+    # scope that keeps a later transactional message from reading as a violation.
+    optouts = [record_optout(conn, r["sender_addr"], args) for r in matched]
+    for optout_id, sender in optouts:
+        conn.execute(
+            "INSERT OR IGNORE INTO event_optouts (event_id, optout_id) "
+            "SELECT id, ? FROM events WHERE session_started_at = ? "
+            "AND sender_addr = ? AND unsubscribed = 1",
+            (optout_id, args.session, sender))
+    conn.commit()
+
     print(json.dumps(untrusted.apply_trust(
         {"updated": cur.rowcount,
+         "optouts_recorded": len(optouts),
+         "scope_recorded": bool(args.scope),
          "per_sender": [{"sender_addr": r["sender_addr"], "events": r["n"]}
                         for r in matched]},
-        {"updated"} | untrusted.under("per_sender", {"events"}),
+        {"updated", "optouts_recorded", "scope_recorded"}
+        | untrusted.under("per_sender", {"events"}),
         handle_fields=untrusted.under("per_sender", {"sender_addr"})),
         indent=2, sort_keys=True))
+
+
+def record_optout(conn: sqlite3.Connection, sender: str,
+                  args: argparse.Namespace) -> tuple:
+    """Insert one sender_optouts row and return (id, sender).
+
+    Idempotent per (sender, session, kind): re-running `set-unsubscribed` after
+    a second batch amends more events without minting a duplicate act. The act
+    happened once even if it authorized trashings at two different times."""
+    existing = conn.execute(
+        "SELECT id FROM sender_optouts WHERE sender_addr = ? "
+        "AND session_started_at IS ? AND kind = ?",
+        (sender, args.session, args.kind)).fetchone()
+    if existing is not None:
+        # Fill in scope/mechanism if this call supplies what the first omitted.
+        for col, val in (("scope", args.scope), ("mechanism", args.mechanism),
+                         ("notes", args.notes)):
+            if val is not None:
+                conn.execute(
+                    f"UPDATE sender_optouts SET {col} = ? "
+                    f"WHERE id = ? AND {col} IS NULL", (val, existing["id"]))
+        return existing["id"], sender
+    cur = conn.execute(
+        """INSERT INTO sender_optouts (sender_addr, occurred_at,
+               session_started_at, kind, mechanism, scope, confirmed, notes)
+           VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+        (sender, utc_now(), args.session, args.kind, args.mechanism,
+         args.scope, args.notes))
+    return cur.lastrowid, sender
+
+
+def cmd_optouts(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Every recorded opt-out, newest first, with how many events each covers.
+
+    `context` does not carry these: they are not session-start framing, they are
+    what the recidivism question is asked against."""
+    where, params = "", ()
+    if args.sender:
+        where = " WHERE o.sender_addr = ?"
+        params = (args.sender.strip().lower(),)
+    rows = [dict(r) for r in conn.execute(
+        f"""SELECT o.id, o.sender_addr, o.occurred_at, o.session_started_at,
+                   o.kind, o.mechanism, o.scope, o.confirmed, o.status, o.notes,
+                   (SELECT COUNT(*) FROM event_optouts x WHERE x.optout_id = o.id)
+                       AS events_covered
+            FROM sender_optouts o{where} ORDER BY o.occurred_at DESC""", params)]
+    trusted, handles = column_trust({"optouts": "sender_optouts"})
+    json.dump(untrusted.apply_trust(
+        {"optouts": rows, "count": len(rows)},
+        trusted | {"count", "optouts.events_covered"}, handle_fields=handles),
+        sys.stdout, indent=2)
+    print()
 
 
 # A rule id is a caller-chosen slug (2026-08-10). Numbers collided with the
@@ -510,6 +577,12 @@ TRUSTED_COLUMNS = {
     "session_notes": {"id", "session_started_at", "written_at"},
     "contacts": {"is_vip", "updated_at"},
     "rules": {"id", "created_at", "updated_at", "active", "origin"},
+    # kind/mechanism are enum-constrained by CHECK on every write path, and the
+    # rest are our own bookkeeping. `status` is an outcome token WE write
+    # ("202"), never the sender's prose.
+    "sender_optouts": {"id", "occurred_at", "session_started_at", "kind",
+                       "mechanism", "confirmed", "status"},
+    "event_optouts": {"event_id", "optout_id"},
     # Enumerated rather than described as "all counts, rates" (UC §6 was loose
     # here). The view drifts: it gained `holds` and lost `skips` on 2026-08-06,
     # and a description cannot fail a test.
@@ -529,6 +602,7 @@ HANDLE_COLUMNS = {
     "events": {"message_id", "thread_root_id", "sender_addr"},
     "contacts": {"addr"},
     "sender_stats": {"sender_addr"},
+    "sender_optouts": {"sender_addr"},
 }
 
 # Deliberately untrusted. Runtime does not consult this set -- default-deny
@@ -549,6 +623,10 @@ UNTRUSTED_COLUMNS = {
     "contacts": {"display_name", "relation", "notes"},
     # UC §3's shared door: analytics.py `rules` reads these same two columns.
     "rules": {"predicate", "action"},
+    # `scope` and `notes` describe a sender's mail in prose a model drafted, and
+    # invariant 7 makes model-written derivatives of email content untrusted too.
+    "sender_optouts": {"scope", "notes"},
+    "event_optouts": set(),
     "sender_stats": set(),
 }
 
@@ -795,6 +873,24 @@ def main() -> None:
                     help="session_started_at the events were logged under")
     su.add_argument("--senders", required=True,
                     help="comma-separated sender addresses to amend")
+    su.add_argument("--scope",
+                    help="WHAT was opted out of and what should keep arriving, "
+                         "e.g. 'marketing digests only; login codes expected to "
+                         "continue'. Without it a later transactional message "
+                         "reads as the sender ignoring the opt-out")
+    su.add_argument("--mechanism", choices=("one-click-post", "header-get",
+                                            "body-manual", "mailto",
+                                            "preference-center", "alias",
+                                            "server-rule"))
+    su.add_argument("--kind", default="unsubscribed",
+                    choices=("unsubscribed", "declined", "alias-deactivated"))
+    su.add_argument("--notes")
+
+    op = sub.add_parser("optouts",
+                        help="every recorded opt-out with its scope and how many "
+                             "events it covers")
+    op.add_argument("--sender", help="limit to one sender address")
+    op.set_defaults(func=cmd_optouts)
     su.set_defaults(func=cmd_set_unsubscribed)
 
     q = sub.add_parser(

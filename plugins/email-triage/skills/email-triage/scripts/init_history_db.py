@@ -73,6 +73,48 @@ CREATE TABLE IF NOT EXISTS rules (
     origin      TEXT NOT NULL CHECK (origin IN ('user','claude-proposed'))
 );
 
+-- An opt-out is a fact about a SENDER RELATIONSHIP, and it happens once.
+-- `events.unsubscribed` is a fact about a MESSAGE -- "this trashing was
+-- unsubscribe-authorized" -- and is correctly true on all 16 rows of a batch.
+-- Both are real; only the second had a home before 2026-08-13, so the WHEN,
+-- HOW and SCOPE of an opt-out had to be reverse-engineered with MIN()/MAX()
+-- over duplicated booleans, and the scope had nowhere to live at all.
+--
+-- Multiple rows per sender ON PURPOSE: BHCCU took two attempts (2026-07-03 and
+-- 2026-07-18) and "did the second one stick?" is the question this answers.
+CREATE TABLE IF NOT EXISTS sender_optouts (
+    id                 INTEGER PRIMARY KEY,
+    sender_addr        TEXT NOT NULL,
+    occurred_at        TEXT NOT NULL,
+    session_started_at TEXT,
+    kind               TEXT NOT NULL CHECK (kind IN
+                         ('unsubscribed','declined','alias-deactivated')),
+    -- how it was done; NULL for backfilled rows, where it is genuinely unknown
+    mechanism          TEXT CHECK (mechanism IS NULL OR mechanism IN
+                         ('one-click-post','header-get','body-manual','mailto',
+                          'preference-center','alias','server-rule')),
+    -- WHAT was opted out of, and what is expected to keep arriving. Free text
+    -- on purpose: the recidivism check surfaces hits for REVIEW rather than
+    -- asserting a violation, so a human reads this rather than a parser.
+    -- Without it, a later transactional message (a Medium login code after
+    -- opting out of Medium's digests) reads as a sender ignoring the opt-out.
+    scope              TEXT,
+    confirmed          INTEGER NOT NULL DEFAULT 0,
+    status             TEXT,
+    notes              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_optouts_sender ON sender_optouts(sender_addr);
+
+-- Junction rather than an `events.optout_id` column, so `events` -- the
+-- irreplaceable table, and the one with no scheduled backup -- is never
+-- ALTERed. The relationship is 1:N, not many-to-many, so UNIQUE(event_id)
+-- does the work a foreign-key column would have done structurally.
+CREATE TABLE IF NOT EXISTS event_optouts (
+    event_id  INTEGER NOT NULL UNIQUE REFERENCES events(id),
+    optout_id INTEGER NOT NULL REFERENCES sender_optouts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_optouts_optout ON event_optouts(optout_id);
+
 -- Two different filters on purpose (2026-08-06); one used to do both jobs.
 --   decisions / holds  -- "did you act at all, or leave it unchanged?"
 --                         'hold' is the only no-op verb.
@@ -147,6 +189,38 @@ def migrate(conn: sqlite3.Connection) -> None:
     # differs. Every rule becomes `rule-<n>`; renaming to something meaningful
     # is a data operation (`update-rule <id> --new-id <slug>`), by whoever
     # knows what the rule means.
+    # 2026-08-13: backfill sender_optouts from the booleans already on events.
+    # Purely additive -- events is neither ALTERed nor UPDATEd, so reverting is
+    # `DROP TABLE event_optouts; DROP TABLE sender_optouts;` and nothing is lost.
+    #
+    # Grouped by (sender_addr, session_started_at), NOT by occurred_at: one
+    # opt-out is one act within one session, and its events do not share a
+    # timestamp. The DNC proves it -- three messages trashed at 01:31 and a
+    # fourth amended at 14:27, all one click. Grouping on occurred_at would have
+    # minted two rows for one act; grouping on session gives one. BHCCU's two
+    # attempts fall in different sessions and correctly stay two rows.
+    if not conn.execute("SELECT EXISTS(SELECT 1 FROM sender_optouts)").fetchone()[0]:
+        groups = conn.execute("""
+            SELECT sender_addr, session_started_at, MIN(occurred_at) AS first_at
+            FROM events WHERE unsubscribed = 1
+            GROUP BY sender_addr, session_started_at
+            ORDER BY first_at""").fetchall()
+        for sender, session, first_at in groups:
+            cur = conn.execute(
+                """INSERT INTO sender_optouts (sender_addr, occurred_at,
+                       session_started_at, kind, confirmed, notes)
+                   VALUES (?, ?, ?, 'unsubscribed', 1, ?)""",
+                (sender, first_at, session,
+                 "backfilled 2026-08-13 from events.unsubscribed; mechanism "
+                 "and scope are genuinely unknown for records predating this "
+                 "table and are left NULL rather than guessed"))
+            conn.execute(
+                """INSERT OR IGNORE INTO event_optouts (event_id, optout_id)
+                   SELECT id, ? FROM events
+                   WHERE unsubscribed = 1 AND sender_addr = ?
+                     AND session_started_at IS ?""",
+                (cur.lastrowid, sender, session))
+
     if _column_type(conn, "rules", "id") == "INTEGER":
         # events.rule_id INTEGER -> TEXT. Add/copy/drop/rename rather than
         # rebuilding the table: `events` is the irreplaceable one, and not
