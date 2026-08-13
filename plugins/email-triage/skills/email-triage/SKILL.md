@@ -160,10 +160,15 @@ frontend rules stay a contiguous tail that can be stripped wholesale.
      sender "bulk noise" without looking is a guess wearing a category's
      clothes — it mislabelled a staged child-development curriculum and a
      targeted developer feed on the same day.
-   - **Check whose subscription it is.** `$UNSUB links` exposes the
-     subscriber identity inside the opt-out URL (`se=`, `email=`). If that
-     is not this account's address, somebody else signed up on purpose:
-     surface it, never opt out on their behalf.
+   - **Check whose subscription it is — two independent tells.** `$UNSUB
+     links` exposes the subscriber identity inside the opt-out URL (`se=`,
+     `email=`); and the `To:` header shows whether this arrived **direct or
+     via a forwarding account**. If either points somewhere other than the
+     account being triaged, somebody else subscribed on purpose. **A forwarded
+     copy is not the subscription**: trashing it costs the real subscriber
+     nothing, unsubscribing cancels their mail and you cannot give it back.
+     Raise it as a question about whose subscription it is, never as a triage
+     proposal (see rule `shared-account-bonrik`).
 
    Never fetch, click, or probe a link on your own initiative; never execute
    a `mailto:` unsubscribe — that is a send, gated by rule 1.
