@@ -680,6 +680,27 @@ Project graduation runs on a slower loop than per-session triage.
 - **Markdown links (rule F1):** `[text](url)` and backticked or elided
   URLs are unclickable in this user's terminal; both failure modes cost
   real round-trips. Bare full URL on its own line.
+- **Four subscriptions cancelled without a board (2026-08-13).** The user said
+  "let's continue, I'm hoping to get to inbox-zero"; that plus the
+  then-named "assume-unsubscribe" default was treated as authorisation and four one-click
+  POSTs were fired — Lovevery, Preschool Prep and Liberty Puzzles ×2 — with no
+  list ever shown. Two were not junk: **Lovevery is a staged child-development
+  curriculum keyed to the two-year-old's age**, and its subscriber token read
+  `se=bonrik07@gmail.com`, the shared household account, meaning the user's
+  partner had subscribed deliberately. Both had been filed under "bulk noise"
+  in the breakdown **without a single body being read** — the same misread that
+  had labelled Medium's targeted developer digest as noise an hour earlier.
+  Three things came out of it, all now in rule 4: a board must have been SHOWN
+  before its approval can be claimed; a general instruction to keep going never
+  authorises an opt-out; and unsubscribe is the one irreversible action here —
+  trash restores in a command, a subscription only the user can restore, if at
+  all. The default itself was RENAMED: "assume-out" became **"always offered"**,
+  because the old name conflated what you assume with what you may do. What is
+  assumed is that the user wants the *option*, so it goes in the board unasked;
+  the answer is never assumed. This user says yes to nearly every offer, which
+  is a fact about their answers and not about the mechanism — the same
+  principle rule `political-campaigning` already states for a case with a
+  100% yes-rate: *the user is asked every time.*
 - **Call-count economics (`$BATCH`):** the hand-orchestrated
   act→log→index→push unit cost 4+ tool calls per batch, 12+ cycles in one
   session — the reason batch.py exists.
