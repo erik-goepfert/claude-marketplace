@@ -55,9 +55,14 @@ lives in the source repository's `implementation-plan.md`, which is not
 installed with the plugin.)
 
 himalaya accounts live in `~/.config/himalaya/config.toml`, not this
-skill's config: `icloud`/`gmail` are IMAP (reply/send only),
+skill's config: `icloud`/`gmail` are IMAP+SMTP (reply/send only),
 `icloud-local`/`gmail-local` are Maildir pointed at
-`<maildir_path>/<account>` from `config.yaml` (all reads and flag ops).
+`<maildir_path>/<account>` from `config.yaml` (local draft saves).
+**himalaya ≥ 2.1 is required** — the v2 config schema (`imap.server`,
+`imap.sasl.plain.*`, `maildir.root`, `mailbox.alias.*`) and every command
+below are v2; a v1 config loads with no backends at all ("No backend
+matching `auto`"). Check with `himalaya account list` (every account must
+show backends) and `himalaya -a <acct> account check`.
 
 ## Composing bodies
 
@@ -210,16 +215,17 @@ standing ones.
   misremembered. A folder name like `[Gmail]/Sent Mail` holds a space and two
   shell globs, so hand-quoting it was a standing hazard rather than a style
   question (2026-08-10).
-- **`himalaya envelope list` defaults to a 10-envelope page** on every
-  backend — a listing that "looks complete" at 10 is silently truncated.
-  Always pass `-s 500` (or page with `-p`). Cost a live session ~9 tool
-  calls to rediscover.
+- **`himalaya envelope list` pages by default** (25 in v2, 10 in v1) on
+  every backend — a listing that "looks complete" at one page is silently
+  truncated. Always pass `-s 500` (or page with `-p`). Cost a live session
+  ~9 tool calls to rediscover. v2 spells the folder `-m/--mailbox` (v1's
+  `-f/--folder` is gone) and JSON output `--json` (v1's `-o json` is gone).
 - **`$ACT` accepts message-ids on stdin** (`... move ... -` with one id
   per line) — use it whenever an id contains shell-hostile characters
   (backslashes bit a live session) or for long batches.
-- **Gmail:** `envelope search` fails (no IMAP SORT) — only
-  `envelope list`, on both the IMAP and `-local` accounts (query-style
-  search via `envelope list -a gmail -f <folder> 'subject X'` does work).
+- **Gmail:** no IMAP SORT. v1's `envelope search` failed on it; v2 sorts
+  client-side when SORT is missing and `envelope list -a gmail` works
+  (verified 2026-09-22); `envelope search` on v2 is unverified.
   The star is `\Flagged`. Gmail's `[Gmail]/Trash` and `[Gmail]/Spam`
   auto-purge in ~30 days — a hard ceiling, vs. a comfortable floor on
   iCloud.
@@ -227,37 +233,48 @@ standing ones.
   `,U=<uid>` filename token travels to the target folder and mbsync
   hard-errors ("UID N is beyond highest assigned UID"), having already
   synced the source-side deletion (a real stranding risk). The act layer
-  (`$ACT`/`$BATCH`) strips the token and is the only move path. Flag ops
-  via `-local` himalaya, by contrast, are mbsync-safe (suffix-only rename,
-  `,U=` preserved in place).
-- **himalaya Maildir-backend ids are unstable** — an id-mapper over the
-  folder, unrelated to the index's `maildir_key` (verified: an id changed
-  0→4 across one sync). Always resolve them fresh, immediately before
-  use, by matching `from_addr` + `date_utc` in `envelope list` output.
-- **`himalaya message save` takes the message on STDIN only** (verified
-  4.5): the argument form silently saves an EMPTY message, and without
-  stdin redirection the command hangs waiting for input. Always
-  `... message save ... < tmpfile`.
-- **A plain local `message read` stamps `S`** on the Maildir filename
-  (mbsync then syncs `\Seen` to the server). `--preview` suppresses it.
-  `$THR read` never touches the filename at all.
-- **iCloud:** himalaya's save-copy is the only Sent copy (iCloud SMTP does
-  not auto-save) — leave `save-copy` at its default on the `icloud`
-  account.
-- **Gmail SMTP auto-saves to Sent** — `message.send.save-copy = false` is
-  set on the `gmail` account in himalaya's config; don't "fix" a missing
-  local save there.
+  (`$ACT`/`$BATCH`) strips the token and is the only move path.
+- **`himalaya flag` on Maildir silently no-ops on unread mail** (v2.1.0,
+  verified 2026-09-22): a message still in `new/` — where mbsync puts
+  unread arrivals — gets "Successfully added flags" and no change on disk,
+  via both `flag add` and `maildir flags add`. `$THR flag` therefore writes
+  the flag suffix itself (`act.flag_one`: `new/` → `cur/`, suffix-only
+  rename, `,U=` preserved in place — what mbsync expects). Never flag by
+  hand through himalaya.
+- **himalaya ids (v2)** are the IMAP UID on the IMAP accounts and the
+  filename stem (`,U=` included — the index's `maildir_key`) on Maildir;
+  both are stable, unlike v1's positional id-mapper. v2 envelopes also
+  carry `message-id`, so match on that, never on from+date.
+- **`himalaya message add` (alias `save`) — pass the message on STDIN**
+  (v1's argument form silently saved an EMPTY message; v2 reads an
+  argument as a path or inline raw, and stdin is the unambiguous form).
+  `-m <mailbox>` is mandatory, `-f draft -f seen` sets flags in the same
+  call, and `--json` returns the new `{"id", "sent"}`. On Maildir it
+  writes **CRLF** line endings whatever it was given (verified
+  2026-09-22) — whether mbsync uploads those cleanly is **unverified**;
+  check the first saved draft on the phone.
+- **`message read` is non-mutating in v2** (v1's plain local read stamped
+  `S`); `--seen` opts in — never pass it. `$THR read` never touches the
+  filename at all.
+- **Composed messages carry a hostname Message-ID** — v2's `message reply`
+  (and `compose`/`forward`) stamp `@<machine name>` with no config to
+  change it. That is why replies go out from Apple Mail until Phase 8
+  (SKILL §Reply); don't send through himalaya.
+- **Sent copies (for Phase 8's `send.py`):** iCloud SMTP keeps no Sent
+  copy — the sender must save one (v2 has no `save-copy` setting either);
+  Gmail SMTP files its own, so saving there would duplicate it.
 
 ## JSON shapes
 
-**himalaya envelope JSON** (verified against himalaya v1.2.0, both
-backends): bare array; `id` is a **string**; `flags` is an array of
-strings (e.g. `["Flagged"]`); `from`/`to` are `{name, addr}` objects;
-`date` is local-tz, minute precision (`2026-07-19 17:40+00:00`).
-**There is NO `message_id` field** — you cannot filter envelopes by
-Message-ID (a live session tried and got an empty match); the only join
-back to the index is from_addr + date, which is exactly what
-`$THR flag` does internally — use it instead of doing this by hand.
+**himalaya envelope JSON** (verified against himalaya v2.1.0, IMAP and
+Maildir, 2026-09-22): an object `{"envelopes": [...]}`, not a bare array.
+Each envelope: `id` (string — IMAP UID / Maildir filename stem),
+`message-id` (**without** angle brackets; the index keeps them),
+`in-reply-to` (list, same normalisation), `flags` (list of
+`{"raw": "\\Seen", "iana": ...}` objects), `from`/`to` (lists of
+`{name, email}`), `subject`, `date` (RFC 3339 with seconds — UTC on IMAP,
+the header's own offset on Maildir), `size`, `has-attachment`.
+`himalaya json-schema <dir>` writes the full schemas.
 
 **The `_trust` block is on EVERY script's JSON, not just `$THR` (6.2).**
 `$IDX`, `$ACT`, `$BATCH`, `$UNSUB`, `$SES` and `$ANA` all carry it. Same
@@ -352,10 +369,10 @@ drafted, subject, from_addr, date_utc, residual_count, folders}],
 
 **`$THR flag`:** `--seen` (one message) or `--block`/`--unblock`
 (thread-wide, rule 2) → `{"account", "mode", "actions": [{message_id,
-folder, himalaya_id, op}], "sync": [{account, boxes, attempts, ok,
-stderr?}]}`. Resolution is internal (from_addr + minute date against
-`envelope list`); 0 or 2+ matches is a hard error (stale index →
-re-index/sync; ambiguous → act manually).
+folder, file, op}], "sync": [{account, boxes, attempts, ok,
+stderr?}]}`. `file` is the message's new Maildir filename. Resolution is
+the act layer's (index `maildir_key` → current file on disk); a file gone
+from disk is a hard error meaning the index is stale → re-index and retry.
 
 Since 2026-08-10 it **pushes the folders it touched itself**, exactly as
 `$BATCH run` does — one retry, box-scoped, `sync[].ok` to check. No `actions`
@@ -648,7 +665,7 @@ Project graduation runs on a slower loop than per-session triage.
    folder was last genuinely active, not stragglers), lands in its family
    folder when one fits — `Areas/W-141st-Ln` →
    `Archive/Housing/20XX-W-141st-Ln`. Create the destination first if new
-   (`himalaya folder create`), then `$ACT move` every message in the
+   (`himalaya imap create -a <acct> "<folder>"`), then `$ACT move` every message in the
    source folder to it in one batch call.
 4. **No event is logged** — folder-level, no per-sender learning signal;
    the active window is reconstructable from Maildir mtimes

@@ -18,7 +18,8 @@ do not have them, nothing here depends on them.
 
 Reads and thread assembly run entirely against a local Maildir mirror +
 SQLite index, not live IMAP. Only two things touch the servers directly:
-`mbsync` (sync) and reply/send (IMAP himalaya). Everything else — listing,
+`mbsync` (sync) and, for now, nothing else — replies go out from Apple Mail
+until Phase 8's `send.py` (see **Reply**). Everything else — listing,
 reading, flagging, moving — is local.
 
 ## State and stack layout
@@ -93,8 +94,9 @@ in reference §Incident history.
   Irreplaceable.
 - `index.db` — header + thread-graph cache over the Maildir. Disposable,
   rebuildable by `$IDX index`.
-- himalaya role split: `icloud`/`gmail` (IMAP) for reply/send **only**;
-  `icloud-local`/`gmail-local` (Maildir) for **all** reads and flag ops.
+- himalaya (being phased out, implementation-plan Phases 7–8) is left in
+  exactly two places: `$THR edit-draft`'s save (via `<acct>-local`) and
+  folder creation. Flags, reads and moves never touch it.
 - Anything missing (tools, DBs, config) → reference.md §Bootstrap.
 
 ## Operating rules (non-negotiable)
@@ -177,10 +179,10 @@ frontend rules stay a contiguous tail that can be stripped wholesale.
    A message counts as read only once the user has been shown its content
    or a representative summary.
    - Reads for your own purposes go through `$THR read` (raw-file-backed,
-     \Seen-safe by construction). Any residual himalaya read must use
-     `--preview` (a plain local read stamps `S`; reference §Quirks).
-   - Mark read explicitly — `himalaya flag add -a <acct>-local -f
-     <folder> <id> seen` — at the moment you present content or a summary.
+     \Seen-safe by construction). A residual himalaya `message read` is
+     non-mutating in v2 — never pass it `--seen` (reference §Quirks).
+   - Mark read explicitly — `$THR flag --account <acct> --message-id <id>
+     --seen` — at the moment you present content or a summary.
    - **Leaving the active zone marks it read** (user rule, 2026-08-07).
      `\Seen` means "awaiting your attention" only INSIDE the live tiers
      (`untriaged`/`active`); on mail that has been resolved it is noise — an
@@ -636,9 +638,10 @@ graph plus a guarded subject fallback, and derives state directly.
   trash/activate batches don't need it** — `$BATCH`'s `thread_of` items
   expand members themselves.
 - `$THR flag --account <acct> --message-id <id> --seen|--block|--unblock`
-  — mechanized flag ops; rule 2's clear-then-set is `--block`. **Resolves
-  himalaya's unstable ids fresh, internally — never do that dance by
-  hand** (reference §Quirks). This is the only flag path.
+  — mechanized flag ops; rule 2's clear-then-set is `--block`. **Writes the
+  Maildir flag suffix directly — never `himalaya flag` by hand** (v2.1.0
+  silently no-ops on unread mail; reference §Quirks). This is the only flag
+  path.
 - `$THR residue` — end-of-session leftovers check (step 7).
 - A thread's messages live in one tier location at a time (system folders
   excepted — Sent copies never move). **Threads never move to Inbox.**
@@ -656,7 +659,7 @@ hardcoded:**
 | Stays open | move to `<tiers.active>` (if `active: null`, the disposition doesn't exist — mail stays put) |
 | Resolve, ongoing group | move to `"<tiers.ongoing>/<group>[/<project>]"` |
 | Resolve, closed one-off | `cold` named → move to `"<tiers.cold>/<year>-<Name>"`; `cold` null → `remove` (strip last label; tier derived by absence) |
-| Resolve, closed chapter in a family | move to `"<cold name or cold_root>/<Family>/<year>-<Name>"` — always a REAL folder; create first if new (`himalaya folder create`) |
+| Resolve, closed chapter in a family | move to `"<cold name or cold_root>/<Family>/<year>-<Name>"` — always a REAL folder; create first if new (`himalaya imap create -a <acct> "<folder>"`) |
 | Discard | move to `<tiers.trash>` |
 | Save reply for later | Reply step 5, "Save for later" exit — writes into `<tiers.drafts>` |
 
@@ -726,11 +729,8 @@ hard invariant either way — not done until the sync runs:
   exactly as `$BATCH run` does — check `sync[].ok`. Then log the event and
   `$IDX index` (~25 s): without the event the next `--suggest-events` run reads
   your own flag change as an external `manual` decision the user never made.
-- **Replies:** act (IMAP himalaya) → log the event → `$IDX index` → box-scoped
-  push by hand, `mbsync -c ~/.config/isync/mbsyncrc '<acct>:<folders touched>'`,
-  one account per invocation. **The last hand-typed sync in the flow** — it
-  survives only because sending still goes through IMAP himalaya rather than a
-  script that could own the push.
+- **Replies:** sent from Apple Mail for now (see **Reply** below), so there is
+  nothing to push from here — the next session sync pulls the Sent copy.
 
 `$ACT move`/`$ACT remove` are the low-level layer for one-offs and recovery;
 `remove` refuses to strip a message's only copy. Resolve-before-act is
@@ -743,37 +743,20 @@ rerun `$IDX index` and retry.
   state-eligible one; `--unblock` clears only.
 - **Move / resolve / trash** (approved): `$BATCH run` (or `$ACT` one-off)
   applied to every non-system, non-trash/junk member.
-- **Reply** (approved; IMAP account — the one non-local operation):
-  1. `References` **from the local index**: `$THR show` → every member's
-     `message_id` in date order up to and including the parent.
-  2. Resolve the parent's **IMAP-side** id (separate id-space):
-     `himalaya envelope list -a <acct> -f <folder> -s 500 -o json`,
-     matched by `from_addr`/`date_utc`/`subject`.
-  3. `himalaya template reply -a <acct> -f <folder> <id>` — prefills
-     everything except `References:`; add it from step 1.
-  4. Write the body per **Composing a body** above (quote below, reply
-     above); save the full template to a temp file.
-  5. Show the complete draft. Three exits:
-     - **Send** (explicit approval of that exact draft):
-       `himalaya template send -a <acct> "$(cat <tmpfile>)"`.
-     - **Save for later**: write the full RFC822 (headers incl.
-       In-Reply-To/References + body, LF endings) to drafts LOCALLY —
-       **on stdin, never as an argument** (argument form silently saves
-       EMPTY; without stdin it hangs):
-       `himalaya message save -a <acct>-local -f "<tiers.drafts>" < <tmpfile>`
-       Resolve the draft's local id FRESH, then
-       `himalaya flag add -a <acct>-local -f "<tiers.drafts>" <id> draft seen`.
-       The batch-boundary sync (must include drafts) pushes it as a
-       standard IMAP draft the phone can open, edit, send. Thread keeps
-       its flag. **Log the THREAD's disposition, not the draft** — there
-       is no `draft` action: `activate` if this moved an untriaged thread
-       into the live tier, nothing at all if it was already live. The
-       `\Draft` flag and the derived `drafted` status are what carry the
-       draft forward, and they resurface it every session until resolved.
-       Sent from the phone later → Sent detection logs the manual `reply`;
-       the draft's disappearance is expected report noise, no event.
-     - **Discard**: delete the temp file; log per the thread's actual
-       disposition.
+- **Reply** (approved) — **interim: the user sends from Apple Mail**
+  (2026-09-22). himalaya v2's composer stamps the machine hostname into
+  the Message-ID (`<…@BonrikPro>`), which would ride out in every sent
+  header; the stdlib replacement (implementation-plan Phase 8) is not
+  built yet. Until it is, no reply is composed or sent from here:
+  1. Write the body per **Composing a body** above and show it, with the
+     thread it answers (subject, recipient, the parent's date).
+  2. The user replies in Apple Mail, pasting or adapting it — sending,
+     and any saved draft, happen there.
+  3. **Log the THREAD's disposition, not the reply** — per the thread's
+     actual state (`activate` if this moved an untriaged thread into the
+     live tier, nothing if it was already live). The sent message itself
+     comes back through Sent detection as a manual `reply` at the next
+     `--suggest-events` run; accept it there.
 
 ## Reconciliation (new arrival on a filed thread)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Maildir act layer for email-triage: cross-folder moves.
+"""Local Maildir act layer for email-triage: cross-folder moves and flag writes.
 
 Exists because himalaya's Maildir backend preserves mbsync's private
 `,U=<uid>` filename token on cross-folder moves, which makes mbsync
@@ -8,8 +8,11 @@ locally (verified live, 2026-07-09; see implementation-plan.md 2.6).
 A move here is a plain rename with the U= token stripped, which mbsync
 syncs as delete + re-append (design §5).
 
-Only moves live here. Flag changes go through himalaya's Maildir accounts
-(suffix-only rename, U= preserved in place — mbsync-safe, verified).
+Flag writes live here too (since the himalaya v2 migration, 2026-09-22):
+a suffix-only rename within the folder, U= preserved in place, which is what
+mbsync expects. himalaya v2.1.0's Maildir flag commands report success on a
+message still in `new/` and change nothing (verified 2026-09-22), and unread
+mail from mbsync sits in exactly `new/` -- so `\\Seen` could never land.
 Reply/send stay on the IMAP accounts. See design §7.5, §12.
 
 Resolve-before-act (§12): callers pass message-ids; the index supplies
@@ -70,15 +73,38 @@ def resolve_current_file(maildir_root: str, folder: str, maildir_key: str) -> st
 
 
 # Maildir flag letters live in the filename suffix after ":2," and are kept in
-# ASCII order by convention. 'S' is \Seen.
+# ASCII order by convention. 'S' is \Seen, 'F' \Flagged, 'D' \Draft.
+FLAG_LETTERS = {"seen": "S", "flagged": "F", "draft": "D", "answered": "R"}
+
+
+def with_flags(filename: str, add: str = "", remove: str = "") -> str:
+    """Add/remove Maildir flag letters on a filename, sorted, idempotent."""
+    stem, sep, flags = filename.partition(":2,")
+    new = (set(flags) | set(add)) - set(remove)
+    if sep and new == set(flags):
+        return filename
+    return f"{stem}:2,{''.join(sorted(new))}"
+
+
 def with_seen(filename: str) -> str:
     """Add the Seen flag to a Maildir filename, order preserved, idempotent."""
-    if ":2," not in filename:
-        return filename + ":2,S"
-    stem, flags = filename.split(":2,", 1)
-    if "S" in flags:
-        return filename
-    return f"{stem}:2,{''.join(sorted(set(flags + 'S')))}"
+    return with_flags(filename, add="S")
+
+
+def flag_one(maildir_root: str, folder: str, maildir_key: str,
+             add: str = "", remove: str = "") -> str:
+    """Rewrite one message's flag suffix in place; returns the new filename.
+
+    Always lands in `cur/`: a message in `new/` has no info section, and giving
+    it one is exactly the move to `cur/` the Maildir spec prescribes. The stem
+    (U= token included) is untouched, so mbsync sees a flag change, not a new
+    message."""
+    src_path = resolve_current_file(maildir_root, folder, maildir_key)
+    new_name = with_flags(os.path.basename(src_path), add=add, remove=remove)
+    dst_path = os.path.join(maildir_root, folder, "cur", new_name)
+    if dst_path != src_path:
+        os.rename(src_path, dst_path)
+    return new_name
 
 
 def move_one(conn, maildir_root: str, account: str, src: str, dst: str,

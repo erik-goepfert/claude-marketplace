@@ -1344,7 +1344,7 @@ RESIDUE_HANDLES = untrusted.under("residue", {"root_message_id"})
 # default-deny escapes and declares it -- mbsync's own text, same call as
 # batch.py's identically named field.
 FLAG_TRUSTED = ({"account", "mode"}
-                | untrusted.under("actions", {"folder", "himalaya_id", "op"})
+                | untrusted.under("actions", {"folder", "file", "op"})
                 | untrusted.under("sync", {"account", "boxes", "attempts", "ok"}))
 FLAG_HANDLES = untrusted.under("actions", {"message_id"})
 
@@ -1581,66 +1581,12 @@ def compact_thread_object(account: str, mlist: list):
 
 
 # --------------------------------------------------------------------------
-# flag: mechanized himalaya-local flag ops (session-review R2, 2026-07-19).
-# The id-resolution dance (resolve FRESH, match by from_addr + date -- ids
-# are an unstable id-mapper; envelope JSON has NO message_id field) was the
-# last himalaya interaction done by hand, and it misfired in a live session
-# (an ad-hoc filter on the nonexistent message_id field). Here it's code.
+# flag: mechanized local flag ops (session-review R2, 2026-07-19).
+# Since the himalaya v2 migration (2026-09-22) this is a direct Maildir
+# rename through act.flag_one -- same resolve-before-act as moves (index row
+# -> maildir_key -> current file on disk), no himalaya call and no id
+# resolution. v2.1.0's own flag commands silently no-op on `new/` messages.
 # --------------------------------------------------------------------------
-
-
-def _parse_himalaya_date(s: str):
-    """himalaya envelope date: '2026-07-19 17:40+00:00' (no seconds)."""
-    try:
-        return datetime.datetime.strptime(s.strip(), "%Y-%m-%d %H:%M%z")
-    except (ValueError, AttributeError):
-        return None
-
-
-def _parse_index_date(s: str):
-    try:
-        return datetime.datetime.strptime(s.strip(), "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=datetime.timezone.utc)
-    except (ValueError, AttributeError):
-        return None
-
-
-def _himalaya(himalaya_bin, *cli_args) -> str:
-    import subprocess
-    proc = subprocess.run([himalaya_bin, *cli_args], capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise FatalError(f"himalaya {' '.join(cli_args[:3])}... failed: "
-                         f"{(proc.stderr or proc.stdout).strip()[:300]}")
-    return proc.stdout
-
-
-def resolve_himalaya_id(himalaya_bin: str, hima_account: str, member: dict) -> str:
-    """Current himalaya-local id for one member: envelope list in the
-    member's folder, matched by from_addr + date (minute precision -- the
-    envelope JSON carries no seconds and NO message_id field)."""
-    out = _himalaya(himalaya_bin, "envelope", "list", "-a", hima_account,
-                    "-f", member["folder"], "-s", "500", "-o", "json")
-    envelopes = json.loads(out)
-    want_addr = (member["from_addr"] or "").lower()
-    want_dt = _parse_index_date(member["date_utc"])
-    matches = []
-    for env in envelopes:
-        addr = ((env.get("from") or {}).get("addr") or "").lower()
-        if addr != want_addr:
-            continue
-        edt = _parse_himalaya_date(env.get("date") or "")
-        if want_dt is None or edt is None:
-            continue
-        if edt.astimezone(datetime.timezone.utc).replace(second=0) == want_dt.replace(second=0):
-            matches.append(env["id"])
-    if len(matches) == 1:
-        return matches[0]
-    raise FatalError(
-        f"himalaya id resolution for {member['message_id']!r} in "
-        f"{member['folder']!r}: {len(matches)} matches by from+date "
-        f"({want_addr}, {member['date_utc']}) -- "
-        + ("ambiguous; act on it manually" if matches else
-           "not found; run the indexer / sync and retry"))
 
 
 # --------------------------------------------------------------------------
@@ -1768,28 +1714,21 @@ def cmd_edit_draft(args: argparse.Namespace) -> None:
         tmp.write(msg.as_bytes(policy=email.policy.default.clone(linesep="\n")))
         tmp_path = tmp.name
     try:
-        # On STDIN, never as an argument: the argument form silently saves an
-        # EMPTY message, and passing neither hangs. Both cost a live session.
+        # On STDIN: v1's argument form silently saved an EMPTY message, and v2
+        # reads an argument as a path or an inline raw message -- stdin is the
+        # one unambiguous form. Flags ride the same call (v2 `add --flag`), so
+        # there is no id to resolve afterwards.
         import subprocess
         with open(tmp_path, "rb") as fh:
             proc = subprocess.run(
-                [args.himalaya, "message", "save", "-a", hima_account,
-                 "-f", folder],
+                [args.himalaya, "message", "add", "-a", hima_account,
+                 "-m", folder, "-f", "draft", "-f", "seen", "--json"],
                 stdin=fh, capture_output=True, text=True)
         if proc.returncode != 0:
-            raise FatalError("himalaya message save failed: "
+            raise FatalError("himalaya message add failed: "
                              f"{(proc.stderr or proc.stdout).strip()[:300]}")
     finally:
         os.unlink(tmp_path)
-
-    # Resolve the NEW draft's id fresh -- himalaya ids are positional and the
-    # save just shifted them.
-    member = {"folder": folder, "from_addr": _first_addr(msg.get("From", "")),
-              "date_utc": _to_index_date(msg["Date"]),
-              "message_id": new_id}
-    hid = resolve_himalaya_id(args.himalaya, hima_account, member)
-    _himalaya(args.himalaya, "flag", "add", "-a", hima_account, "-f", folder,
-              str(hid), "draft", "seen")
 
     verified, new_file = _verify_saved_draft(args.maildir, args.account, folder,
                                             new_id, args.replace)
@@ -1806,14 +1745,6 @@ def cmd_edit_draft(args: argparse.Namespace) -> None:
 
 def _first_addr(value: str) -> str:
     return email.utils.parseaddr(value)[1] or value
-
-
-def _to_index_date(value: str):
-    try:
-        dt = email.utils.parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _verify_saved_draft(maildir_root, account, folder, new_id, replacements):
@@ -1851,19 +1782,28 @@ def cmd_flag(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         members = load_account_members(conn, args.account)
+        # (message_id, folder) -> maildir_key, for every row flag might touch.
+        keys = {(mid, folder): key for mid, folder, key in conn.execute(
+            "SELECT message_id, folder, maildir_key FROM envelopes WHERE account = ?",
+            (args.account,))}
     finally:
         conn.close()
     if args.message_id not in members:
         raise FatalError(f"unknown message-id for account {args.account!r}: {args.message_id}")
-    hima_account = args.himalaya_account or f"{args.account}-local"
     actions = []
 
     def op(member, verb, flag):
-        hid = resolve_himalaya_id(args.himalaya, hima_account, member)
-        _himalaya(args.himalaya, "flag", verb, "-a", hima_account,
-                  "-f", member["folder"], hid, flag)
-        actions.append({"message_id": member["message_id"], "folder": member["folder"],
-                        "himalaya_id": hid, "op": f"{verb} {flag}"})
+        folder = member["folder"]
+        # Resolve-before-act, as act.py does for moves: index key -> the file
+        # currently on disk. A flag write is a suffix-only rename (U= kept).
+        try:
+            new_file = act.flag_one(str(args.maildir), folder,
+                                    keys[(member["message_id"], folder)],
+                                    **{verb: act.FLAG_LETTERS[flag]})
+        except act.FatalError as e:
+            raise FatalError(str(e)) from e
+        actions.append({"message_id": member["message_id"], "folder": folder,
+                        "file": new_file, "op": f"{verb} {flag}"})
 
     if args.mode == "seen":
         op(members[args.message_id], "add", "seen")
@@ -2101,7 +2041,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     flag_p = sub.add_parser(
         "flag",
-        help="mechanized himalaya-local flag ops: --seen one message, or "
+        help="mechanized local Maildir flag ops: --seen one message, or "
              "--block/--unblock = rule 2's thread-wide clear-then-set",
     )
     flag_p.add_argument("--db", type=Path, default=None, help="index.db; default <data-dir>/index.db")
@@ -2115,9 +2055,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="thread needs the user's reply: clear \\Flagged everywhere, set it on the latest state-eligible member")
     mode.add_argument("--unblock", dest="mode", action="store_const", const="unblock",
                       help="clear \\Flagged from every member")
-    flag_p.add_argument("--himalaya", default="himalaya", help="himalaya binary (tests override)")
-    flag_p.add_argument("--himalaya-account", default=None,
-                        help="himalaya account name; default <account>-local")
+    flag_p.add_argument("--maildir", type=Path, default=None,
+                        help="the account's Maildir root; default <data-dir>/mail/<account>")
     flag_p.add_argument("--mbsyncrc", default=os.path.expanduser("~/.config/isync/mbsyncrc"),
                         help="mbsync config (never auto-discovered)")
     flag_p.add_argument("--mbsync", default="mbsync", help="mbsync binary (tests override)")

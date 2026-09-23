@@ -645,24 +645,10 @@ class TrustLayerTests(ThreadsTestCaseFixture):
         self.assertNotEqual(first, self.trust["nonce"])
 
 
-HIMALAYA_STUB = """#!/usr/bin/env python3
-import json, os, sys
-args = sys.argv[1:]
-with open(os.environ["HIMA_LOG"], "a") as f:
-    f.write(" ".join(args) + "\\n")
-if args and args[0] == "envelope":
-    folder = args[args.index("-f") + 1]
-    data = json.load(open(os.environ["HIMA_DATA"]))
-    print(json.dumps(data.get(folder, [])))
-else:
-    print("Flag(s) ok")
-"""
-
-
 class FlagCommandTests(unittest.TestCase):
-    """threads.py flag (R2): stubbed himalaya; asserts the resolution
-    matching (from_addr + minute-precision date, no message_id field) and
-    rule 2's thread-wide clear-then-set order."""
+    """threads.py flag (R2): a real Maildir tree; asserts rule 2's
+    thread-wide clear-then-set order and that every write is a suffix-only
+    rename (mbsync's U= token kept in place)."""
 
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
@@ -671,13 +657,7 @@ class FlagCommandTests(unittest.TestCase):
         self.conn = indexer.init_db(self.db_path)
         self.addCleanup(self.conn.close)
         self.addCleanup(self._tmpdir.cleanup)
-        self.hima = tmp / "himalaya-stub"
-        self.hima.write_text(HIMALAYA_STUB)
-        self.hima.chmod(0o755)
-        self.hima_log = tmp / "hima.log"
-        self.hima_data = tmp / "hima-data.json"
-        os.environ["HIMA_LOG"] = str(self.hima_log)
-        os.environ["HIMA_DATA"] = str(self.hima_data)
+        self.maildir = tmp / "mail"
         self.mbsync_log = tmp / "mbsync.log"
         self.mbsync = tmp / "mbsync-stub"
         self.mbsync.write_text(
@@ -690,8 +670,16 @@ class FlagCommandTests(unittest.TestCase):
         self.mbsync_fail.chmod(0o755)
         os.environ["MBSYNC_LOG"] = str(self.mbsync_log)
 
-    def insert(self, **kw):
+    def insert(self, *, sub="cur", suffix=":2,", **kw):
+        """Index row plus its file on disk, named the way mbsync names it."""
+        kw.setdefault("maildir_key", f"{kw['message_id']}.host,U=1")
         ThreadsTestCaseFixture.insert(self, **kw)
+        make_maildir_folder(self.maildir, kw["folder"])
+        (self.maildir / kw["folder"] / sub / (kw["maildir_key"] + suffix)).write_text("x")
+
+    def files(self, folder):
+        return sorted(str(p.relative_to(self.maildir / folder))
+                      for p in (self.maildir / folder).rglob("*") if p.is_file())
 
     def run_flag(self, message_id, mode, *extra, mbsync=None):
         """Always passes a stub mbsync and a /dev/null mbsyncrc. `flag` pushes
@@ -701,7 +689,7 @@ class FlagCommandTests(unittest.TestCase):
         args = parser.parse_args([
             "flag", "--db", str(self.db_path), "--account", "ic",
             "--message-id", message_id, f"--{mode}",
-            "--himalaya", str(self.hima),
+            "--maildir", str(self.maildir),
             "--mbsync", str(mbsync or self.mbsync), "--mbsyncrc", "/dev/null",
             *extra])
         buf = io.StringIO()
@@ -713,35 +701,43 @@ class FlagCommandTests(unittest.TestCase):
         # A flagged in Active (stale flag), B latest in INBOX unflagged.
         self.insert(message_id="A", folder="Active", folder_tier="active", account="ic",
                     subject="Quote", from_addr="a@x.com", date_utc="2026-07-10T10:00:23Z",
-                    is_flagged=1, flags=["Flagged", "Seen"])
+                    is_flagged=1, flags=["Flagged", "Seen"], suffix=":2,FS")
         self.insert(message_id="B", folder="INBOX", folder_tier="untriaged", account="ic",
                     in_reply_to="A", subject="Re: Quote", from_addr="b@x.com",
                     date_utc="2026-07-18T09:30:11Z")
-        json.dump({
-            "Active": [{"id": "4", "from": {"addr": "a@x.com"}, "date": "2026-07-10 10:00+00:00"}],
-            "INBOX": [
-                {"id": "9", "from": {"addr": "b@x.com"}, "date": "2026-07-18 09:30+00:00"},
-                {"id": "10", "from": {"addr": "other@x.com"}, "date": "2026-07-18 09:30+00:00"},
-            ],
-        }, open(self.hima_data, "w"))
         out = self.run_flag("A", "block")
         self.assertEqual([a["op"] for a in out["actions"]],
                          ["remove flagged", "add flagged"])
-        self.assertEqual(out["actions"][0]["himalaya_id"], "4")   # cleared in Active
-        self.assertEqual(out["actions"][1]["himalaya_id"], "9")   # set on latest, INBOX
-        log = self.hima_log.read_text()
-        self.assertIn("flag remove -a ic-local -f Active 4 flagged", log)
-        self.assertIn("flag add -a ic-local -f INBOX 9 flagged", log)
+        self.assertEqual(out["actions"][0]["file"], "A.host,U=1:2,S")   # cleared in Active
+        self.assertEqual(out["actions"][1]["file"], "B.host,U=1:2,F")   # set on latest, INBOX
+        self.assertEqual(self.files("Active"), ["cur/A.host,U=1:2,S"])
+        self.assertEqual(self.files("INBOX"), ["cur/B.host,U=1:2,F"])
 
     def test_seen_marks_single_message(self):
         self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Note", from_addr="a@x.com", date_utc="2026-07-18T09:30:59Z")
-        json.dump({"INBOX": [{"id": "3", "from": {"addr": "a@x.com"},
-                              "date": "2026-07-18 09:30+00:00"}]},
-                  open(self.hima_data, "w"))
         out = self.run_flag("A", "seen")
         self.assertEqual(out["actions"], [{"message_id": "A", "folder": "INBOX",
-                                           "himalaya_id": "3", "op": "add seen"}])
+                                           "file": "A.host,U=1:2,S", "op": "add seen"}])
+
+    def test_seen_on_a_new_message_moves_it_to_cur(self):
+        """Unread mail from mbsync sits in new/ with no info section. himalaya
+        v2.1.0's flag commands report success there and change nothing
+        (2026-09-22), which is why this path no longer goes through himalaya."""
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
+                    subject="Note", from_addr="a@x.com", date_utc="2026-07-18T09:30:59Z",
+                    sub="new", suffix="")
+        self.run_flag("A", "seen", "--no-sync")
+        self.assertEqual(self.files("INBOX"), ["cur/A.host,U=1:2,S"])
+
+    def test_flag_letters_stay_sorted_and_writes_are_idempotent(self):
+        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
+                    subject="Note", from_addr="a@x.com", date_utc="2026-07-18T09:30:59Z",
+                    suffix=":2,RS")
+        self.run_flag("A", "block", "--no-sync")
+        self.assertEqual(self.files("INBOX"), ["cur/A.host,U=1:2,FRS"])
+        self.run_flag("A", "seen", "--no-sync")
+        self.assertEqual(self.files("INBOX"), ["cur/A.host,U=1:2,FRS"])
 
     # -- the push (2026-08-10): a flag write is not done until it reaches the
     # server, the same invariant $BATCH run carries. It used to be a hand-typed
@@ -751,14 +747,10 @@ class FlagCommandTests(unittest.TestCase):
     def two_member_thread(self):
         self.insert(message_id="A", folder="Active", folder_tier="active", account="ic",
                     subject="Quote", from_addr="a@x.com", date_utc="2026-07-10T10:00:23Z",
-                    is_flagged=1, flags=["Flagged", "Seen"])
+                    is_flagged=1, flags=["Flagged", "Seen"], suffix=":2,FS")
         self.insert(message_id="B", folder="INBOX", folder_tier="untriaged", account="ic",
                     in_reply_to="A", subject="Re: Quote", from_addr="b@x.com",
                     date_utc="2026-07-18T09:30:11Z")
-        json.dump({
-            "Active": [{"id": "4", "from": {"addr": "a@x.com"}, "date": "2026-07-10 10:00+00:00"}],
-            "INBOX": [{"id": "9", "from": {"addr": "b@x.com"}, "date": "2026-07-18 09:30+00:00"}],
-        }, open(self.hima_data, "w"))
 
     def test_push_covers_exactly_the_folders_touched(self):
         self.two_member_thread()
@@ -786,9 +778,6 @@ class FlagCommandTests(unittest.TestCase):
         self.insert(message_id="A", folder="INBOX", folder_tier="untriaged",
                     account="ic", subject="Note", from_addr="a@x.com",
                     date_utc="2026-07-18T09:30:59Z")
-        json.dump({"INBOX": [{"id": "3", "from": {"addr": "a@x.com"},
-                              "date": "2026-07-18 09:30+00:00"}]},
-                  open(self.hima_data, "w"))
         out = self.run_flag("A", "unblock")
         self.assertEqual(out["actions"], [])
         self.assertNotIn("sync", out)
@@ -802,24 +791,13 @@ class FlagCommandTests(unittest.TestCase):
         self.assertIn("sync.stderr", out["_trust"]["untrusted_fields"])
         self.assertIn("&lt;b&gt;", out["sync"][0]["stderr"])
 
-    def test_resolution_ambiguity_is_a_hard_error(self):
+    def test_file_gone_from_disk_says_reindex(self):
         self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
                     subject="Note", from_addr="a@x.com", date_utc="2026-07-18T09:30:00Z")
-        json.dump({"INBOX": [
-            {"id": "3", "from": {"addr": "a@x.com"}, "date": "2026-07-18 09:30+00:00"},
-            {"id": "4", "from": {"addr": "a@x.com"}, "date": "2026-07-18 09:30+00:00"},
-        ]}, open(self.hima_data, "w"))
+        (self.maildir / "INBOX" / "cur" / "A.host,U=1:2,").unlink()
         with self.assertRaises(threads.FatalError) as cm:
             self.run_flag("A", "seen")
-        self.assertIn("2 matches", str(cm.exception))
-
-    def test_resolution_not_found_says_resync(self):
-        self.insert(message_id="A", folder="INBOX", folder_tier="untriaged", account="ic",
-                    subject="Note", from_addr="a@x.com", date_utc="2026-07-18T09:30:00Z")
-        json.dump({"INBOX": []}, open(self.hima_data, "w"))
-        with self.assertRaises(threads.FatalError) as cm:
-            self.run_flag("A", "seen")
-        self.assertIn("not found", str(cm.exception))
+        self.assertIn("run the indexer", str(cm.exception))
 
 
 def make_maildir_folder(root, folder):
@@ -1881,46 +1859,33 @@ class ReadNoQuotesTests(ReadFixture):
 
 
 HIMALAYA_DRAFT_STUB = """#!/usr/bin/env python3
-import datetime, email, email.policy, email.utils, json, os, pathlib, sys
+import json, os, pathlib, sys
 args = sys.argv[1:]
 with open(os.environ["HIMA_LOG"], "a") as f:
     f.write(" ".join(args) + chr(10))
-def folder_of():
-    return args[args.index("-f") + 1]
-def load():
-    p = os.environ["HIMA_DATA"]
-    return json.load(open(p)) if os.path.exists(p) else {}
-if args[:2] == ["message", "save"]:
+if args[:2] == ["message", "add"]:
     raw = sys.stdin.buffer.read()
     with open(os.environ["HIMA_LOG"], "a") as f:
         f.write("STDIN_BYTES=%d" % len(raw) + chr(10))
-    msg = email.message_from_bytes(raw, policy=email.policy.default)
-    d = pathlib.Path(os.environ["HIMA_MAILDIR"]) / folder_of() / "cur"
+    letters = {"draft": "D", "seen": "S", "flagged": "F", "answered": "R"}
+    flags = "".join(sorted(letters[args[i + 1]] for i, a in enumerate(args)
+                           if a == "-f"))
+    d = pathlib.Path(os.environ["HIMA_MAILDIR"]) / args[args.index("-m") + 1] / "cur"
     d.mkdir(parents=True, exist_ok=True)
     n = len(list(d.iterdir())) + 1
-    (d / ("saved%d:2,D" % n)).write_bytes(raw)
-    data = load()
-    dt = email.utils.parsedate_to_datetime(msg["Date"]).astimezone(
-        datetime.timezone.utc)
-    data.setdefault(folder_of(), []).append(
-        {"id": str(100 + n),
-         "from": {"addr": email.utils.parseaddr(msg["From"])[1]},
-         "date": dt.strftime("%Y-%m-%d %H:%M+00:00")})
-    json.dump(data, open(os.environ["HIMA_DATA"], "w"))
-    print("saved")
-elif args and args[0] == "envelope":
-    print(json.dumps(load().get(folder_of(), [])))
+    (d / ("saved%d:2,%s" % (n, flags))).write_bytes(raw)
+    print(json.dumps({"id": "saved%d" % n, "sent": False}))
 else:
-    print("ok")
+    sys.exit("unexpected himalaya call: " + " ".join(args))
 """
 
 
 class EditDraftTests(unittest.TestCase):
     """Phase 11.3 — guarded draft mutation.
 
-    The stub genuinely simulates `message save`: it reads STDIN, writes the
-    message into the Maildir, and registers an envelope so id resolution can find
-    it. A stub that just printed "ok" would let the two properties that matter
+    The stub genuinely simulates v2's `message add`: it reads STDIN and writes
+    the message into the Maildir with the flags it was given. A stub that just
+    printed "ok" would let the two properties that matter
     most -- the save happened on stdin, and the saved copy verifies -- pass
     without being true."""
 
@@ -1940,7 +1905,6 @@ class EditDraftTests(unittest.TestCase):
         self.hima.chmod(0o755)
         self.log = tmp / "hima.log"
         os.environ["HIMA_LOG"] = str(self.log)
-        os.environ["HIMA_DATA"] = str(tmp / "hima-data.json")
         os.environ["HIMA_MAILDIR"] = str(self.maildir)
 
     def put_draft(self, plain=None, html=None, key="d1",
@@ -2051,20 +2015,21 @@ class EditDraftTests(unittest.TestCase):
         mid = self.put_draft(plain="see you on Tuesday")
         self.edit(mid, [("Tuesday", "Thursday")])
         log = self.log.read_text()
-        self.assertIn("message save", log)
+        self.assertIn("message add", log)
         sizes = [int(l.split("=")[1]) for l in log.splitlines()
                  if l.startswith("STDIN_BYTES=")]
         self.assertEqual(len(sizes), 1)
         self.assertGreater(sizes[0], 50)
 
     def test_draft_and_seen_flags_are_set_on_the_new_message(self):
+        """Set by the save itself (v2 `add --flag`): no second call, no id to
+        resolve in between."""
         mid = self.put_draft(plain="see you on Tuesday")
         self.edit(mid, [("Tuesday", "Thursday")])
-        flag_lines = [l for l in self.log.read_text().splitlines()
-                      if l.startswith("flag add")]
-        self.assertEqual(len(flag_lines), 1)
-        self.assertIn("draft", flag_lines[0])
-        self.assertIn("seen", flag_lines[0])
+        calls = [l for l in self.log.read_text().splitlines()
+                 if not l.startswith("STDIN_BYTES=")]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("saved2:2,DS", self.saved_files())
 
     def test_both_alternatives_are_edited_when_both_match(self):
         """A multipart/alternative whose branches disagree shows different text
