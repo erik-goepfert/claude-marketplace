@@ -1727,6 +1727,74 @@ our `strip_html` does NOT neutralize CSS-hidden text.
       `rules.predicate` vs `candidates.suggested_predicate` as the clearest
       pair, same kind of string, opposite direction, opposite treatment.
 
+- [ ] **6.11 `PreToolUse` hook — make the raw-file-read ban structural**
+      (added 2026-08-13, from the third live session; the user surfaced
+      Anthropic's "steering Claude Code" post, whose anti-pattern list states
+      that hard blocks must never be enforced by instructions alone). The
+      plugin currently ships **no hooks at all** — `plugin.json` and the skill,
+      nothing else.
+
+      **What this is NOT, stated first, because 6.8's whole purpose was to stop
+      over-claiming.** It does *not* reopen 6.8 and does *not* create a
+      capability boundary. Reach after a successful injection stays unbounded;
+      option 3 (read-only classification phase feeding a separate act step)
+      remains the only posture that changes that. A hook matches on tool-call
+      shape and cannot distinguish a legitimate batch from an injected one.
+
+      **What it does do — one narrow thing that is currently unguarded.** 6.8
+      closes with "the containment layer itself — which is script-side and
+      unaffected by any permission setting." That holds *only while sender
+      bytes arrive exclusively through the wrapping scripts*, and today nothing
+      guarantees that except rule 6's behavioural raw-file-read ban. One `Read`
+      against a Maildir path, or one `cat`/`head`/`grep`, bypasses containment
+      silently and leaves no trace. **That sentence in 6.8 is the claim this
+      task falsifies**, and a `PreToolUse` hook can convert it into something
+      structurally true.
+
+      Scope — deny (exit code 2), nothing else:
+      (a) `Read` whose `file_path` resolves under `<data-dir>/mail/`;
+      (b) `Bash` whose command references a path under `<data-dir>/mail/`;
+      (c) either tool targeting `suggestions.log_file` — rule 6 already names
+      it "the same bypass with a friendlier filename."
+
+      **Why this is not the two postures 6.8 declined** (the load-bearing
+      argument; if it fails, drop the task):
+      - vs `disallowed-tools`, *implemented then withdrawn*: that was
+        **per-turn**, covering roughly one turn in ten. A `PreToolUse` hook
+        fires on every matching call for the whole session — the exact
+        objection that killed option 2 does not apply.
+      - vs `permissions.deny`, *declined*: that is **global**, and `Read`/`Bash`
+        are needed in every other kind of session. Plugin hooks ship with the
+        plugin and apply where it applies.
+      - Neither of those could have expressed this rule anyway. The skill
+        *requires* `Read` (oversized tool-results) and `Bash` (every script
+        invocation); the constraint is on the **path**, not the tool, and only
+        a hook can discriminate that way.
+
+      Verify before building — 6.8's own discipline was to check viability
+      rather than assume it, after a malformed frontmatter value was found to
+      fail silently in the dangerous direction:
+      - Confirm the block signal, and that a blocked call surfaces to the model
+        as feedback rather than dying quietly. **A hook that fails open is
+        worse than no hook**, for the same reason the per-turn `disallowed-tools`
+        line was worse than nothing: two documents would cite it as backing
+        rule 6 up.
+      - Path comparison must resolve symlinks and `..` before matching, or it is
+        trivially evaded, and must key off `$EMAIL_TRIAGE_DATA_DIR` rather than a
+        hardcoded path.
+      - It must not block the scripts themselves — they read Maildir files by
+        design. Match the *tool call*, never the script's own file I/O.
+      - Decide and record the error posture explicitly: if the hook itself
+        errors, does the call proceed?
+
+      Doc consequences (runs last, like 6.10 — document what actually shipped).
+      Rule 6's "There is no capability boundary. This rule is the whole
+      control" becomes **narrower but still true**: no boundary on reach, one
+      structural guarantee on containment. SKILL 6.6 and `reference.md`
+      §Capability posture both need that correction, and 6.8 needs a forward
+      pointer to it. Resist any wording that lets either document lean harder
+      on this than it deserves.
+
 **Exit criteria (Phase 6).** All of — 6.9 excepted, since it is not
 security work and may be deferred to its own phase without affecting any
 of the below (if it *does* land here, criteria 1 and 3 must include its
@@ -1967,7 +2035,20 @@ local Maildir op with a direct file op, leaving himalaya invoked ONLY for
 reply/send.** Independent of Phase 6 (that wraps emit/read *output*; this
 changes act *paths*).
 
-- [ ] **7.1 Flags as direct Maildir renames.** Replace `$THR flag`'s
+**Status 2026-09-22 (BonrikPro migration).** Homebrew now ships himalaya
+v2.1.0 (the Air ran v1.2.0): new config schema, new command tree
+(`-m/--mailbox`, `--json`, `message add`, no `template`), and a Maildir bug —
+`flag add` on a message still in `new/` reports success and changes nothing,
+so `\Seen` could never land on unread mail. That forced 7.1 early. Branch
+`himalaya-v2` (uncommitted as of this note) holds 7.1 plus a stopgap v2 port
+of the remaining himalaya calls (`edit-draft` via v2 `message add`; the
+`~/.config/himalaya/config.toml` rewritten for v2, v1 kept as
+`config.toml.v1-backup`). 7.2–7.4 are next on the same branch.
+
+- [x] **7.1 Flags as direct Maildir renames.** *(Done 2026-09-22, branch
+      `himalaya-v2`: `act.flag_one` / `act.with_flags`; `$THR flag` takes
+      `--maildir`, output `actions[].file` replaces `himalaya_id`; tests
+      on a real Maildir tree incl. the `new/` → `cur/` case.)* Replace `$THR flag`'s
       himalaya path (`resolve_himalaya_id` + `envelope list` +
       `himalaya flag`) with a direct suffix rename on the message's file
       — reuse `act.resolve_current_file` (message-id → file), recompute
@@ -1976,8 +2057,11 @@ changes act *paths*).
       flag test drops its himalaya stub. Net code reduction.
 - [ ] **7.2 Draft-save as a direct Maildir write.** Replace
       `himalaya message save` with writing the RFC822 into the Drafts
-      folder's `new/` (fresh file, no `,U=` — mbsync-safe, the property
-      act.py relies on). Drops the stdin-only footgun. (The reply text it
+      folder's `cur/` as `<fresh-key>:2,DS` (fresh file, no `,U=` —
+      mbsync-safe, the property act.py relies on; `cur/` not `new/`,
+      because a file in `new/` carries no flags and a draft needs
+      `\Draft` + `\Seen`). LF line endings — v2 `message add` writes
+      CRLF, whose mbsync round-trip was never verified. Drops the stdin-only footgun. (The reply text it
       saves is still himalaya-assembled until Phase 8.1 — decoupled: this
       task only changes how the file is written.)
 - [ ] **7.3 Folder-create as `mkdir`.** Replace `himalaya folder create`
@@ -1996,6 +2080,15 @@ replaces it and removes the dependency entirely — the real 1.5
 (publish/second-machine) payoff: one fewer binary to install, one fewer
 config file, only `mbsync` + `python3` left as external tools. Should
 land before Phase 10 so the TUI is built on the final engine.
+
+**Interim (2026-09-22): reply/send from Apple Mail.** The v2 reply path
+works but `message reply` stamps the machine hostname into Message-ID
+(`<…@BonrikPro>`) with no config to change it — a privacy leak into every
+sent header and every reply's References. Rather than ship a hand-run
+header rewrite, SKILL's Reply section points to Apple Mail until 8.2 lands.
+8.1/8.2 generate the Message-ID from the From domain (as `edit-draft`
+already does via `make_msgid(domain=…)`), so the problem disappears with
+himalaya.
 
 **Send-tool decision (2026-07-24).** For send-only, himalaya (a Rust
 binary + a 4-account `config.toml`) is overkill. Ranked:
@@ -2709,3 +2802,152 @@ permanently understates reality and every rate derived from it is wrong.
 Deliberately narrow: one boolean, scoped to a session and an explicit sender
 list, idempotent, reporting rows changed. `query` stays read-only so arbitrary
 mutation of an irreplaceable DB is never one typo away.
+
+---
+
+## Phase 12 — Multi-machine operation & folder vocabulary (added 2026-09-10, from the third live session + the BonrikPro migration)
+
+Two unrelated items sharing one trigger: the skill is moving to BonrikPro (a
+headless M1 Pro) for continued development, and `history.db` is about to exist
+in two places for the first time.
+
+**Sequencing is load-bearing. 12.2 requires a schema migration on `history.db`,
+and 2.9 means nothing backs it up.** Do not run a migration on the single
+irreplaceable copy. Order: migrate → **2.9** → 12.2(a) → 12.2(b). 12.1 is
+independent and can land any time.
+
+- [ ] **12.1 Folder aliases — user vocabulary → real folder names.**
+      User request 2026-09-10: *"it'd be useful to have aliases for folders.
+      That folder name isn't an easy type. I'd much rather say 'move it to my
+      home folder'."* `Areas/W-141st-Ln` is the concrete offender.
+
+      This is the **existing `tiers:` pattern one level down.** Schema v2 maps
+      tier CONCEPTS (code) → folder names (config). Aliases map the USER'S
+      VOCABULARY → folder names. Same philosophy, same file:
+
+      ```yaml
+      folder_aliases:
+        home:     Areas/W-141st-Ln
+        receipts: Areas/Receipts
+        taxes:    Areas/Taxes
+      ```
+
+      Three constraints, in order of importance:
+
+      1. **Resolution belongs in the scripts, not in SKILL.md prose.**
+         `batch.py` already resolves `disposition: trash` → tier key → folder
+         via `resolve_disposition`; an `alias:` item key uses that identical
+         path. If aliases were only documentation, the model would still type
+         the literal string and could still get it wrong — the "never improvise
+         folder names" guarantee has to be enforced in code, exactly as
+         `disposition` already is.
+      2. **The approval gate must not get vaguer.** Rule 1 requires the ask to
+         name the resolved destination. So: alias in conversation, real folder
+         name in the approval line — *"move it to your home folder
+         (`Areas/W-141st-Ln`)?"* Never the alias alone. An alias that hides
+         which folder is about to receive mail is a regression, not a feature.
+      3. **Per-account with a shared default.** All three folders currently have
+         identical names in both accounts, so a top-level map covers today;
+         allow a per-account override for later divergence.
+
+      Bonus, and a real one: `Areas/W-141st-Ln` is named for a street address,
+      and the `receipt-filing` rule says its relevance "ends when the property
+      is sold." On a move the folder changes and the alias `home` repoints —
+      the rule text and every stored command keep working.
+
+- [ ] **12.2 Replace lock-only concurrency with liveness metadata + divergence
+      detection.** User proposal 2026-09-10: *"I wonder if there needs to be a
+      session lock. Better to have everything be transactional with a counter or
+      uuid on the db for every change. If a session notices a concurrent
+      modification it can fail the write and notify me."*
+
+      **Analysis — the lock and a counter guard different things; this is not
+      an either/or.**
+
+      The lock's real job is not protecting `history.db` from concurrent writes
+      (SQLite already does that). It is stopping two agents from triaging the
+      same mailbox at once, and the thing most at risk is the **Maildir/IMAP
+      side, which has no transactions at all**. `act.py` renames a file; mbsync
+      pushes it; there is no rollback. If session A trashes a message while
+      session B is mid-batch on the same thread, failing B's DB write does not
+      un-move the file. Optimistic concurrency on the DB detects the conflict
+      *after* the mailbox has already diverged — an accurate error about the DB
+      while the real damage is done. Worth having, weaker than it sounds.
+
+      **(a) Fix the lock's actual defect: it has no liveness information.**
+      Today `session.lock` is a bare `mkdir` containing nothing — no pid, no
+      host, no `session_started_at`, no heartbeat. Observed 2026-09-10: a lock
+      held **three days** across a context compaction. The next session gets
+      `lock: held` and cannot distinguish "someone is working right now" from "a
+      session died in July," which is precisely why SKILL step 1 tells the model
+      to *ask the user* — a human performing the liveness check the lock cannot
+      perform itself.
+      Write `{pid, host, session_started_at, heartbeat_at}` into the lock dir so
+      `start` can report *"held by pid 2417 on bonrikpro since 3 days ago; that
+      process is not running — break it?"* Small change, most of the benefit,
+      **no schema migration**, so it is not gated on 2.9.
+
+      **(b) Add what the lock structurally cannot cover: cross-machine
+      divergence.** Once `history.db` exists on the Air *and* BonrikPro, a local
+      lock is meaningless — neither machine can see the other's lock file. Both
+      can hold "the" lock and diverge silently. This is the case the user's idea
+      actually solves, and it is new as of the migration.
+      A `db_identity` uuid generated once at init, plus a monotonic
+      `change_counter` bumped on every write. A session records the counter it
+      observed at `start` and validates before writing. Two copies descending
+      from a common ancestor carry divergent counters and are detectable.
+
+      **State the ceiling honestly in the code and the docs: this gives
+      DETECTION, not RESOLUTION.** Merging two divergent `history.db` files is a
+      genuinely hard problem and nothing here solves it. The value is telling
+      the user the mailbox has two histories and stopping before it gets worse.
+      Any wording that implies otherwise is the same over-claiming failure 6.8
+      exists to prevent.
+
+**Exit criteria (Phase 12).**
+1. `12.1`: a `to_folder` given as an alias resolves in `batch.py` (not in prose),
+   an unknown alias is a hard error naming the valid set, and the approval line
+   in a live session shows the resolved folder name alongside the alias.
+2. `12.2(a)`: a lock whose recorded pid is not running is reported as stale, with
+   its age and host, and can be broken without the user having to reason about
+   it. A lock whose pid IS running is never auto-broken.
+3. `12.2(b)`: two copies of `history.db` edited independently are detected as
+   divergent on the next `session.py start`, and the session refuses to write.
+4. Neither item weakens rule 1: every destination is still named at approval
+   time, and no new autonomy is introduced.
+
+---
+
+## Phase 13 — Self-bootstrapping first run (added 2026-09-22, from the BonrikPro migration)
+
+Standing up the skill on a fresh machine needed a one-off wrapper,
+`first-sync.sh` (in the migration bundle, not in this repo), because the
+normal session flow has no notion of "nothing indexed yet". Pointed at an
+empty data dir it fails two ways:
+
+- **`$SES sync` can't finish an initial mirror.** It runs mbsync in the
+  foreground with one retry; a from-scratch Gmail pull (~3.1 GB) runs into
+  Gmail's ~2.5 GB/day IMAP download cap, fails both attempts, and the session
+  stops — the mirror needs more than one day and nothing expects that.
+- **The first `index --suggest-events` floods.** With no prior index, every
+  file already in a Sent folder looks like a new send, so it proposes a
+  `reply` event per message (~3,000 at cut time). Proposals, not writes — but
+  unusable, and a partial mirror makes it worse: whatever arrives on day two
+  looks "new" too.
+
+The skill should handle this itself, so a new machine needs only
+`install` + credentials + "start a session":
+
+- [ ] **13.1 Baseline mode in the indexer.** When `index.db` is new/empty (or
+      a `baseline_complete` marker is absent), `index` records a baseline and
+      `--suggest-events` returns nothing but says why — never a flood.
+      The marker is set only after every account's mirror is complete.
+- [ ] **13.2 Resumable initial mirror in `session.py`.** Detect a missing
+      or incomplete mirror (no mbsync state / no `baseline_complete`), run
+      the initial pull as its own resumable step, report progress per account,
+      and end the session cleanly on a quota/timeout failure with "resume
+      tomorrow" rather than treating it as a sync error.
+- [ ] **13.3 Retire `first-sync.sh`.** Once 13.1–13.2 land, the bootstrap
+      section of reference.md says: create the Keychain items, run a session.
+      Test: an empty data dir + stub mbsync that fails day one and succeeds
+      day two ends with a baseline and zero proposed events.
