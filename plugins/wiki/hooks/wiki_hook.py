@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Hooks for the wiki plugin.
 
     wiki_hook.py pre   PreToolUse: block Edit/Write into the iCloud vault or the
                        main repo; sync before any tool call that touches the wiki
-                       (throttled).
+                       (throttled); report recorded sync failures (once per
+                       session) so Claude tells Erik.
     wiki_hook.py stop  Stop: if the claude worktree has changes not yet on main,
                        kick off a sync in the background so they reach Obsidian.
 
@@ -13,31 +14,20 @@ Plugin hooks fire on every tool call in every session, so the common path --
 
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SYNC = os.path.join(PLUGIN_ROOT, "sync", "sync.sh")
-SYNC_MIN_INTERVAL = 60  # seconds between pre-access syncs
+sys.path.insert(0, os.path.join(PLUGIN_ROOT, "sync"))
+from config import Config  # noqa: E402
+
+SYNC = ["/usr/bin/python3", os.path.join(PLUGIN_ROOT, "sync", "sync.py")]
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
 
-def load_config():
-    """Parse config.sh's plain KEY="value" lines (only $HOME is expanded)."""
-    home = os.path.expanduser("~")
-    cfg = {}
-    with open(os.path.join(PLUGIN_ROOT, "config.sh")) as f:
-        for line in f:
-            m = re.match(r'^(\w+)="(.*)"\s*$', line.strip())
-            if m:
-                cfg[m.group(1)] = m.group(2).replace("$HOME", home)
-    return cfg
-
-
 def under(path, root):
-    path, root = os.path.realpath(path), os.path.realpath(root)
+    path, root = os.path.realpath(path), os.path.realpath(str(root))
     return path == root or path.startswith(root + os.sep)
 
 
@@ -53,7 +43,7 @@ def tool_paths(tool_input, cwd):
 
 
 def mentions(command, root):
-    home = os.path.expanduser("~")
+    root, home = str(root), os.path.expanduser("~")
     tilde = "~" + root[len(home):] if root.startswith(home) else root
     return root in command or tilde in command
 
@@ -61,7 +51,7 @@ def mentions(command, root):
 def pre(data, cfg):
     tool = data.get("tool_name", "")
     tool_input = data.get("tool_input") or {}
-    roots = [cfg["WIKI_MAIN"], cfg["WIKI_CLAUDE"], cfg["WIKI_ICLOUD"]]
+    roots = cfg.roots
 
     if tool == "Bash":
         command = tool_input.get("command", "")
@@ -70,10 +60,10 @@ def pre(data, cfg):
         paths = tool_paths(tool_input, data.get("cwd") or os.getcwd())
         if tool in WRITE_TOOLS:
             for p in paths:
-                for root, what in ((cfg["WIKI_ICLOUD"], "the iCloud vault"),
-                                   (cfg["WIKI_MAIN"], "the main wiki repo")):
+                for root, what in ((cfg.icloud, "the iCloud vault"),
+                                   (cfg.main, "the main wiki repo")):
                     if under(p, root):
-                        deny(f"Wiki edits go in {cfg['WIKI_CLAUDE']} (branch `claude`), "
+                        deny(f"Wiki edits go in {cfg.claude} (branch `claude`), "
                              f"never {what}. Make the same edit there; the sync "
                              f"propagates it.")
                         return
@@ -82,28 +72,58 @@ def pre(data, cfg):
     if not touches:
         return
 
-    stamp = os.path.join(cfg["WIKI_STATE_DIR"], "last-check")
+    notes = []
+    stamp = cfg.state_dir / "last-check"
     try:
-        if time.time() - os.path.getmtime(stamp) < SYNC_MIN_INTERVAL:
-            return
+        fresh = time.time() - os.path.getmtime(stamp) < cfg.sync_min_interval
+    except OSError:
+        fresh = False
+    if not fresh:
+        result = subprocess.run(SYNC, capture_output=True, text=True)
+        if result.returncode != 0:
+            notes.append(f"An on-demand wiki sync just failed (exit {result.returncode}), "
+                         f"so the wiki may be stale: {result.stderr.strip()}")
+
+    notes += unreported_failures(cfg, data.get("session_id", ""))
+    if notes:
+        context("\n".join(notes) + f"\nTell Erik about this now (log: {cfg.log}) "
+                "and offer to investigate it together. Don't try to fix it silently.")
+
+
+def unreported_failures(cfg, session_id):
+    """Recorded failures (sync.py's failed-<mode> files) this session hasn't seen."""
+    state = cfg.state_dir
+    found = []
+    for mode in ("timer", "ondemand"):
+        try:
+            with open(os.path.join(state, f"failed-{mode}")) as f:
+                found.append(f"[{mode}] {f.read().strip()}")
+        except OSError:
+            pass
+    if not found:
+        return []
+    key = session_id + "\n" + "\n".join(found)
+    seen = os.path.join(state, "reported")
+    try:
+        with open(seen) as f:
+            if f.read() == key:
+                return []
     except OSError:
         pass
-
-    result = subprocess.run([SYNC], capture_output=True, text=True)
-    if result.returncode != 0:
-        context(f"Wiki sync failed (exit {result.returncode}); the wiki may be stale. "
-                f"{result.stderr.strip()} See {cfg['WIKI_LOG']}.")
+    with open(seen, "w") as f:
+        f.write(key)
+    return ["The wiki sync has a recorded failure (cleared by that mode's next clean run):"] + found
 
 
 def stop(data, cfg):
     def git(*args):
-        return subprocess.run(["git", "-C", cfg["WIKI_CLAUDE"], *args],
+        return subprocess.run([cfg.git_bin, "-C", str(cfg.claude), *args],
                               capture_output=True, text=True).stdout.strip()
 
     pending = git("status", "--porcelain") or git("rev-list", "main..claude")
     if pending:
         # Detached: the user shouldn't wait on the sync at the end of a turn.
-        subprocess.Popen([SYNC], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        subprocess.Popen(SYNC, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
 
 
@@ -127,8 +147,8 @@ def main():
     # sync from within the sync.
     if os.environ.get("WIKI_SYNC_HEADLESS"):
         return
-    cfg = load_config()
-    if not os.path.isdir(cfg["WIKI_CLAUDE"]):
+    cfg = Config()
+    if not cfg.claude.is_dir():
         return  # not on the Mac (e.g. a cloud session)
     data = json.load(sys.stdin)
     {"pre": pre, "stop": stop}[sys.argv[1]](data, cfg)

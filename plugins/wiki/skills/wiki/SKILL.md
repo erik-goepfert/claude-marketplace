@@ -32,7 +32,7 @@ the phone. Git reconciles the two. Design and history:
 
 ## Syncing is automatic
 
-This plugin's hooks run `sync/sync.sh`:
+This plugin's hooks run `sync/sync.py`:
 
 - **Before you touch the wiki** (any tool call referencing a wiki path), at most
   once a minute, so you read the latest phone edits.
@@ -41,6 +41,39 @@ This plugin's hooks run `sync/sync.sh`:
 
 A launchd timer also runs it as a backstop. `/wiki-sync` runs it by hand.
 Don't run `git merge`/`git push` yourself; the sync owns those.
+
+## When the sync is failing
+
+Each sync mode records its last failure in
+`~/Library/Caches/wiki-sync/failed-timer` / `failed-ondemand` (cleared by that
+mode's next clean run). The pre-access hook reports them once per session.
+**When this skill loads, check yourself too:**
+
+```bash
+cat ~/Library/Caches/wiki-sync/failed-* 2>/dev/null
+```
+
+If anything is there, or a hook reports a failure: **tell Erik right away**,
+in plain words, with the recorded message. Then offer to investigate it
+together. Don't quietly work around it, and don't delete the failure files,
+locks or stuck processes on your own. Useful starting points:
+
+- `tail -50 ~/Library/Logs/wiki-sync.log` — every failure, deferral and
+  headless run is logged there; nothing-to-do runs are not.
+- `launchctl print gui/$(id -u)/com.erik-goepfert.wiki-sync` — whether the
+  timer is loaded, running, and its last exit code.
+- `ps ax | grep '[s]ync.py'` — a cycle that's stuck holding the lock.
+- **TIMED OUT on the iCloud vault** usually means macOS is waiting on a
+  privacy (TCC) prompt — for `git` (e.g. after `brew upgrade` replaced the
+  binary) or for `python3` (the timer runs Apple's `/usr/bin/python3`; a
+  macOS or Command Line Tools update can replace it). The failure message
+  names the program. Erik approves it on the Mac (Privacy & Security →
+  Files and Folders).
+- **Evicted iCloud placeholders** (`.Name.md.icloud`): the vault folder needs
+  "Keep Downloaded" in Finder. Never commit those deletions.
+
+While the sync is broken, reading the `claude` worktree may be stale, and your
+edits won't reach Obsidian; say so if it matters for what Erik asked.
 
 ## Committing your edits
 
