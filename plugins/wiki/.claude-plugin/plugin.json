@@ -1,0 +1,8 @@
+{
+  "name": "wiki",
+  "description": "Personal wiki shared by Claude (on the Mac) and Erik (in Obsidian on the phone): authoring rules, git conventions, and hooks that keep the claude/icloud/main worktrees synced on demand.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Erik Goepfert"
+  }
+}

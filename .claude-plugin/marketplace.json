@@ -11,6 +11,12 @@
       "source": "./plugins/email-triage",
       "description": "Claude-driven email maintenance for iCloud + Gmail: thread-centric triage over IMAP via himalaya, with a persistent history DB so sessions compound.",
       "version": "0.1.0"
+    },
+    {
+      "name": "wiki",
+      "source": "./plugins/wiki",
+      "description": "Personal wiki shared by Claude and Obsidian: authoring rules, git conventions, and on-demand sync hooks.",
+      "version": "0.1.0"
     }
   ]
 }
