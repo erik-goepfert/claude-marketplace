@@ -99,6 +99,13 @@ git -C ~/Source/wiki-claude commit -m "Add packing list to 'Japan trip'" --trail
   has open, which bypasses the `claude` worktree. Create and edit notes with
   normal file edits in `~/Source/wiki-claude`.
 - Filename = note title (`Japan trip.md`); link with `[[Japan trip]]`.
+- **No title heading.** Obsidian shows the filename as the note's title, so
+  don't start a note with `# Japan trip`; start with the content, and use
+  `##` for sections.
+- **Never hard-wrap prose.** Obsidian renders every newline as a line break,
+  so a paragraph wrapped at 80 columns shows up ragged on the phone. Write
+  each paragraph, list item and callout line as one long line. (This file
+  is wrapped because it's a skill, not a note.)
 - Keep properties (frontmatter) minimal; add them when they earn their place
   (`tags`, `aliases`, dates).
 - Prefer editing an existing note over creating a near-duplicate; search first.
