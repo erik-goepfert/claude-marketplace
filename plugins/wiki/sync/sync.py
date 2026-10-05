@@ -98,6 +98,7 @@ class Pending:
     claude: list      # changed paths in the claude worktree
     diverged: bool    # main/icloud/claude don't all point at one commit
     unpushed: list    # branches whose tip differs from origin's
+    main_tip: str     # main's commit when checked
 
     def anything(self):
         return bool(self.icloud or self.claude or self.diverged or self.unpushed)
@@ -178,7 +179,19 @@ class Sync:
         tips = {refs.get(f"refs/heads/{b}") for b in BRANCHES}
         unpushed = [b for b in BRANCHES
                     if refs.get(f"refs/heads/{b}") != refs.get(f"refs/remotes/origin/{b}")]
-        return Pending(icloud, claude, diverged=len(tips) != 1, unpushed=unpushed)
+        return Pending(icloud, claude, diverged=len(tips) != 1, unpushed=unpushed,
+                       main_tip=refs.get("refs/heads/main", ""))
+
+    def commits_missing_origin(self, since):
+        """New commits on main (since `since`) without a readable Origin: trailer."""
+        out = self.git(self.cfg.main, "log", "--format=%h%x00%(trailers:key=Origin,valueonly,separator=,)%x00%s",
+                       f"{since}..main", what="git log in the main repo")
+        missing = []
+        for line in out.splitlines():
+            sha, origin, subject = line.split("\0", 2)
+            if not origin.strip():
+                missing.append(f"{sha} {subject}")
+        return missing
 
     def icloud_stats(self, paths):
         """{path: (mtime, dataless)} for changed iCloud files that still exist
@@ -301,6 +314,11 @@ class Sync:
         after_stats = self.icloud_stats(after.icloud)
         left = sorted(p for p in after.icloud
                       if p in stats and p in after_stats and after_stats[p][0] == stats[p][0])
+        no_origin = self.commits_missing_origin(pending.main_tip)
+        if no_origin:
+            raise SyncFailure(
+                "headless run made commits on main without a readable `Origin:` trailer "
+                f"(see git-conventions.md, use --trailer): {'; '.join(no_origin[:5])}")
         if after.claude or after.diverged or after.unpushed or left:
             raise SyncFailure(
                 "headless run finished but left work undone (claude worktree dirty: "

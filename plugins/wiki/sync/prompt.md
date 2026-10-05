@@ -19,9 +19,11 @@ using only `git` commands:
    and an `Origin: icloud` trailer.
 2. In the `claude` worktree: same — `git add -A`, commit anything staged with
    an accurate message and an `Origin: claude` trailer.
-3. From the main repo, merge `icloud` into `main` with `--no-ff` if `icloud`
-   has commits `main` doesn't. Then merge `claude` into `main` with `--no-ff`
-   if `claude` has commits `main` doesn't.
+3. From the main repo, merge `icloud` into `main` if `icloud` has commits
+   `main` doesn't. Then merge `claude` into `main` if `claude` has commits
+   `main` doesn't. Make each merge exactly as the conventions below show:
+   `git merge --no-ff --no-commit <branch>`, then `git commit` with the
+   message and `--trailer "Origin: <branch>"`.
    - If a merge produces real conflicts, resolve them deliberately: read both
      sides of each conflicting hunk, merge the content with judgment (don't
      just pick one side blindly), stage the resolution, and finish the merge

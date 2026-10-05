@@ -24,12 +24,18 @@ from config import Config
 # worktrees, merge into main, fast-forward back, push.
 FAKE_CLAUDE_SYNC = """#!/bin/bash
 set -e
-for wt in "$FAKE_ICLOUD" "$FAKE_CLAUDE"; do
-  git -C "$wt" add -A
-  git -C "$wt" diff --cached --quiet || git -C "$wt" commit -qm "fake sync commit"
+commit_wt() {
+  git -C "$1" add -A
+  git -C "$1" diff --cached --quiet || git -C "$1" commit -qm "fake sync commit" --trailer "Origin: $2"
+}
+commit_wt "$FAKE_ICLOUD" icloud
+commit_wt "$FAKE_CLAUDE" claude
+for b in icloud claude; do
+  if [ -n "$(git rev-list main..$b)" ]; then
+    git merge -q --no-ff --no-commit $b >/dev/null
+    git commit -qm "Merge $b into main" --trailer "Origin: $b"
+  fi
 done
-git merge -q --no-ff icloud -m "Merge icloud into main" >/dev/null
-git merge -q --no-ff claude -m "Merge claude into main" >/dev/null
 git -C "$FAKE_ICLOUD" merge -q --ff-only main
 git -C "$FAKE_CLAUDE" merge -q --ff-only main
 git push -q origin main icloud claude 2>/dev/null
@@ -190,11 +196,34 @@ class SyncTest(unittest.TestCase):
     def test_uncommitted_phone_change_fails_postcheck(self):
         # Syncs everything except the iCloud worktree's changes.
         self.cfg.claude_bin = self.fake_claude(
-            FAKE_CLAUDE_SYNC.replace('for wt in "$FAKE_ICLOUD" "$FAKE_CLAUDE"', 'for wt in "$FAKE_CLAUDE"'),
+            FAKE_CLAUDE_SYNC.replace('commit_wt "$FAKE_ICLOUD" icloud\n', ''),
             "partial")
         self.phone_edit(age=600)
         self.assertEqual(self.run_sync(), 1)
         self.assertIn("phone changes uncommitted: Note.md", self.failure("ondemand"))
+
+    def test_merge_without_origin_trailer_fails_postcheck(self):
+        # The bug this guards against: Origin passed as a separate -m paragraph.
+        self.cfg.claude_bin = self.fake_claude(
+            FAKE_CLAUDE_SYNC.replace(
+                'git commit -qm "Merge $b into main" --trailer "Origin: $b"',
+                'git commit -qm "Merge $b into main" -m "Origin: $b" -m "Co-Authored-By: X <x@example.com>"'),
+            "notrailer")
+        self.phone_edit(age=600)
+        self.assertEqual(self.run_sync(), 1)
+        failure = self.failure("ondemand")
+        self.assertIn("without a readable `Origin:` trailer", failure)
+        self.assertIn("Merge icloud into main", failure)
+        self.assertNotIn("fake sync commit", failure)  # the content commit had it
+
+    def test_synced_commits_carry_origin(self):
+        self.phone_edit(age=600)
+        (self.cfg.claude / "New note.md").write_text("from claude\n")
+        self.assertEqual(self.run_sync(), 0)
+        out = subprocess.run(
+            ["git", "-C", str(self.cfg.main), "log", "--format=%(trailers:key=Origin,valueonly,separator=)",
+             "HEAD~2..HEAD"], capture_output=True, text=True, check=True).stdout.split()
+        self.assertEqual(sorted(out), ["claude", "claude", "icloud", "icloud"])
 
     def test_phone_edit_landing_mid_run_is_fine(self):
         self.cfg.claude_bin = self.fake_claude(
