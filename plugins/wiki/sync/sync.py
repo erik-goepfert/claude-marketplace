@@ -270,7 +270,7 @@ class Sync:
         pending = self.check_pending()
         self.stamp_file.touch()
         if not pending.anything():
-            return  # deliberately not logged (every 15 min + every hook)
+            return  # deliberately not logged (every 5 min + every hook)
 
         # Changed phone files whose contents iCloud hasn't downloaded can't be
         # read, so `git add` would fail on them. Wait (on demand) or defer.
