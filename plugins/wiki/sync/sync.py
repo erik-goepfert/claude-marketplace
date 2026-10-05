@@ -6,7 +6,8 @@ Called by the launchd timer (--timer), by the plugin's hooks, and by
 pushes to GitHub (design: erik-goepfert-private projects/wiki/README.md).
 
     1. Lock      -- one cycle at a time, however it was started.
-    2. Precheck  -- plain git, no model: is there anything to do at all?
+    2. Precheck  -- plain git, no model: is there anything to do at all? Are
+       the phone's changes fully downloaded by iCloud yet?
     3. Headless `claude -p` does the commits/merges/push, in dontAsk mode with
        only `Bash(git *)` pre-approved: any other tool call is denied, so note
        content can't steer it beyond git.
@@ -32,7 +33,6 @@ import contextlib
 import datetime
 import fcntl
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -45,8 +45,16 @@ from config import BRANCHES, Config  # noqa: E402
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
-# iCloud's "Optimize Mac Storage" replaces a note with `.Name.md.icloud`.
-EVICTED = re.compile(r"(^|/)\.[^/]+\.icloud$")
+# st_flags bit for a file whose contents iCloud hasn't downloaded: names and
+# metadata only, and reading it fails ("Resource deadlock avoided"). Happens
+# for a few seconds whenever a phone edit arrives (metadata first), and for
+# good when macOS offloads a file to save space. (stat.SF_DATALESS, which
+# Python only names from 3.13.)
+SF_DATALESS = 0x40000000
+
+
+def is_dataless(st):
+    return bool(st.st_flags & SF_DATALESS)
 
 
 class SyncFailure(Exception):
@@ -101,6 +109,7 @@ class Sync:
         self.fail_file = cfg.state_dir / f"failed-{mode}"
         self.stamp_file = cfg.state_dir / "last-check"
         self.lock_file = cfg.state_dir / "sync.lock"
+        self.dataless_since_file = cfg.state_dir / "dataless-since"
 
     # --- plumbing ------------------------------------------------------------
 
@@ -171,18 +180,57 @@ class Sync:
                     if refs.get(f"refs/heads/{b}") != refs.get(f"refs/remotes/origin/{b}")]
         return Pending(icloud, claude, diverged=len(tips) != 1, unpushed=unpushed)
 
-    def newest_mtime(self, paths):
-        """Newest modification time among changed iCloud files that still exist.
+    def icloud_stats(self, paths):
+        """{path: (mtime, dataless)} for changed iCloud files that still exist
+        (deleted ones are skipped). Metadata only -- works on dataless files.
         Read here, not via a `stat` child, so no extra program needs approval."""
-        newest = None
-        with self.deadline("reading modification times in the iCloud vault", "python3"):
+        stats = {}
+        with self.deadline("reading file metadata in the iCloud vault", "python3"):
             for p in paths:
                 try:
-                    m = (self.cfg.icloud / p).stat().st_mtime
+                    st = (self.cfg.icloud / p).stat()
                 except FileNotFoundError:
                     continue  # deleted on the phone
-                newest = m if newest is None else max(newest, m)
-        return newest
+                stats[p] = (st.st_mtime, is_dataless(st))
+        return stats
+
+    def wait_for_downloads(self, pending):
+        """Deal with changed iCloud files that are still dataless. Returns
+        (pending, stats) once none are, or None if the cycle should defer."""
+        stats = self.icloud_stats(pending.icloud)
+        give_up = time.monotonic() + (self.cfg.dataless_wait_seconds if self.mode == "ondemand" else 0)
+        while any(dataless for _, dataless in stats.values()):
+            if time.monotonic() >= give_up:
+                break
+            time.sleep(2)  # on demand: the caller wants it now; usually seconds
+            pending = self.check_pending()
+            stats = self.icloud_stats(pending.icloud)
+
+        stuck = sorted(p for p, (_, dataless) in stats.items() if dataless)
+        if not stuck:
+            with contextlib.suppress(FileNotFoundError):
+                self.dataless_since_file.unlink()
+            return pending, stats
+
+        # A few seconds is a phone edit arriving; for long, it's offloading.
+        try:
+            since = float(self.dataless_since_file.read_text())
+        except (FileNotFoundError, ValueError):
+            since = time.time()
+            self.dataless_since_file.write_text(str(since))
+        names = ", ".join(stuck[:5])
+        waited = time.time() - since
+        if waited > self.cfg.dataless_fail_seconds:
+            raise SyncFailure(
+                f"{len(stuck)} changed file(s) in the iCloud vault have had no downloaded contents "
+                f"for {waited / 60:.0f} min ({names}). iCloud isn't downloading them -- likely "
+                "offloaded to save space; set the vault folder to Keep Downloaded in Finder.")
+        self.log(f"deferred: iCloud still downloading {len(stuck)} file(s): {names}")
+        if self.mode == "ondemand":
+            print(f"wiki sync deferred: iCloud is still downloading {len(stuck)} phone-edited "
+                  f"file(s) ({names}), so the wiki may be missing the newest phone edits.",
+                  file=sys.stderr)
+        return None
 
     def run_headless(self):
         cfg = self.cfg
@@ -220,24 +268,25 @@ class Sync:
 
     def cycle(self):
         pending = self.check_pending()
-
-        # `git add -A` would commit an evicted note as deleted, and the deletion
-        # would propagate everywhere. Refuse until it's resolved.
-        evicted = [p for p in pending.icloud if EVICTED.search(p)]
-        if evicted:
-            raise SyncFailure("evicted iCloud placeholders in the vault (set the folder to "
-                              f"Keep Downloaded): {', '.join(evicted[:5])}")
-
         self.stamp_file.touch()
         if not pending.anything():
             return  # deliberately not logged (every 15 min + every hook)
 
+        # Changed phone files whose contents iCloud hasn't downloaded can't be
+        # read, so `git add` would fail on them. Wait (on demand) or defer.
+        stats = {}
+        if pending.icloud:
+            ready = self.wait_for_downloads(pending)
+            if ready is None:
+                return
+            pending, stats = ready
+
         # Quiet window: don't commit a note while it's still being typed on the
         # phone. Only files git sees as changed count, so Obsidian's ignored
         # UI-state churn can't hold the cycle off forever.
-        if self.mode == "timer" and pending.icloud:
-            newest = self.newest_mtime(pending.icloud)
-            if newest is not None and time.time() - newest < self.cfg.quiet_seconds:
+        if self.mode == "timer" and stats:
+            newest = max(mtime for mtime, _ in stats.values())
+            if time.time() - newest < self.cfg.quiet_seconds:
                 self.log(f"deferred: phone edits changed {time.time() - newest:.0f}s ago, "
                          "waiting for them to settle")
                 return
@@ -245,13 +294,18 @@ class Sync:
         self.run_headless()
 
         # The headless run can exit 0 having done nothing (e.g. a denied tool
-        # call it merely reported). `icloud` being dirty again is fine: a phone
-        # edit may have landed mid-run.
+        # call it merely reported).
         after = self.check_pending()
-        if after.claude or after.diverged or after.unpushed:
+        # Phone changes still uncommitted count only if untouched since we
+        # looked: a phone edit landing mid-run is fine, the next cycle takes it.
+        after_stats = self.icloud_stats(after.icloud)
+        left = sorted(p for p in after.icloud
+                      if p in stats and p in after_stats and after_stats[p][0] == stats[p][0])
+        if after.claude or after.diverged or after.unpushed or left:
             raise SyncFailure(
                 "headless run finished but left work undone (claude worktree dirty: "
-                f"{'yes' if after.claude else 'no'}; branches diverged: "
+                f"{'yes' if after.claude else 'no'}; phone changes uncommitted: "
+                f"{', '.join(left[:5]) or 'none'}; branches diverged: "
                 f"{'yes' if after.diverged else 'no'}; unpushed: "
                 f"{', '.join(after.unpushed) or 'none'}); see its output above in the log")
 

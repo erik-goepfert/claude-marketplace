@@ -83,6 +83,8 @@ def pre(data, cfg):
         if result.returncode != 0:
             notes.append(f"An on-demand wiki sync just failed (exit {result.returncode}), "
                          f"so the wiki may be stale: {result.stderr.strip()}")
+        elif result.stderr.strip():  # e.g. deferred: iCloud still downloading
+            notes.append(result.stderr.strip())
 
     notes += unreported_failures(cfg, data.get("session_id", ""))
     if notes:

@@ -31,6 +31,8 @@ class Config:
     git_timeout: float = 30          # any single precheck step (normally milliseconds)
     claude_timeout: float = 600      # the whole headless run (normally ~20 s)
     sync_min_interval: float = 60    # hook: seconds between pre-access syncs
+    dataless_wait_seconds: float = 30      # on demand: wait for iCloud to finish downloading
+    dataless_fail_seconds: float = 45 * 60  # still not downloaded after this: a failure
 
     extra_env: dict = field(default_factory=dict)  # tests only
 

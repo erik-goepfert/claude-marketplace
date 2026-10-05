@@ -6,13 +6,16 @@
 
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 import tempfile
 import textwrap
 import time
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 import sync
 from config import Config
@@ -145,11 +148,61 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(pending.diverged)
         self.assertEqual(pending.unpushed, [])
 
-    def test_evicted_placeholder_aborts(self):
-        (self.cfg.icloud / "Note.md").rename(self.cfg.icloud / ".Note.md.icloud")
-        self.assertEqual(self.run_sync(timer=True), 1)
-        self.assertIn("evicted", self.failure("timer"))
+    def test_timer_defers_while_icloud_downloads(self):
+        self.phone_edit(age=600)
+        with mock.patch("sync.is_dataless", return_value=True):
+            self.assertEqual(self.run_sync(timer=True), 0)
+        self.assertIn("still downloading 1 file(s): Note.md", self.log())
         self.assertNotIn("sync start", self.log())
+        self.assertTrue((self.cfg.state_dir / "dataless-since").exists())
+
+    def test_dataless_for_too_long_is_a_failure(self):
+        self.phone_edit(age=600)
+        self.cfg.state_dir.mkdir(parents=True)
+        (self.cfg.state_dir / "dataless-since").write_text(str(time.time() - 3600))
+        with mock.patch("sync.is_dataless", return_value=True):
+            self.assertEqual(self.run_sync(timer=True), 1)
+        self.assertIn("Keep Downloaded", self.failure("timer"))
+
+    def test_on_demand_waits_for_download_then_syncs(self):
+        self.phone_edit(age=0)
+        self.cfg.dataless_wait_seconds = 10
+        calls = []
+
+        def downloading_at_first(st):
+            calls.append(st)
+            return len(calls) == 1
+
+        with mock.patch("sync.is_dataless", side_effect=downloading_at_first):
+            self.assertEqual(self.run_sync(), 0)
+        self.assert_all_synced()
+        self.assertFalse((self.cfg.state_dir / "dataless-since").exists())
+
+    def test_on_demand_gives_up_waiting_and_says_so(self):
+        self.phone_edit(age=0)
+        self.cfg.dataless_wait_seconds = 1
+        err = io.StringIO()
+        with mock.patch("sync.is_dataless", return_value=True), redirect_stderr(err):
+            self.assertEqual(self.run_sync(), 0)
+        self.assertIn("still downloading", err.getvalue())
+        self.assertNotIn("sync start", self.log())
+
+    def test_uncommitted_phone_change_fails_postcheck(self):
+        # Syncs everything except the iCloud worktree's changes.
+        self.cfg.claude_bin = self.fake_claude(
+            FAKE_CLAUDE_SYNC.replace('for wt in "$FAKE_ICLOUD" "$FAKE_CLAUDE"', 'for wt in "$FAKE_CLAUDE"'),
+            "partial")
+        self.phone_edit(age=600)
+        self.assertEqual(self.run_sync(), 1)
+        self.assertIn("phone changes uncommitted: Note.md", self.failure("ondemand"))
+
+    def test_phone_edit_landing_mid_run_is_fine(self):
+        self.cfg.claude_bin = self.fake_claude(
+            FAKE_CLAUDE_SYNC + 'sleep 0.1; echo "typed during sync" >> "$FAKE_ICLOUD/Note.md"\n',
+            "racy")
+        self.phone_edit(age=600)
+        self.assertEqual(self.run_sync(), 0)
+        self.assertIsNone(self.failure("ondemand"))
 
     def test_headless_failure_is_recorded(self):
         self.cfg.claude_bin = self.fake_claude("#!/bin/bash\necho boom\nexit 3\n", "bad")
@@ -209,12 +262,6 @@ class ParseTest(unittest.TestCase):
     def test_porcelain_z(self):
         out = " M a.md\0?? dir/b c.md\0R  new.md\0old.md\0"
         self.assertEqual(sync.parse_porcelain_z(out), ["a.md", "dir/b c.md", "new.md"])
-
-    def test_evicted_pattern(self):
-        self.assertTrue(sync.EVICTED.search(".Note.md.icloud"))
-        self.assertTrue(sync.EVICTED.search("dir/.Japan trip.md.icloud"))
-        self.assertFalse(sync.EVICTED.search("Note.md"))
-        self.assertFalse(sync.EVICTED.search("notes.icloud"))
 
 
 if __name__ == "__main__":

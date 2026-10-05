@@ -69,8 +69,11 @@ locks or stuck processes on your own. Useful starting points:
   macOS or Command Line Tools update can replace it). The failure message
   names the program. Erik approves it on the Mac (Privacy & Security →
   Files and Folders).
-- **Evicted iCloud placeholders** (`.Name.md.icloud`): the vault folder needs
-  "Keep Downloaded" in Finder. Never commit those deletions.
+- **"deferred: iCloud still downloading"** is normal for a few seconds after
+  a phone edit (iCloud delivers metadata first; such *dataless* files can't
+  be read, `ls -lO` shows `dataless`). If it lasts 45 min it becomes a
+  failure: files are offloaded, and the vault folder needs "Keep
+  Downloaded" in Finder.
 
 While the sync is broken, reading the `claude` worktree may be stale, and your
 edits won't reach Obsidian; say so if it matters for what Erik asked.
