@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """Tests for sync.py: real temporary git repos, fake `claude`.
 
-    /usr/bin/python3 -m unittest discover -s plugins/wiki/sync -v
+    /usr/bin/python3 -m unittest discover -s plugins/personal-knowledge-base/sync -v
 """
 
 from __future__ import annotations

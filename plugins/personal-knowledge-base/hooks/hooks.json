@@ -1,5 +1,5 @@
 {
-  "description": "Wiki: block edits outside the claude worktree, sync before wiki access, sync after a turn that changed the wiki.",
+  "description": "Personal knowledge base: block edits outside the claude worktree, sync before access, sync after a turn that changed it.",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/wiki_hook.py\" pre",
+            "command": "/usr/bin/python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/personal_knowledge_base_hook.py\" pre",
             "timeout": 240
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/wiki_hook.py\" stop",
+            "command": "/usr/bin/python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/personal_knowledge_base_hook.py\" stop",
             "timeout": 30
           }
         ]

@@ -1,15 +1,16 @@
 #!/usr/bin/python3
-"""Hooks for the wiki plugin.
+"""Hooks for the personal-knowledge-base plugin.
 
-    wiki_hook.py pre   PreToolUse: block Edit/Write into the iCloud vault or the
-                       main repo; sync before any tool call that touches the wiki
-                       (throttled); report recorded sync failures (once per
-                       session) so Claude tells Erik.
-    wiki_hook.py stop  Stop: if the claude worktree has changes not yet on main,
-                       kick off a sync in the background so they reach Obsidian.
+    personal_knowledge_base_hook.py pre   PreToolUse: block Edit/Write into the
+                       iCloud vault or the main repo; sync before any tool call
+                       that touches the vault (throttled); report recorded sync
+                       failures (once per session) so Claude tells Erik.
+    personal_knowledge_base_hook.py stop  Stop: if the claude worktree has
+                       changes not yet on main, kick off a sync in the
+                       background so they reach Obsidian.
 
 Plugin hooks fire on every tool call in every session, so the common path --
-"this call has nothing to do with the wiki" -- must return fast and silently.
+"this call has nothing to do with the vault" -- must return fast and silently.
 """
 
 import json
@@ -61,9 +62,9 @@ def pre(data, cfg):
         if tool in WRITE_TOOLS:
             for p in paths:
                 for root, what in ((cfg.icloud, "the iCloud vault"),
-                                   (cfg.main, "the main wiki repo")):
+                                   (cfg.main, "the main repo")):
                     if under(p, root):
-                        deny(f"Wiki edits go in {cfg.claude} (branch `claude`), "
+                        deny(f"Edits go in {cfg.claude} (branch `claude`), "
                              f"never {what}. Make the same edit there; the sync "
                              f"propagates it.")
                         return
@@ -81,8 +82,8 @@ def pre(data, cfg):
     if not fresh:
         result = subprocess.run(SYNC, capture_output=True, text=True)
         if result.returncode != 0:
-            notes.append(f"An on-demand wiki sync just failed (exit {result.returncode}), "
-                         f"so the wiki may be stale: {result.stderr.strip()}")
+            notes.append(f"An on-demand sync just failed (exit {result.returncode}), "
+                         f"so the vault may be stale: {result.stderr.strip()}")
         elif result.stderr.strip():  # e.g. deferred: iCloud still downloading
             notes.append(result.stderr.strip())
 
@@ -114,7 +115,7 @@ def unreported_failures(cfg, session_id):
         pass
     with open(seen, "w") as f:
         f.write(key)
-    return ["The wiki sync has a recorded failure (cleared by that mode's next clean run):"] + found
+    return ["The sync has a recorded failure (cleared by that mode's next clean run):"] + found
 
 
 def stop(data, cfg):
@@ -147,7 +148,7 @@ def context(text):
 def main():
     # Inside the headless sync run, stand down: it would otherwise try to
     # sync from within the sync.
-    if os.environ.get("WIKI_SYNC_HEADLESS"):
+    if os.environ.get("PERSONAL_KNOWLEDGE_BASE_SYNC_HEADLESS"):
         return
     cfg = Config()
     if not cfg.claude.is_dir():

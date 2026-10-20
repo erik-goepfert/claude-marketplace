@@ -1,12 +1,13 @@
-You are running an unattended sync cycle for a personal wiki. Three git
-worktrees share one repo at `/Users/erik/Source/wiki`:
+You are running an unattended sync cycle for a personal knowledge base. Three
+git worktrees share one repo at `/Users/erik/Source/personal-knowledge-base`:
 
-- `/Users/erik/Source/wiki` — branch `main`, integration branch, pushed to
-  GitHub (`origin`).
-- `/Users/erik/Source/wiki-claude` — branch `claude`. Edits Claude made
-  directly land here between cycles (often already committed).
-- `/Users/erik/Library/Mobile Documents/iCloud~md~obsidian/Documents/wiki` —
-  branch `icloud`. Edits made on the phone in Obsidian arrive here via
+- `/Users/erik/Source/personal-knowledge-base` — branch `main`, integration
+  branch, pushed to GitHub (`origin`).
+- `/Users/erik/Source/personal-knowledge-base-claude` — branch `claude`.
+  Edits Claude made directly land here between cycles (often already
+  committed).
+- `/Users/erik/Library/Mobile Documents/iCloud~md~obsidian/Documents/personal-knowledge-base`
+  — branch `icloud`. Edits made on the phone in Obsidian arrive here via
   iCloud's own file sync between cycles.
 
 A shell precheck already confirmed there is something to do (uncommitted
@@ -39,11 +40,12 @@ using only `git` commands:
 
 Additional rules for this run:
 - Every Bash call must be exactly one plain `git` command that targets its
-  worktree with `-C`, e.g. `git -C "/Users/erik/Source/wiki-claude" add -A`.
+  worktree with `-C`, e.g.
+  `git -C "/Users/erik/Source/personal-knowledge-base-claude" add -A`.
   No `cd`, no `&&`/`;`/pipes, no command substitution: this run only has
   `git …` pre-approved, and anything else is denied outright.
 - Do not touch any files outside these three worktrees.
 - Do not install, upgrade, or run anything other than `git`.
 
-The wiki's git conventions follow; they apply to every commit and merge you
+The vault's git conventions follow; they apply to every commit and merge you
 make.

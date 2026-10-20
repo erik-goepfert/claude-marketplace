@@ -1,4 +1,4 @@
-"""Paths and limits shared by sync.py and hooks/wiki_hook.py.
+"""Paths and limits shared by sync.py and hooks/personal_knowledge_base_hook.py.
 
 Must stay compatible with Apple's /usr/bin/python3 (3.9): the launchd timer
 runs on it, so macOS privacy approvals attach to a binary that Homebrew
@@ -16,12 +16,12 @@ BRANCHES = ("main", "icloud", "claude")
 
 @dataclass
 class Config:
-    main: Path = HOME / "Source/wiki"
-    claude: Path = HOME / "Source/wiki-claude"
-    icloud: Path = HOME / "Library/Mobile Documents/iCloud~md~obsidian/Documents/wiki"
+    main: Path = HOME / "Source/personal-knowledge-base"
+    claude: Path = HOME / "Source/personal-knowledge-base-claude"
+    icloud: Path = HOME / "Library/Mobile Documents/iCloud~md~obsidian/Documents/personal-knowledge-base"
 
-    log: Path = HOME / "Library/Logs/wiki-sync.log"
-    state_dir: Path = HOME / "Library/Caches/wiki-sync"
+    log: Path = HOME / "Library/Logs/personal-knowledge-base-sync.log"
+    state_dir: Path = HOME / "Library/Caches/personal-knowledge-base-sync"
 
     git_bin: str = "git"
     claude_bin: str = str(HOME / ".local/bin/claude")

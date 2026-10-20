@@ -13,9 +13,9 @@
       "version": "0.1.0"
     },
     {
-      "name": "wiki",
-      "source": "./plugins/wiki",
-      "description": "Personal wiki shared by Claude and Obsidian: authoring rules, git conventions, and on-demand sync hooks.",
+      "name": "personal-knowledge-base",
+      "source": "./plugins/personal-knowledge-base",
+      "description": "Personal knowledge base shared by Claude and Obsidian: authoring rules, git conventions, and on-demand sync hooks.",
       "version": "0.1.0"
     }
   ]

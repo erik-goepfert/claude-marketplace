@@ -1,13 +1,14 @@
-# Wiki git conventions
+# Personal knowledge base git conventions
 
-Shared by interactive sessions (via the `wiki` skill) and the headless sync
-run (appended to its prompt). One copy, so the two can't drift apart.
+Shared by interactive sessions (via the `personal-knowledge-base` skill) and
+the headless sync run (appended to its prompt). One copy, so the two can't
+drift apart.
 
 ## Branches
 
 - `main` — integration branch, the source of truth, pushed to GitHub.
 - `icloud` — the Obsidian vault in iCloud Drive; phone edits land here.
-- `claude` — `~/Source/wiki-claude`; the only place Claude edits.
+- `claude` — `~/Source/personal-knowledge-base-claude`; the only place Claude edits.
 
 `icloud` and `claude` never merge into each other directly; everything goes
 through `main`.
@@ -51,4 +52,4 @@ through `main`.
 No `rebase`, `commit --amend`, `push --force`/`--force-with-lease`, or
 `reset --hard`. Mistakes get fixed with a revert commit. Rewriting one branch
 would strand commits the other worktrees already hold, and the history is the
-wiki's journal of who wrote what, when.
+vault's journal of who wrote what, when.

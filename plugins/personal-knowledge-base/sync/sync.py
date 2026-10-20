@@ -1,9 +1,10 @@
 #!/usr/bin/python3
-"""One wiki sync cycle -- the single entry point.
+"""One personal-knowledge-base sync cycle -- the single entry point.
 
 Called by the launchd timer (--timer), by the plugin's hooks, and by
-/wiki-sync. Reconciles the `icloud` and `claude` worktrees through `main` and
-pushes to GitHub (design: erik-goepfert-private projects/wiki/README.md).
+/personal-knowledge-base-sync. Reconciles the `icloud` and `claude` worktrees
+through `main` and pushes to GitHub (design: erik-goepfert-private
+projects/personal-knowledge-base/README.md).
 
     1. Lock      -- one cycle at a time, however it was started.
     2. Precheck  -- plain git, no model: is there anything to do at all? Are
@@ -240,18 +241,18 @@ class Sync:
                 "offloaded to save space; set the vault folder to Keep Downloaded in Finder.")
         self.log(f"deferred: iCloud still downloading {len(stuck)} file(s): {names}")
         if self.mode == "ondemand":
-            print(f"wiki sync deferred: iCloud is still downloading {len(stuck)} phone-edited "
-                  f"file(s) ({names}), so the wiki may be missing the newest phone edits.",
+            print(f"sync deferred: iCloud is still downloading {len(stuck)} phone-edited "
+                  f"file(s) ({names}), so the vault may be missing the newest phone edits.",
                   file=sys.stderr)
         return None
 
     def run_headless(self):
         cfg = self.cfg
         prompt = ((PLUGIN_ROOT / "sync/prompt.md").read_text(encoding="utf-8") + "\n\n"
-                  + (PLUGIN_ROOT / "skills/wiki/git-conventions.md").read_text(encoding="utf-8"))
-        # WIKI_SYNC_HEADLESS: this plugin's hooks stand down inside the run
-        # (otherwise they'd try to sync from within the sync).
-        env = dict(os.environ, WIKI_SYNC_HEADLESS="1", **cfg.extra_env)
+                  + (PLUGIN_ROOT / "skills/personal-knowledge-base/git-conventions.md").read_text(encoding="utf-8"))
+        # PERSONAL_KNOWLEDGE_BASE_SYNC_HEADLESS: this plugin's hooks stand down
+        # inside the run (otherwise they'd try to sync from within the sync).
+        env = dict(os.environ, PERSONAL_KNOWLEDGE_BASE_SYNC_HEADLESS="1", **cfg.extra_env)
         with open(cfg.log, "a", encoding="utf-8") as logf:
             logf.write(f"=== {timestamp()} [{self.mode}] sync start ===\n")
             logf.flush()
@@ -342,7 +343,7 @@ class Sync:
         except SyncFailure as e:
             self.log(f"FAILED: {e}")
             self.fail_file.write_text(f"{timestamp()} {e}\n", encoding="utf-8")
-            print(f"wiki sync ({self.mode}) failed: {e} -- see {self.cfg.log}", file=sys.stderr)
+            print(f"sync ({self.mode}) failed: {e} -- see {self.cfg.log}", file=sys.stderr)
             return 1
         with contextlib.suppress(FileNotFoundError):
             self.fail_file.unlink()
