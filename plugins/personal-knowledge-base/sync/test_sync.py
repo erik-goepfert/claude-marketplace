@@ -71,6 +71,7 @@ class SyncTest(unittest.TestCase):
             main=main, claude=t / "claude", icloud=t / "icloud",
             log=t / "log", state_dir=t / "state",
             claude_bin=self.fake_claude(FAKE_CLAUDE_SYNC),
+            claude_live_symlink=t / "bin" / "no-such-live-claude-symlink",
             lock_wait_seconds=1, git_timeout=2, claude_timeout=5,
             extra_env={"FAKE_ICLOUD": str(t / "icloud"), "FAKE_CLAUDE": str(t / "claude")},
         )
@@ -106,6 +107,20 @@ class SyncTest(unittest.TestCase):
         p.write_text(text)
         t = time.time() - age
         os.utime(p, (t, t))
+
+    def seed_maintenance_note(self):
+        projects = self.cfg.claude / "Projects"
+        projects.mkdir(exist_ok=True)
+        note = projects / "Personal knowledge base setup.md"
+        note.write_text("Intro.\n\n## Maintenance\n\n- existing bullet\n\n## Vault setup\n\n- x\n")
+        return note
+
+    def set_live_claude(self, version):
+        target = self.t / "bin" / version
+        target.write_text("#!/bin/bash\n")
+        symlink = self.t / "bin" / "live-claude"
+        symlink.symlink_to(target)
+        self.cfg.claude_live_symlink = symlink
 
     def assert_all_synced(self):
         tips = {self.tip(r) for r in ("main", "icloud", "claude",
@@ -280,6 +295,29 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.run_sync(timer=True), 0)
         self.assertIsNone(self.failure("timer"))
         self.assertIsNotNone(self.failure("ondemand"))
+
+    def test_claude_version_pin_notices_update(self):
+        note = self.seed_maintenance_note()
+        self.set_live_claude("9.9.9")
+        self.assertEqual(self.run_sync(), 0)
+        text = note.read_text()
+        self.assertIn("Claude Code CLI updated to `9.9.9`", text)
+        self.assertIn("#task/inbox", text)
+        self.assert_all_synced()
+
+    def test_claude_version_pin_does_not_repeat(self):
+        note = self.seed_maintenance_note()
+        self.set_live_claude("9.9.9")
+        self.assertEqual(self.run_sync(), 0)
+        self.assertEqual(self.run_sync(), 0)
+        self.assertEqual(note.read_text().count("Claude Code CLI updated to `9.9.9`"), 1)
+
+    def test_claude_version_pin_matching_is_silent(self):
+        symlink = self.t / "bin" / "live-claude-matching"
+        symlink.symlink_to(self.cfg.claude_bin)  # basename ("claude") matches the pin
+        self.cfg.claude_live_symlink = symlink
+        self.assertEqual(self.run_sync(timer=True), 0)
+        self.assertEqual(self.log(), "")
 
     def test_emoji_filenames(self):
         self.phone_edit(age=600, name="Hello 🌎.md", text="hi\n")

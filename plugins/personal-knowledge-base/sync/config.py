@@ -24,7 +24,15 @@ class Config:
     state_dir: Path = HOME / "Library/Caches/personal-knowledge-base-sync"
 
     git_bin: str = "git"
-    claude_bin: str = str(HOME / ".local/bin/claude")
+    # Pinned to a specific installed version, not the auto-updating
+    # ~/.local/bin/claude symlink: each Claude Code CLI update is a brand-new
+    # unbundled binary, so TCC treats it as needing its own Files & Folders
+    # approval. Pinning means that only happens when Erik deliberately bumps
+    # this (see claude_live_symlink below), not invisibly on every update.
+    claude_bin: str = str(HOME / ".local/share/claude/versions/2.1.306")
+    # What Claude Code's own updater currently points at, purely to detect
+    # drift from the pin above (see Sync.check_claude_version_pin).
+    claude_live_symlink: Path = HOME / ".local/bin/claude"
 
     quiet_seconds: float = 120       # timer: phone edits must be this old to sync
     lock_wait_seconds: float = 180   # on demand: how long to wait for a running cycle

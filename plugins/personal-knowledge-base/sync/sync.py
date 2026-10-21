@@ -106,6 +106,11 @@ class Pending:
 
 
 class Sync:
+    # Where the version-pin notice goes when the live Claude Code CLI drifts
+    # from config.py's pinned claude_bin (see check_claude_version_pin).
+    MAINTENANCE_NOTE = "Projects/Personal knowledge base setup.md"
+    MAINTENANCE_ANCHOR = "## Maintenance\n\n"
+
     def __init__(self, cfg: Config, mode: str):
         self.cfg, self.mode = cfg, mode
         self.fail_file = cfg.state_dir / f"failed-{mode}"
@@ -165,6 +170,42 @@ class Sync:
                 time.sleep(0.5)
 
     # --- the cycle -------------------------------------------------------------
+
+    def check_claude_version_pin(self):
+        """If Claude Code's own updater has moved past the version sync.py is
+        pinned to, leave a task in the vault so Erik notices from his phone --
+        the headless run can't author note content itself (only `Bash(git *)`
+        is allowed), so this writes and commits the note directly, once per
+        new live version seen."""
+        cfg = self.cfg
+        pinned = os.path.basename(cfg.claude_bin)
+        try:
+            live = os.path.basename(os.readlink(cfg.claude_live_symlink))
+        except OSError:
+            return  # not on the Mac, symlink missing, etc.
+        if live == pinned:
+            return
+        notified = cfg.state_dir / "claude-version-notified"
+        with contextlib.suppress(FileNotFoundError):
+            if notified.read_text().strip() == live:
+                return  # already flagged this version
+        note_path = cfg.claude / self.MAINTENANCE_NOTE
+        try:
+            text = note_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return  # note's gone missing; don't guess where else this goes
+        if self.MAINTENANCE_ANCHOR not in text:
+            return  # section's gone missing; don't guess where to insert
+        task = (f"- [ ] Claude Code CLI updated to `{live}` (sync still pinned to `{pinned}`) "
+                f"— approve it in System Settings → Privacy & Security → Files and Folders, "
+                f"then bump `sync/config.py`'s `claude_bin` #task/inbox\n")
+        note_path.write_text(text.replace(self.MAINTENANCE_ANCHOR, self.MAINTENANCE_ANCHOR + task, 1),
+                              encoding="utf-8")
+        self.git(cfg.claude, "add", self.MAINTENANCE_NOTE, what="staging the version-pin notice")
+        self.git(cfg.claude, "commit", "-m", f"Note: Claude Code CLI updated to {live}",
+                  "--trailer", "Origin: claude", what="committing the version-pin notice")
+        notified.write_text(live, encoding="utf-8")
+        self.log(f"noted: Claude Code CLI updated to {live}, sync still pinned to {pinned}")
 
     def check_pending(self) -> Pending:
         cfg = self.cfg
@@ -281,6 +322,7 @@ class Sync:
             raise SyncFailure(f"headless claude run exited {rc}; see its output above in the log")
 
     def cycle(self):
+        self.check_claude_version_pin()
         pending = self.check_pending()
         self.stamp_file.touch()
         if not pending.anything():
