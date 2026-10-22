@@ -201,9 +201,19 @@ class Sync:
                 f"then bump `sync/config.py`'s `claude_bin` #task/inbox\n")
         note_path.write_text(text.replace(self.MAINTENANCE_ANCHOR, self.MAINTENANCE_ANCHOR + task, 1),
                               encoding="utf-8")
-        self.git(cfg.claude, "add", self.MAINTENANCE_NOTE, what="staging the version-pin notice")
-        self.git(cfg.claude, "commit", "-m", f"Note: Claude Code CLI updated to {live}",
-                  "--trailer", "Origin: claude", what="committing the version-pin notice")
+        try:
+            self.git(cfg.claude, "add", self.MAINTENANCE_NOTE, what="staging the version-pin notice")
+            self.git(cfg.claude, "commit", "-m", f"Note: Claude Code CLI updated to {live}",
+                      "--trailer", "Origin: claude", what="committing the version-pin notice")
+        except SyncFailure:
+            # The marker below is only written on success, so a failed commit
+            # is retried next cycle: put the note back first, or every retry
+            # appends another copy of the task.
+            note_path.write_text(text, encoding="utf-8")
+            with contextlib.suppress(SyncFailure):
+                self.git(cfg.claude, "reset", "-q", "--", self.MAINTENANCE_NOTE,
+                          what="unstaging the version-pin notice")
+            raise
         notified.write_text(live, encoding="utf-8")
         self.log(f"noted: Claude Code CLI updated to {live}, sync still pinned to {pinned}")
 

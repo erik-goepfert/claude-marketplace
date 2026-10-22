@@ -312,6 +312,19 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.run_sync(), 0)
         self.assertEqual(note.read_text().count("Claude Code CLI updated to `9.9.9`"), 1)
 
+    def test_claude_version_pin_failed_commit_leaves_no_duplicate(self):
+        note = self.seed_maintenance_note()
+        before = note.read_text()
+        self.set_live_claude("9.9.9")
+        self.cfg.git_bin = self.fake_claude(
+            '#!/bin/bash\n[[ " $* " == *" commit "* ]] && { echo boom >&2; exit 128; }\nexec git "$@"\n',
+            "nocommit")
+        self.assertEqual(self.run_sync(), 1)
+        self.assertEqual(note.read_text(), before)
+        self.cfg.git_bin = "git"
+        self.assertEqual(self.run_sync(), 0)
+        self.assertEqual(note.read_text().count("Claude Code CLI updated to `9.9.9`"), 1)
+
     def test_claude_version_pin_matching_is_silent(self):
         symlink = self.t / "bin" / "live-claude-matching"
         symlink.symlink_to(self.cfg.claude_bin)  # basename ("claude") matches the pin
