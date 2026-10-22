@@ -29,7 +29,7 @@ class Config:
     # unbundled binary, so TCC treats it as needing its own Files & Folders
     # approval. Pinning means that only happens when Erik deliberately bumps
     # this (see claude_live_symlink below), not invisibly on every update.
-    claude_bin: str = str(HOME / ".local/share/claude/versions/2.1.306")
+    claude_bin: str = str(HOME / ".local/share/claude/versions/2.1.288")
     # What Claude Code's own updater currently points at, purely to detect
     # drift from the pin above (see Sync.check_claude_version_pin).
     claude_live_symlink: Path = HOME / ".local/bin/claude"
